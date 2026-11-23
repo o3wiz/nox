@@ -608,7 +608,10 @@ impl Workspace {
             }
             Command::Open => self.choose_file(cx),
             Command::Quit => cx.quit(),
-            Command::FocusSearch => self.input.read(cx).focus_handle(cx).focus(window, cx),
+            Command::FocusSearch => {
+                self.show_goto = false;
+                self.input.read(cx).focus_handle(cx).focus(window, cx);
+            }
             Command::FocusLog => {
                 self.show_goto = false;
                 self.focus.focus(window, cx);
@@ -687,7 +690,9 @@ impl Workspace {
                 }
             }
             Command::GoToLine => {
-                if self.show_goto {
+                if self.tabs.is_empty() {
+                    self.show_goto = false;
+                } else if self.show_goto {
                     let line = self.goto.read(cx).as_str().trim().parse::<usize>();
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         if let (Ok(line), Some(log)) = (line, &tab.log) {
@@ -714,6 +719,14 @@ impl Workspace {
             Command::ExportResults => self.export(cx),
         }
         cx.notify();
+    }
+
+    fn toggle_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_goto {
+            self.command(Command::FocusLog, window, cx);
+        } else {
+            self.command(Command::GoToLine, window, cx);
+        }
     }
 
     fn cmd_icon(
@@ -780,6 +793,7 @@ impl Workspace {
                                 tab.follow = false;
                                 tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
                             }
+                            this.show_goto = false;
                             this.focus.focus(window, cx);
                             cx.notify();
                         })),
@@ -910,6 +924,7 @@ impl Workspace {
                                     tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
                                 }
                             }
+                            this.show_goto = false;
                             this.focus.focus(window, cx);
                             cx.notify();
                         }))
@@ -1135,18 +1150,23 @@ impl Workspace {
                                 },
                                 cx,
                             ))
-                            .child(self.cmd_icon(
-                                "goto",
-                                Icon::Hash,
-                                "Go to line",
-                                Command::GoToLine,
-                                if self.show_goto {
-                                    ButtonTone::Active
-                                } else {
-                                    ButtonTone::Ghost
-                                },
-                                cx,
-                            ))
+                            .child(
+                                icon_button(
+                                    "goto",
+                                    Icon::Hash,
+                                    "Go to line",
+                                    t.shortcut(Command::GoToLine),
+                                    if self.show_goto {
+                                        ButtonTone::Active
+                                    } else {
+                                        ButtonTone::Ghost
+                                    },
+                                    t,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.toggle_goto(window, cx)),
+                                ),
+                            )
                             .child(self.cmd_icon(
                                 "copy",
                                 Icon::Copy,
@@ -1281,41 +1301,60 @@ impl Workspace {
         list
     }
 
-    fn render_goto_bar(&self, cx: &Context<Self>) -> Div {
+    fn render_goto_popover(&self, line_count: usize, cx: &Context<Self>) -> Stateful<Div> {
         let t = &self.theme;
+        let right_inset = if self.config.viewer.show_overview && line_count > 0 {
+            self.config.viewer.overview_width + 12.
+        } else {
+            12.
+        };
+
         div()
+            .id("goto-popover")
+            .debug_selector(|| "goto-popover".into())
             .key_context("GoTo")
+            .occlude()
+            .absolute()
+            .top(px(8.))
+            .right(px(right_inset))
             .h(px(40.))
-            .px_3()
-            .flex_shrink_0()
+            .px_2p5()
+            .rounded_lg()
+            .bg(t.elevated)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
             .flex()
             .items_center()
             .gap_2()
-            .bg(t.elevated)
-            .border_b_1()
-            .border_color(t.border)
             .child(Icon::Hash.element(ICON_SM, t.accent))
             .child(
                 div()
-                    .w(px(180.))
+                    .w(px(176.))
                     .h(px(28.))
                     .px_2()
                     .rounded_md()
                     .bg(t.background)
                     .border_1()
-                    .border_color(t.border)
+                    .border_color(t.accent_border)
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .child(
                         text_input("goto-input")
+                            .debug_selector(|| "goto-input".into())
                             .key_context(format!("{DEFAULT_INPUT_CONTEXT} GoTo").as_str())
                             .state(self.goto.downgrade())
                             .placeholder("Line number…")
                             .caret_color(t.accent)
                             .placeholder_color(t.muted)
-                            .font_family(t.mono_font.clone())
+                            .font(t.mono_font_spec())
                             .text_size(t.mono_size)
-                            .w_full(),
+                            .line_height(relative(1.35))
+                            .min_w_0()
+                            .w_full()
+                            .whitespace_nowrap()
+                            .overflow_x_scroll(),
                     ),
             )
             .child(
@@ -1562,17 +1601,27 @@ impl Workspace {
             .gap_1p5()
             .child(Icon::Search.element(ICON_SM, t.muted))
             .child(
-                div().key_context("Search").flex_1().min_w_0().child(
-                    text_input("query")
-                        .key_context(format!("{DEFAULT_INPUT_CONTEXT} Search").as_str())
-                        .state(self.input.downgrade())
-                        .placeholder("Search…")
-                        .caret_color(t.accent)
-                        .placeholder_color(t.muted)
-                        .font(t.mono_font_spec())
-                        .text_size(t.mono_size)
-                        .w_full(),
-                ),
+                div()
+                    .key_context("Search")
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        text_input("query")
+                            .debug_selector(|| "search-input".into())
+                            .key_context(format!("{DEFAULT_INPUT_CONTEXT} Search").as_str())
+                            .state(self.input.downgrade())
+                            .placeholder("Search…")
+                            .caret_color(t.accent)
+                            .placeholder_color(t.muted)
+                            .font(t.mono_font_spec())
+                            .text_size(t.mono_size)
+                            .line_height(relative(1.35))
+                            .min_w_0()
+                            .w_full()
+                            .whitespace_nowrap()
+                            .overflow_x_scroll(),
+                    ),
             )
             .when(has_query, |el| {
                 el.child(
@@ -1827,9 +1876,9 @@ impl Workspace {
                                     format_count(selected),
                                     format_count(line_count)
                                 ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.command(Command::GoToLine, window, cx)
-                                })),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.toggle_goto(window, cx)),
+                                ),
                         )
                         .child(
                             div()
@@ -1939,15 +1988,54 @@ impl Render for Workspace {
                 "No matches"
             };
 
-            let source_pane = div()
+            let source_log_area = div()
                 .key_context("Log")
                 .track_focus(&self.focus)
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .when(line_count == 0, |area| {
+                    area.items_center()
+                        .justify_center()
+                        .text_size(t.small_size)
+                        .text_color(t.muted)
+                        .child(if loading {
+                            "Opening file…"
+                        } else if tab_error.is_some() {
+                            "Cannot read file"
+                        } else {
+                            "Empty file"
+                        })
+                })
+                .when(line_count > 0, |area| {
+                    area.child(
+                        uniform_list(
+                            "source",
+                            line_count,
+                            cx.processor(|this, range, _, cx| this.rows(range, false, cx)),
+                        )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .with_width_from_item(Some(widest_line))
+                        .track_scroll(&scroll)
+                        .flex_1()
+                        .min_w_0()
+                        .h_full(),
+                    )
+                    .when(self.config.viewer.show_overview, |row| {
+                        row.child(self.overview(cx))
+                    })
+                });
+
+            let source_pane = div()
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col()
                 .child(
                     div()
+                        .debug_selector(|| "file-path-bar".into())
                         .h(px(26.))
                         .px_3()
                         .flex_shrink_0()
@@ -1989,50 +2077,18 @@ impl Render for Workspace {
                                 .child(format_count(line_count)),
                         ),
                 )
-                .when(line_count == 0, |pane| {
-                    pane.child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(t.small_size)
-                            .text_color(t.muted)
-                            .child(if loading {
-                                "Opening file…"
-                            } else if tab_error.is_some() {
-                                "Cannot read file"
-                            } else {
-                                "Empty file"
-                            }),
-                    )
-                })
-                .when(line_count > 0, |pane| {
-                    pane.child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_h_0()
-                            .child(
-                                uniform_list(
-                                    "source",
-                                    line_count,
-                                    cx.processor(|this, range, _, cx| this.rows(range, false, cx)),
-                                )
-                                .with_horizontal_sizing_behavior(
-                                    ListHorizontalSizingBehavior::Unconstrained,
-                                )
-                                .with_width_from_item(Some(widest_line))
-                                .track_scroll(&scroll)
-                                .flex_1()
-                                .min_w_0()
-                                .h_full(),
-                            )
-                            .when(self.config.viewer.show_overview, |row| {
-                                row.child(self.overview(cx))
-                            }),
-                    )
-                });
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(source_log_area)
+                        .when(self.show_goto, |body| {
+                            body.child(self.render_goto_popover(line_count, cx))
+                        }),
+                );
 
             let results_header = div()
                 .h(px(30.))
@@ -2177,7 +2233,6 @@ impl Render for Workspace {
             .when(self.show_files, |root| {
                 root.child(self.render_file_drawer(cx))
             })
-            .when(self.show_goto, |root| root.child(self.render_goto_bar(cx)))
             .when_some(tab_error, |root, error| {
                 root.child(self.render_error_banner(error, cx))
             })
@@ -2388,5 +2443,109 @@ mod tests {
         let mut config = Config::load(None).unwrap();
         config.keyboard.bindings[0].keys = "invalidmodifier-o".into();
         assert!(keybindings(&config).is_err());
+    }
+
+    #[gpui::test]
+    fn goto_popover_sits_below_file_path_without_shifting_or_wrapping(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.log");
+        std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, _| view.tabs[0].log = Some(log));
+        cx.run_until_parked();
+
+        let file_path_before = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar should be rendered");
+        assert!(cx.debug_bounds("goto-popover").is_none());
+
+        view.update_in(cx, |view, window, cx| view.toggle_goto(window, cx));
+        cx.run_until_parked();
+
+        let file_path_after = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar should remain rendered");
+        let popover = cx
+            .debug_bounds("goto-popover")
+            .expect("goto popover should be rendered");
+        let input_bounds = cx
+            .debug_bounds("goto-input")
+            .expect("goto input should be rendered");
+
+        assert_eq!(
+            file_path_before.origin.y, file_path_after.origin.y,
+            "opening go-to-line should not shift the file path bar"
+        );
+        assert!(
+            popover.origin.y >= file_path_after.bottom(),
+            "go-to-line popover ({:?}) should appear below the file path bar ({:?})",
+            popover,
+            file_path_after
+        );
+        assert!(
+            input_bounds.size.height <= px(28.),
+            "goto placeholder should stay single-line, got height {:?}",
+            input_bounds.size.height
+        );
+
+        // Repeated redraws must not alternate between wrapped and single-line layout.
+        for _ in 0..5 {
+            cx.refresh().unwrap();
+            let redrawn = cx
+                .debug_bounds("goto-input")
+                .expect("goto input should stay rendered");
+            assert_eq!(
+                redrawn.size.height, input_bounds.size.height,
+                "goto input height should remain stable across redraws"
+            );
+        }
+
+        // Typing log shortcut letters inside the popover must not trigger Log actions.
+        cx.simulate_input("mf");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.goto.read(cx).as_str(), "mf");
+            assert!(view.tabs[0].bookmarks.is_empty());
+            assert!(!view.tabs[0].follow);
+        });
+
+        // Toggling go-to-line closed should dismiss without showing an invalid-number error.
+        view.update_in(cx, |view, window, cx| view.toggle_goto(window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_goto);
+            assert!(view.status.is_none());
+        });
+        assert!(cx.debug_bounds("goto-popover").is_none());
+
+        // Multi-word queries in the search input must also stay single-line across redraws.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx)
+        });
+        cx.simulate_input("connection refused timeout");
+        cx.run_until_parked();
+        let search_bounds = cx
+            .debug_bounds("search-input")
+            .expect("search input should be rendered");
+        assert!(
+            search_bounds.size.height <= px(34.),
+            "search input should stay single-line, got height {:?}",
+            search_bounds.size.height
+        );
+        for _ in 0..5 {
+            cx.refresh().unwrap();
+            let redrawn = cx
+                .debug_bounds("search-input")
+                .expect("search input should stay rendered");
+            assert_eq!(redrawn.size.height, search_bounds.size.height);
+        }
     }
 }
