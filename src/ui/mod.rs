@@ -108,6 +108,50 @@ enum Message {
     Exported(Result<(), String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusTone {
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatusMessage {
+    tone: StatusTone,
+    text: String,
+}
+
+impl StatusMessage {
+    fn success(text: impl Into<String>) -> Self {
+        Self {
+            tone: StatusTone::Success,
+            text: text.into(),
+        }
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            tone: StatusTone::Warning,
+            text: text.into(),
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            tone: StatusTone::Error,
+            text: text.into(),
+        }
+    }
+
+    fn icon_and_color(&self, theme: &Theme) -> (Icon, Hsla) {
+        match self.tone {
+            StatusTone::Success => (Icon::Check, theme.accent),
+            StatusTone::Warning => (Icon::AlertTriangle, theme.warning),
+            StatusTone::Error => (Icon::AlertTriangle, theme.danger),
+        }
+    }
+}
+
 pub struct Workspace {
     config: Config,
     theme: Theme,
@@ -130,7 +174,7 @@ pub struct Workspace {
     sender: Sender<Message>,
     receiver: Receiver<Message>,
     last_poll: Instant,
-    status: Option<String>,
+    status: Option<StatusMessage>,
     _timer: Task<()>,
     _subscriptions: Vec<Subscription>,
     state_path: Option<PathBuf>,
@@ -261,7 +305,9 @@ impl Workspace {
             this.input.update(cx, |input, cx| input.emplace(&query, cx));
         }
         if let Some(error) = session_error {
-            this.status = Some(format!("{error} · session saving disabled"));
+            this.status = Some(StatusMessage::error(format!(
+                "{error} · session saving disabled"
+            )));
         }
         this
     }
@@ -619,8 +665,8 @@ impl Workspace {
                 }
                 Message::Exported(result) => {
                     self.status = Some(match result {
-                        Ok(()) => "Exported".into(),
-                        Err(error) => format!("Export failed: {error}"),
+                        Ok(()) => StatusMessage::success("Exported"),
+                        Err(error) => StatusMessage::error(format!("Export failed: {error}")),
                     });
                 }
             }
@@ -680,7 +726,9 @@ impl Workspace {
                 }
                 Ok(Ok(None)) => {}
                 other => {
-                    this.status = Some(format!("File dialog failed: {other:?}"));
+                    this.status = Some(StatusMessage::error(format!(
+                        "File dialog failed: {other:?}"
+                    )));
                     cx.notify();
                 }
             });
@@ -712,7 +760,9 @@ impl Workspace {
             Ok(Ok(None)) => {}
             other => {
                 let _ = this.update(cx, |this, cx| {
-                    this.status = Some(format!("Save dialog failed: {other:?}"));
+                    this.status = Some(StatusMessage::error(format!(
+                        "Save dialog failed: {other:?}"
+                    )));
                     cx.notify();
                 });
             }
@@ -1236,10 +1286,10 @@ impl Workspace {
                         return;
                     }
                     if count > MAX_BULK_BOOKMARK_LINES {
-                        self.status = Some(format!(
+                        self.status = Some(StatusMessage::warning(format!(
                             "Too many lines selected to bookmark (limit {})",
                             format_count(MAX_BULK_BOOKMARK_LINES)
-                        ));
+                        )));
                     } else {
                         let lines: Vec<usize> = Self::selected_source_lines(tab, pane).collect();
                         let all_marked = lines.iter().all(|line| tab.bookmarks.contains(line));
@@ -1292,7 +1342,7 @@ impl Workspace {
                 {
                     let count = Self::selection_count(tab, pane);
                     if count == 0 {
-                        self.status = Some("No lines selected".into());
+                        self.status = Some(StatusMessage::warning("No lines selected"));
                     } else {
                         let mut total_bytes: u64 = 0;
                         let mut lines_to_copy = Vec::with_capacity(count.min(1024));
@@ -1306,9 +1356,11 @@ impl Workspace {
                             lines_to_copy.push(line);
                         }
                         if exceeded {
-                            self.status = Some("Selection too large to copy (limit 64 MB)".into());
+                            self.status = Some(StatusMessage::warning(
+                                "Selection too large to copy (limit 64 MB)",
+                            ));
                         } else if lines_to_copy.is_empty() {
-                            self.status = Some("No lines selected".into());
+                            self.status = Some(StatusMessage::warning("No lines selected"));
                         } else {
                             let mut copied = String::with_capacity(total_bytes as usize);
                             let mut read_error = None;
@@ -1325,14 +1377,18 @@ impl Workspace {
                                 }
                             }
                             if let Some(error) = read_error {
-                                self.status = Some(error);
+                                self.status = Some(StatusMessage::error(error));
                             } else {
                                 cx.write_to_clipboard(ClipboardItem::new_string(copied));
-                                self.status = Some(if lines_to_copy.len() == 1 {
-                                    format!("Copied Ln {}", format_count(lines_to_copy[0] + 1))
-                                } else {
-                                    format!("Copied {} lines", format_count(lines_to_copy.len()))
-                                });
+                                self.status =
+                                    Some(StatusMessage::success(if lines_to_copy.len() == 1 {
+                                        format!("Copied Ln {}", format_count(lines_to_copy[0] + 1))
+                                    } else {
+                                        format!(
+                                            "Copied {} lines",
+                                            format_count(lines_to_copy.len())
+                                        )
+                                    }));
                             }
                         }
                     }
@@ -1361,10 +1417,13 @@ impl Workspace {
                                 self.active_pane = Pane::Main;
                                 self.focus.focus(window, cx);
                             } else {
-                                self.status = Some(format!("Range: 1–{}", format_count(log.len())));
+                                self.status = Some(StatusMessage::warning(format!(
+                                    "Range: 1–{}",
+                                    format_count(log.len())
+                                )));
                             }
                         } else {
-                            self.status = Some("Invalid line number".into());
+                            self.status = Some(StatusMessage::warning("Invalid line number"));
                         }
                     }
                 } else {
@@ -2964,14 +3023,15 @@ impl Workspace {
                     .when(tab.is_none(), |left| left.child("Ready")),
             )
             .when_some(self.status.clone(), |bar, feedback| {
+                let (icon, color) = feedback.icon_and_color(t);
                 bar.child(
                     div()
                         .flex()
                         .items_center()
                         .gap_1p5()
-                        .text_color(t.accent)
-                        .child(Icon::Check.element(px(12.), t.accent))
-                        .child(feedback),
+                        .text_color(color)
+                        .child(icon.element(px(12.), color))
+                        .child(feedback.text),
                 )
             })
     }
@@ -4189,5 +4249,79 @@ mod tests {
                 ][..]
             )
         );
+    }
+
+    #[test]
+    fn status_message_tones_use_expected_icons_and_colors() {
+        let config = Config::load(None).unwrap();
+        let theme = Theme::from_config_with_fonts(&config, &[]);
+
+        assert_eq!(
+            StatusMessage::success("Copied Ln 1").icon_and_color(&theme),
+            (Icon::Check, theme.accent)
+        );
+        assert_eq!(
+            StatusMessage::warning("Invalid line number").icon_and_color(&theme),
+            (Icon::AlertTriangle, theme.warning)
+        );
+        assert_eq!(
+            StatusMessage::error("Export failed").icon_and_color(&theme),
+            (Icon::AlertTriangle, theme.danger)
+        );
+    }
+
+    #[gpui::test]
+    fn invalid_and_out_of_range_goto_line_sets_warning_status(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("goto-status.log");
+        std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, _| view.tabs[0].log = Some(log));
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| view.toggle_goto(window, cx));
+        cx.simulate_input("abc");
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("Invalid line number"))
+            );
+            assert!(view.show_goto);
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.goto.update(cx, |input, cx| input.emplace("99", cx));
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.status, Some(StatusMessage::warning("Range: 1–3")));
+            assert!(view.show_goto);
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.goto.update(cx, |input, cx| input.emplace("2", cx));
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.status, None);
+            assert!(!view.show_goto);
+            assert_eq!(view.tabs[0].selected, 1);
+        });
     }
 }
