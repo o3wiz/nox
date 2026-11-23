@@ -1802,7 +1802,7 @@ impl Workspace {
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .font_family(t.mono_font.clone())
+                            .font(t.mono_font_spec())
                             .text_size(t.xs_size)
                             .text_color(t.muted)
                             .child(dir),
@@ -2019,7 +2019,7 @@ impl Workspace {
                                 .py_0p5()
                                 .rounded_sm()
                                 .bg(t.on_accent.opacity(0.14))
-                                .font_family(t.mono_font.clone())
+                                .font(t.mono_font_spec())
                                 .text_size(t.xs_size)
                                 .child(key),
                         )
@@ -2079,7 +2079,7 @@ impl Workspace {
                                 .min_w_0()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
-                                .font_family(t.mono_font.clone())
+                                .font(t.mono_font_spec())
                                 .text_size(t.xs_size)
                                 .text_color(t.muted)
                                 .child(dir),
@@ -2388,7 +2388,7 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .font_family(t.mono_font.clone())
+                                .font(t.mono_font_spec())
                                 .cursor_pointer()
                                 .hover({
                                     let fg = t.foreground;
@@ -2406,7 +2406,7 @@ impl Workspace {
                         .when(pane == Pane::Results && result_count > 0, |el| {
                             el.child(
                                 div()
-                                    .font_family(t.mono_font.clone())
+                                    .font(t.mono_font_spec())
                                     .text_color(t.foreground)
                                     .child(format!(
                                         "Filter {} / {}",
@@ -2418,7 +2418,7 @@ impl Workspace {
                         .when(selected_count > 1, |el| {
                             el.child(
                                 div()
-                                    .font_family(t.mono_font.clone())
+                                    .font(t.mono_font_spec())
                                     .text_color(t.accent)
                                     .child(format!("{} selected", format_count(selected_count))),
                             )
@@ -2448,7 +2448,7 @@ impl Workspace {
                                 )
                                 .child(
                                     div()
-                                        .font_family(t.mono_font.clone())
+                                        .font(t.mono_font_spec())
                                         .child(format_count(bookmarks)),
                                 )
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -2468,7 +2468,7 @@ impl Workspace {
                                     }))
                                     .child(
                                         div()
-                                            .font_family(t.mono_font.clone())
+                                            .font(t.mono_font_spec())
                                             .child(format!("{} · UTF-8", format_bytes(len))),
                                     ),
                             )
@@ -2625,7 +2625,7 @@ impl Render for Workspace {
                                 ))
                                 .child(
                                     div()
-                                        .font_family(t.mono_font.clone())
+                                        .font(t.mono_font_spec())
                                         .text_size(t.xs_size)
                                         .overflow_hidden()
                                         .whitespace_nowrap()
@@ -2638,7 +2638,7 @@ impl Render for Workspace {
                                 .items_center()
                                 .gap_2()
                                 .flex_shrink_0()
-                                .font_family(t.mono_font.clone())
+                                .font(t.mono_font_spec())
                                 .text_size(t.xs_size)
                                 .text_color(t.muted)
                                 .when(loading, |el| el.text_color(t.accent).child("Indexing…"))
@@ -2699,7 +2699,7 @@ impl Render for Workspace {
                             ))
                             .child(
                                 div()
-                                    .font_family(t.mono_font.clone())
+                                    .font(t.mono_font_spec())
                                     .text_color(if result_count > 0 {
                                         t.foreground
                                     } else {
@@ -3358,5 +3358,42 @@ mod tests {
                 "Tab from main pane should focus filter pane"
             );
         });
+    }
+
+    #[test]
+    fn theme_fallbacks_include_symbol_fonts_without_duplicates() {
+        let config = Config::load(None).unwrap();
+        let installed = vec![
+            "SF Pro Text".to_owned(),
+            "SauceCodePro Nerd Font Mono".to_owned(),
+            "Menlo".to_owned(),
+            "Apple Symbols".to_owned(),
+            "Lucida Grande".to_owned(),
+        ];
+        let theme = Theme::from_config_with_fonts(&config, &installed);
+        assert_eq!(theme.ui_font.as_ref(), "SF Pro Text");
+        assert_eq!(theme.mono_font.as_ref(), "SauceCodePro Nerd Font Mono");
+        assert_eq!(
+            theme.ui_fallbacks.fallback_list(),
+            &["Apple Symbols", "Lucida Grande", "Menlo"]
+        );
+        assert_eq!(
+            theme.mono_fallbacks.fallback_list(),
+            &["Menlo", "Apple Symbols", "Lucida Grande"]
+        );
+        assert_eq!(
+            theme
+                .mono_font_spec()
+                .fallbacks
+                .as_ref()
+                .map(|fallbacks| fallbacks.fallback_list()),
+            Some(
+                &[
+                    "Menlo".to_owned(),
+                    "Apple Symbols".to_owned(),
+                    "Lucida Grande".to_owned()
+                ][..]
+            )
+        );
     }
 }

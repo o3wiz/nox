@@ -60,7 +60,7 @@ impl Render for Tooltip {
                         .bg(t.background)
                         .border_1()
                         .border_color(t.border)
-                        .font_family(t.mono_font.clone())
+                        .font(t.mono_font_spec())
                         .text_size(t.xs_size)
                         .text_color(t.muted)
                         .child(key),

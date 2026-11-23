@@ -26,6 +26,16 @@ const MONO_FONT_PREFERENCES: &[&str] = &[
     "DejaVu Sans Mono",
 ];
 
+const SYMBOL_FONT_FALLBACKS: &[&str] = &[
+    "Apple Symbols",
+    "Lucida Grande",
+    "Menlo",
+    "Segoe UI Symbol",
+    "DejaVu Sans",
+    "Noto Sans Symbols 2",
+    "Noto Sans Symbols",
+];
+
 /// Consistent icon sizes (in logical pixels) matching the 4/8px design rhythm.
 pub const ICON_XS: Pixels = px(13.0);
 pub const ICON_SM: Pixels = px(15.0);
@@ -203,9 +213,13 @@ fn find_installed(name: &str, installed: &[String]) -> Option<String> {
 }
 
 fn build_fallbacks(primary: &str, preferences: &[&str], installed: &[String]) -> FontFallbacks {
-    let mut list = Vec::new();
-    for candidate in preferences {
-        if candidate.eq_ignore_ascii_case(primary) {
+    let mut list: Vec<String> = Vec::new();
+    for candidate in preferences.iter().chain(SYMBOL_FONT_FALLBACKS.iter()) {
+        if candidate.eq_ignore_ascii_case(primary)
+            || list
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(candidate))
+        {
             continue;
         }
         if let Some(found) = find_installed(candidate, installed) {
