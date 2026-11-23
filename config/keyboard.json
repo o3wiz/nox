@@ -22,6 +22,11 @@
       "context": "Workspace"
     },
     {
+      "keys": "secondary-p",
+      "action": "toggle_presets",
+      "context": "Workspace"
+    },
+    {
       "keys": "secondary-l",
       "action": "go_to_line",
       "context": "Workspace"
@@ -190,6 +195,41 @@
       "keys": "escape",
       "action": "clear_selection",
       "context": "Log"
+    },
+    {
+      "keys": "down",
+      "action": "next_line",
+      "context": "Presets"
+    },
+    {
+      "keys": "up",
+      "action": "previous_line",
+      "context": "Presets"
+    },
+    {
+      "keys": "home",
+      "action": "first_line",
+      "context": "Presets"
+    },
+    {
+      "keys": "end",
+      "action": "last_line",
+      "context": "Presets"
+    },
+    {
+      "keys": "enter",
+      "action": "apply_preset",
+      "context": "Presets"
+    },
+    {
+      "keys": "space",
+      "action": "apply_preset",
+      "context": "Presets"
+    },
+    {
+      "keys": "escape",
+      "action": "focus_log",
+      "context": "Presets"
     }
   ]
 }

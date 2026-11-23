@@ -23,8 +23,10 @@ use nox::{
 use regex::Regex;
 use serde::Deserialize;
 use std::{
+    cell::Cell,
     collections::BTreeSet,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -116,6 +118,11 @@ pub struct Workspace {
     input: Entity<EditableTextState>,
     goto: Entity<EditableTextState>,
     show_goto: bool,
+    show_presets: bool,
+    preset_index: usize,
+    presets_focus: FocusHandle,
+    presets_scroll: ScrollHandle,
+    presets_trigger_bounds: Rc<Cell<Bounds<Pixels>>>,
     focus: FocusHandle,
     results_focus: FocusHandle,
     active_pane: Pane,
@@ -141,6 +148,7 @@ impl Workspace {
         let (sender, receiver) = mpsc::channel();
         let focus = cx.focus_handle();
         let results_focus = cx.focus_handle();
+        let presets_focus = cx.focus_handle();
         focus.focus(window, cx);
         let timer = cx.spawn(async move |this, cx| {
             loop {
@@ -209,6 +217,11 @@ impl Workspace {
             input: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
             goto: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
             show_goto: false,
+            show_presets: false,
+            preset_index: 0,
+            presets_focus,
+            presets_scroll: ScrollHandle::new(),
+            presets_trigger_bounds: Rc::new(Cell::new(Bounds::default())),
             focus,
             results_focus,
             active_pane: Pane::Main,
@@ -332,6 +345,7 @@ impl Workspace {
         }
         self.active = index;
         self.drag_selecting = None;
+        self.show_presets = false;
         let query = self
             .tabs
             .get(index)
@@ -351,6 +365,7 @@ impl Workspace {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.drag_selecting = None;
+        self.show_presets = false;
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -718,6 +733,7 @@ impl Workspace {
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         self.active_pane = pane;
         self.show_goto = false;
+        self.show_presets = false;
         match pane {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => {
@@ -807,6 +823,7 @@ impl Workspace {
     ) {
         self.active_pane = pane;
         self.show_goto = false;
+        self.show_presets = false;
         match pane {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => self.results_focus.focus(window, cx),
@@ -987,13 +1004,39 @@ impl Workspace {
 
     fn command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
-            Command::ShowFiles => self.show_files = !self.show_files,
+            Command::ShowFiles => {
+                self.show_presets = false;
+                self.show_files = !self.show_files;
+            }
+            Command::TogglePresets => {
+                self.toggle_presets(window, cx);
+                return;
+            }
+            Command::ApplyPreset => {
+                if self.show_presets {
+                    self.apply_preset(self.preset_index, window, cx);
+                }
+                return;
+            }
             Command::NextLine
             | Command::PreviousLine
             | Command::FirstLine
             | Command::LastLine
             | Command::PageUp
             | Command::PageDown => {
+                if self.show_presets
+                    && self.presets_focus.is_focused(window)
+                    && matches!(
+                        command,
+                        Command::NextLine
+                            | Command::PreviousLine
+                            | Command::FirstLine
+                            | Command::LastLine
+                    )
+                {
+                    self.navigate_presets(command, cx);
+                    return;
+                }
                 self.navigate(command, false, window, cx);
                 return;
             }
@@ -1120,10 +1163,15 @@ impl Workspace {
             Command::Quit => cx.quit(),
             Command::FocusSearch => {
                 self.show_goto = false;
+                self.show_presets = false;
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
             }
             Command::FocusLog => {
-                self.focus_pane(Pane::Main, window, cx);
+                if self.show_presets {
+                    self.close_presets(window, cx);
+                } else {
+                    self.focus_pane(Pane::Main, window, cx);
+                }
                 return;
             }
             Command::Search => self.start_search(self.active, cx),
@@ -1296,6 +1344,7 @@ impl Workspace {
                 }
             }
             Command::GoToLine => {
+                self.show_presets = false;
                 if self.tabs.is_empty() {
                     self.show_goto = false;
                 } else if self.show_goto {
@@ -1335,6 +1384,72 @@ impl Workspace {
         } else {
             self.command(Command::GoToLine, window, cx);
         }
+    }
+
+    fn active_preset_index(&self, cx: &App) -> Option<usize> {
+        let current_input = self.input.read(cx).as_str();
+        let mode = self
+            .tabs
+            .get(self.active)
+            .map_or(self.config.search.mode, |tab| tab.options.mode);
+        self.config
+            .search
+            .presets
+            .iter()
+            .position(|preset| preset.pattern == current_input && preset.mode == mode)
+    }
+
+    fn toggle_presets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() || self.config.search.presets.is_empty() {
+            self.show_presets = false;
+            return;
+        }
+        if self.show_presets {
+            self.close_presets(window, cx);
+        } else {
+            self.show_goto = false;
+            self.show_presets = true;
+            self.preset_index = self.active_preset_index(cx).unwrap_or(0);
+            self.presets_scroll.scroll_to_item(self.preset_index);
+            self.presets_focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn close_presets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_presets = false;
+        self.focus_pane(self.active_pane, window, cx);
+    }
+
+    fn apply_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preset) = self.config.search.presets.get(index).cloned() else {
+            return;
+        };
+        self.input
+            .update(cx, |input, cx| input.emplace(&preset.pattern, cx));
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.options.mode = preset.mode;
+        }
+        self.show_presets = false;
+        self.preset_index = index;
+        self.start_search(self.active, cx);
+        self.focus_pane(self.active_pane, window, cx);
+    }
+
+    fn navigate_presets(&mut self, command: Command, cx: &mut Context<Self>) {
+        let len = self.config.search.presets.len();
+        if len == 0 {
+            return;
+        }
+        self.preset_index = match command {
+            Command::NextLine => (self.preset_index + 1) % len,
+            Command::PreviousLine => (self.preset_index + len - 1) % len,
+            Command::FirstLine => 0,
+            Command::LastLine => len - 1,
+            _ => self.preset_index,
+        };
+        self.presets_scroll.scroll_to_item(self.preset_index);
+        cx.notify();
     }
 
     fn cmd_icon(
@@ -1404,6 +1519,7 @@ impl Workspace {
                             }
                             this.active_pane = Pane::Main;
                             this.show_goto = false;
+                            this.show_presets = false;
                             this.focus.focus(window, cx);
                             cx.notify();
                         })),
@@ -2226,7 +2342,323 @@ impl Workspace {
         hero
     }
 
-    fn render_search_bar(&self, options: &SearchConfig, cx: &Context<Self>) -> Div {
+    fn render_presets_dropdown(
+        &self,
+        options: &SearchConfig,
+        current_input: &str,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let t = &self.theme;
+        let active_index = self
+            .config
+            .search
+            .presets
+            .iter()
+            .position(|preset| preset.pattern == current_input && preset.mode == options.mode);
+        let active_name = active_index
+            .and_then(|idx| self.config.search.presets.get(idx))
+            .map(|preset| preset.name.clone());
+        let is_open = self.show_presets;
+        let is_active = active_index.is_some();
+
+        let (bg, border, fg, icon_color, hover_bg) = if is_open {
+            (
+                t.elevated,
+                t.accent_border,
+                t.foreground,
+                t.accent,
+                t.elevated,
+            )
+        } else if is_active {
+            (
+                t.accent_subtle,
+                t.accent_border,
+                t.accent,
+                t.accent,
+                t.accent_subtle,
+            )
+        } else {
+            (t.background, t.border, t.foreground, t.muted, t.hover)
+        };
+
+        let trigger_bounds = self.presets_trigger_bounds.clone();
+        let bounds_tracker = canvas(
+            move |bounds, _window, _cx| {
+                trigger_bounds.set(bounds);
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+
+        let tip_theme = t.clone();
+        let shortcut = t.shortcut(Command::TogglePresets);
+        let label = active_name.unwrap_or_else(|| "Patterns".to_owned());
+
+        let trigger = div()
+            .id("presets-trigger")
+            .debug_selector(|| "presets-trigger".into())
+            .relative()
+            .h(px(32.))
+            .pl_2p5()
+            .pr_2()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(bg)
+            .text_color(fg)
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .child(bounds_tracker)
+            .child(Icon::ListFilter.element(ICON_XS, icon_color))
+            .child(
+                div()
+                    .max_w(px(136.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(t.small_size)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(label),
+            )
+            .child(
+                (if is_open {
+                    Icon::ChevronUp
+                } else {
+                    Icon::ChevronDown
+                })
+                .element(
+                    px(12.),
+                    if is_open || is_active {
+                        t.accent
+                    } else {
+                        t.muted
+                    },
+                ),
+            )
+            .tooltip_show_delay(TOOLTIP_DELAY)
+            .tooltip(move |_window, cx| {
+                Tooltip::view("Saved patterns", shortcut.clone(), tip_theme.clone(), cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_presets(window, cx)));
+
+        let mut wrapper = div()
+            .relative()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .child(trigger);
+
+        if is_open {
+            let viewport_h = f32::from(window.viewport_size().height);
+            let results_h = self.config.window.results_height.min(viewport_h * 0.45);
+            let status_h = if self.config.window.show_status_bar {
+                26.0
+            } else {
+                0.0
+            };
+            let open_upward = results_h + 30.0 + status_h < 180.0;
+            let highlighted = self
+                .preset_index
+                .min(self.config.search.presets.len().saturating_sub(1));
+
+            let mut list = div()
+                .id("presets-list")
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .track_scroll(&self.presets_scroll)
+                .flex()
+                .flex_col()
+                .gap_0p5();
+
+            for (index, preset) in self.config.search.presets.iter().enumerate() {
+                let item_active = active_index == Some(index);
+                let item_highlighted = highlighted == index;
+                let hover = t.hover;
+                let mode_label = match preset.mode {
+                    SearchMode::Regex => "Regex",
+                    SearchMode::Literal => "Literal",
+                };
+
+                list = list.child(
+                    div()
+                        .id(("preset-item", index))
+                        .debug_selector(move || format!("preset-item-{index}"))
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if item_highlighted {
+                            t.accent_border
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .bg(if item_highlighted {
+                            t.selection
+                        } else if item_active {
+                            t.accent_subtle.opacity(0.5)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .cursor_pointer()
+                        .hover(move |s| if item_highlighted { s } else { s.bg(hover) })
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                            if this.preset_index != index {
+                                this.preset_index = index;
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.apply_preset(index, window, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_size(t.small_size)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(if item_active {
+                                            t.accent
+                                        } else {
+                                            t.foreground
+                                        })
+                                        .child(preset.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .flex_shrink_0()
+                                        .child(
+                                            div()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .bg(t.background)
+                                                .border_1()
+                                                .border_color(t.border)
+                                                .font(t.mono_font_spec())
+                                                .text_size(px(10.))
+                                                .text_color(t.muted)
+                                                .child(mode_label),
+                                        )
+                                        .when(item_active, |row| {
+                                            row.child(Icon::Check.element(ICON_XS, t.accent))
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .font(t.mono_font_spec())
+                                .text_size(t.xs_size)
+                                .text_color(t.muted)
+                                .child(preset.pattern.clone()),
+                        ),
+                );
+            }
+
+            let out_trigger_bounds = self.presets_trigger_bounds.clone();
+            let mut menu = div()
+                .id("presets-menu")
+                .debug_selector(|| "presets-menu".into())
+                .key_context("Presets")
+                .track_focus(&self.presets_focus)
+                .occlude()
+                .absolute()
+                .right_0()
+                .w(px(320.))
+                .p_1p5()
+                .rounded_lg()
+                .bg(t.elevated)
+                .border_1()
+                .border_color(t.border)
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if !out_trigger_bounds.get().contains(&event.position) {
+                        this.show_presets = false;
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .pb_1p5()
+                        .border_b_1()
+                        .border_color(t.border.opacity(0.6))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .text_size(t.xs_size)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(t.muted)
+                                .child("Saved patterns")
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .bg(t.background)
+                                        .font(t.mono_font_spec())
+                                        .text_size(px(10.))
+                                        .text_color(t.muted)
+                                        .child(format_count(self.config.search.presets.len())),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .font(t.mono_font_spec())
+                                .text_size(px(10.))
+                                .text_color(t.muted)
+                                .child("↑↓ ↵"),
+                        ),
+                )
+                .child(list);
+
+            menu = if open_upward {
+                menu.bottom(px(36.))
+            } else {
+                menu.top(px(36.))
+            };
+
+            wrapper = wrapper.child(deferred(menu).priority(1));
+        }
+
+        wrapper
+    }
+
+    fn render_search_bar(
+        &self,
+        options: &SearchConfig,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
         let t = &self.theme;
         let current_input = self.input.read(cx).as_str().to_owned();
         let has_query = !current_input.is_empty();
@@ -2391,76 +2823,9 @@ impl Workspace {
             ));
 
         if !self.config.search.presets.is_empty() {
-            let mut presets = div()
-                .id("presets")
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .flex_shrink_0()
+            bar = bar
                 .child(toolbar_divider(t))
-                .child(
-                    div()
-                        .id("presets-icon")
-                        .child(Icon::Sparkles.element(ICON_XS, t.muted))
-                        .tooltip_show_delay(TOOLTIP_DELAY)
-                        .tooltip({
-                            let tip_theme = t.clone();
-                            move |_, cx| {
-                                Tooltip::view("Saved searches", None, tip_theme.clone(), cx)
-                            }
-                        }),
-                );
-
-            for (index, preset) in self.config.search.presets.iter().enumerate() {
-                let active = current_input == preset.pattern && options.mode == preset.mode;
-                let preset_clone = preset.clone();
-                let tip_pattern = SharedString::from(preset.pattern.clone());
-                let tip_theme = t.clone();
-                let hover = t.hover;
-                let fg = t.foreground;
-
-                presets = presets.child(
-                    div()
-                        .id(("preset", index))
-                        .h(px(26.))
-                        .px_2p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if active { t.accent_border } else { t.border })
-                        .bg(if active {
-                            t.accent_subtle
-                        } else {
-                            t.background
-                        })
-                        .text_color(if active { t.accent } else { t.muted })
-                        .text_size(t.xs_size)
-                        .font_weight(FontWeight::MEDIUM)
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .hover(move |s| {
-                            if active {
-                                s
-                            } else {
-                                s.bg(hover).text_color(fg)
-                            }
-                        })
-                        .child(preset.name.clone())
-                        .tooltip_show_delay(TOOLTIP_DELAY)
-                        .tooltip(move |_, cx| {
-                            Tooltip::view(tip_pattern.clone(), None, tip_theme.clone(), cx)
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.input
-                                .update(cx, |input, cx| input.emplace(&preset_clone.pattern, cx));
-                            if let Some(tab) = this.tabs.get_mut(this.active) {
-                                tab.options.mode = preset_clone.mode;
-                            }
-                            this.start_search(this.active, cx);
-                        })),
-                );
-            }
-            bar = bar.child(presets);
+                .child(self.render_presets_dropdown(options, &current_input, window, cx));
         }
 
         bar
@@ -2928,7 +3293,7 @@ impl Render for Workspace {
                 .flex()
                 .flex_col()
                 .child(source_pane)
-                .child(self.render_search_bar(&options, cx))
+                .child(self.render_search_bar(&options, window, cx))
                 .child(results_header)
                 .child(results_body)
         };
@@ -3641,6 +4006,152 @@ mod tests {
                 "Tab from main pane should focus filter pane"
             );
         });
+    }
+
+    #[gpui::test]
+    fn saved_patterns_dropdown_supports_keyboard_and_mouse_workflows(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("presets.log");
+        std::fs::write(
+            &path,
+            "info boot\nWARN slow query\nERROR panic\nGET /health\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let presets_key = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+
+        // Dropdown trigger is visible while menu is initially closed.
+        let trigger_bounds = cx
+            .debug_bounds("presets-trigger")
+            .expect("presets trigger should be rendered");
+        assert!(cx.debug_bounds("presets-menu").is_none());
+
+        // Keyboard shortcut opens dropdown, focuses it, and positions it cleanly below trigger.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, _| {
+            assert!(view.show_presets);
+            assert!(view.presets_focus.is_focused(window));
+            assert_eq!(view.preset_index, 0);
+        });
+        let menu_bounds = cx
+            .debug_bounds("presets-menu")
+            .expect("presets menu should be rendered when open");
+        assert!(
+            menu_bounds.origin.y >= trigger_bounds.bottom(),
+            "presets menu ({menu_bounds:?}) should open below trigger ({trigger_bounds:?})"
+        );
+
+        // Arrow navigation inside dropdown moves highlight without moving log selection.
+        cx.simulate_keystrokes("down");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.preset_index, 1);
+            assert_eq!(view.tabs[0].selected, 0);
+        });
+        cx.simulate_keystrokes("end");
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 2));
+        cx.simulate_keystrokes("down");
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 0));
+        cx.simulate_keystrokes("up");
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 2));
+        cx.simulate_keystrokes("home down");
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
+
+        // Pressing Enter applies the highlighted preset ("Warnings": literal "warn"), closes menu, and restores focus.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "warn");
+            assert_eq!(view.tabs[0].query, "warn");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+        });
+        assert!(cx.debug_bounds("presets-menu").is_none());
+
+        // Reopening highlights the active preset and Escape closes without changing query.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_presets);
+            assert_eq!(view.preset_index, 1);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "warn");
+        });
+
+        // Shortcut also works from the search input and toggles closed on second press.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx)
+        });
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.show_presets));
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.show_presets));
+
+        // Clicking the trigger opens the dropdown, and clicking it again closes it.
+        let trigger_center = cx
+            .debug_bounds("presets-trigger")
+            .expect("presets trigger")
+            .center();
+        cx.simulate_click(trigger_center, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.show_presets));
+
+        cx.simulate_click(trigger_center, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.show_presets));
+
+        // Clicking a preset item applies it and closes the dropdown.
+        cx.simulate_click(trigger_center, Modifiers::none());
+        cx.run_until_parked();
+        let item2_center = cx
+            .debug_bounds("preset-item-2")
+            .expect("third preset item")
+            .center();
+        cx.simulate_click(item2_center, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), "GET|POST|PUT|DELETE");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+        });
+
+        // Clicking outside the open dropdown dismisses it.
+        cx.simulate_click(trigger_center, Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("presets-menu").is_some());
+        let row0 = cx.debug_bounds("main-row-0").expect("main row 0").center();
+        cx.simulate_click(row0, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.show_presets));
+        assert!(cx.debug_bounds("presets-menu").is_none());
     }
 
     #[test]

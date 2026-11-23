@@ -29,7 +29,6 @@ pub enum Icon {
     ListFilter,
     Lines,
     AlertTriangle,
-    Sparkles,
     MatchDot,
     Check,
 }
@@ -61,7 +60,6 @@ impl Icon {
         Icon::ListFilter,
         Icon::Lines,
         Icon::AlertTriangle,
-        Icon::Sparkles,
         Icon::MatchDot,
         Icon::Check,
     ];
@@ -115,8 +113,6 @@ impl Icon {
             Icon::Lines => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><line x1="4.5" y1="6.5" x2="19.5" y2="6.5"/><line x1="4.5" y1="12" x2="19.5" y2="12"/><line x1="4.5" y1="17.5" x2="14.5" y2="17.5"/></svg>"##,
 
             Icon::AlertTriangle => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 4.1 2.7 17.5a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 4.1a2 2 0 0 0-3.4 0Z"/><line x1="12" y1="9.5" x2="12" y2="13.5"/><circle cx="12" cy="17" r="1" fill="#ffffff" stroke="none"/></svg>"##,
-
-            Icon::Sparkles => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M18.5 16.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z"/></svg>"##,
 
             Icon::MatchDot => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#ffffff"><circle cx="12" cy="12" r="4.5"/></svg>"##,
 

@@ -41,7 +41,8 @@
         "Workspace",
         "Log",
         "Search",
-        "GoTo"
+        "GoTo",
+        "Presets"
       ]
     },
     "Command": {
@@ -83,7 +84,9 @@
         "select_page_up",
         "select_page_down",
         "select_all",
-        "clear_selection"
+        "clear_selection",
+        "toggle_presets",
+        "apply_preset"
       ]
     }
   }

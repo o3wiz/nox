@@ -13,7 +13,7 @@ Requires a Rust toolchain supporting edition 2024 and the native build prerequis
 
 ## Using the viewer
 
-Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar. Saved search presets apply immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
+Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar. Open saved patterns from the **Patterns** dropdown (or **⌘P** / **Ctrl+P**), navigate with **↑**/**↓** (**Home**/**End**), and press **Enter** or click an item to apply it immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
 
 Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
@@ -26,6 +26,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Workspace | secondary-o / secondary-w | Open / close tab |
 | Workspace | ctrl-tab | Next tab |
 | Workspace | secondary-f / secondary-l | Focus search / go to line |
+| Workspace | secondary-p | Toggle saved patterns dropdown |
 | Workspace | secondary-r / secondary-e | Reload / export results |
 | Workspace | F3 / shift-F3 | Next / previous match |
 | Workspace | secondary-q | Quit |
@@ -43,6 +44,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Search | secondary-alt-w | Toggle whole words |
 | Search | secondary-alt-i | Toggle exclude matches (invert) |
 | GoTo | Enter / Escape | Jump / cancel |
+| Presets | up/down, home/end, Enter/Space, Escape | Navigate / apply / close saved patterns |
 
 Text editing uses GPUI CE's native editable-text element, including clipboard operations, selection, undo, and IME support.
 
@@ -73,7 +75,7 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | `search.json` | Default search mode, case/word/inversion, context lines, match limit, named presets |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |
 | `files.json` | Startup paths, favorites, session restore/save, session path, recent-file limit |
-| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Search`, or `GoTo` contexts |
+| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Search`, `GoTo`, or `Presets` contexts |
 
 Each JSON file has a `$schema` link for editor completion and validation. Schemas are generated from the same Rust types used to deserialize configuration. Top-level properties are optional because files are overlays; objects inside replacement arrays require their fields. Additional semantic checks (for example regex syntax and shortcut conflicts) run in the application.
 

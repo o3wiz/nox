@@ -151,6 +151,8 @@ pub enum Command {
     SelectPageDown,
     SelectAll,
     ClearSelection,
+    TogglePresets,
+    ApplyPreset,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 pub enum KeyContext {
@@ -158,6 +160,7 @@ pub enum KeyContext {
     Log,
     Search,
     GoTo,
+    Presets,
 }
 impl KeyContext {
     pub fn as_str(self) -> &'static str {
@@ -166,6 +169,7 @@ impl KeyContext {
             Self::Log => "Log",
             Self::Search => "Search",
             Self::GoTo => "GoTo",
+            Self::Presets => "Presets",
         }
     }
 }
