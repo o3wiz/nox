@@ -866,10 +866,11 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_color(if marked { t.warning } else { t.accent })
-                                .when(marked, |g| g.child(Icon::BookmarkFilled.element(px(12.))))
+                                .when(marked, |g| {
+                                    g.child(Icon::BookmarkFilled.element(px(12.), t.warning))
+                                })
                                 .when(!marked && matched, |g| {
-                                    g.child(Icon::MatchDot.element(px(9.)))
+                                    g.child(Icon::MatchDot.element(px(9.), t.accent))
                                 })
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -982,11 +983,7 @@ impl Workspace {
                             }
                         }
                     })
-                    .child(
-                        div()
-                            .text_color(if active { t.accent } else { t.muted })
-                            .child(Icon::FileText.element(ICON_XS)),
-                    )
+                    .child(Icon::FileText.element(ICON_XS, if active { t.accent } else { t.muted }))
                     .child(
                         div()
                             .text_size(t.small_size)
@@ -1006,13 +1003,11 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(t.muted)
                             .hover({
                                 let hover = t.hover;
-                                let fg = t.foreground;
-                                move |s| s.bg(hover).text_color(fg)
+                                move |s| s.bg(hover)
                             })
-                            .child(Icon::Close.element(px(11.)))
+                            .child(Icon::Close.element(px(11.), t.muted))
                             .tooltip_show_delay(TOOLTIP_DELAY)
                             .tooltip(move |_window, cx| {
                                 Tooltip::view(
@@ -1052,11 +1047,7 @@ impl Workspace {
                     .items_center()
                     .gap_2()
                     .flex_shrink_0()
-                    .child(
-                        div()
-                            .text_color(t.accent)
-                            .child(Icon::NoxMark.element(ICON_MD)),
-                    )
+                    .child(Icon::NoxMark.element(ICON_MD, t.accent))
                     .child(
                         div()
                             .text_size(px(14.))
@@ -1205,7 +1196,7 @@ impl Workspace {
                             .text_size(t.small_size)
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(t.muted)
-                            .child(Icon::ClockHistory.element(ICON_XS))
+                            .child(Icon::ClockHistory.element(ICON_XS, t.muted))
                             .child("Recent & favorites"),
                     )
                     .child(
@@ -1257,16 +1248,12 @@ impl Workspace {
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
                     .child(
-                        div()
-                            .text_color(if is_fav { t.warning } else { t.muted })
-                            .child(
-                                if is_fav {
-                                    Icon::StarFilled
-                                } else {
-                                    Icon::FileText
-                                }
-                                .element(ICON_XS),
-                            ),
+                        if is_fav {
+                            Icon::StarFilled
+                        } else {
+                            Icon::FileText
+                        }
+                        .element(ICON_XS, if is_fav { t.warning } else { t.muted }),
                     )
                     .child(
                         div()
@@ -1307,11 +1294,7 @@ impl Workspace {
             .bg(t.elevated)
             .border_b_1()
             .border_color(t.border)
-            .child(
-                div()
-                    .text_color(t.accent)
-                    .child(Icon::Hash.element(ICON_SM)),
-            )
+            .child(Icon::Hash.element(ICON_SM, t.accent))
             .child(
                 div()
                     .w(px(180.))
@@ -1385,11 +1368,7 @@ impl Workspace {
                     .gap_2()
                     .min_w_0()
                     .flex_1()
-                    .child(
-                        div()
-                            .text_color(t.danger)
-                            .child(Icon::AlertTriangle.element(ICON_SM)),
-                    )
+                    .child(Icon::AlertTriangle.element(ICON_SM, t.danger))
                     .child(
                         div()
                             .text_size(t.small_size)
@@ -1446,8 +1425,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(t.accent)
-                            .child(Icon::NoxMark.element(ICON_HERO)),
+                            .child(Icon::NoxMark.element(ICON_HERO, t.accent)),
                     )
                     .child(
                         div()
@@ -1480,7 +1458,7 @@ impl Workspace {
                     .items_center()
                     .gap_2p5()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(Icon::FolderOpen.element(ICON_MD))
+                    .child(Icon::FolderOpen.element(ICON_MD, t.on_accent))
                     .child("Open")
                     .when_some(open_shortcut, |el, key| {
                         el.child(
@@ -1528,16 +1506,12 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(move |s| s.bg(hover))
                         .child(
-                            div()
-                                .text_color(if is_fav { t.warning } else { t.muted })
-                                .child(
-                                    if is_fav {
-                                        Icon::StarFilled
-                                    } else {
-                                        Icon::ClockHistory
-                                    }
-                                    .element(ICON_XS),
-                                ),
+                            if is_fav {
+                                Icon::StarFilled
+                            } else {
+                                Icon::ClockHistory
+                            }
+                            .element(ICON_XS, if is_fav { t.warning } else { t.muted }),
                         )
                         .child(
                             div()
@@ -1575,7 +1549,7 @@ impl Workspace {
 
         let search_box = div()
             .flex_1()
-            .min_w(px(280.))
+            .min_w(px(200.))
             .h(px(34.))
             .pl_2p5()
             .pr_1()
@@ -1586,11 +1560,7 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1p5()
-            .child(
-                div()
-                    .text_color(t.muted)
-                    .child(Icon::Search.element(ICON_SM)),
-            )
+            .child(Icon::Search.element(ICON_SM, t.muted))
             .child(
                 div().key_context("Search").flex_1().min_w_0().child(
                     text_input("query")
@@ -1701,14 +1671,13 @@ impl Workspace {
             );
 
         let mut bar = div()
+            .h(px(48.))
             .flex_shrink_0()
             .bg(t.panel)
             .border_t_1()
             .border_color(t.border)
             .px_3()
-            .py_2()
             .flex()
-            .flex_wrap()
             .items_center()
             .gap_2()
             .child(search_box)
@@ -1748,8 +1717,7 @@ impl Workspace {
                 .child(
                     div()
                         .id("presets-icon")
-                        .text_color(t.muted)
-                        .child(Icon::Sparkles.element(ICON_XS))
+                        .child(Icon::Sparkles.element(ICON_XS, t.muted))
                         .tooltip_show_delay(TOOLTIP_DELAY)
                         .tooltip({
                             let tip_theme = t.clone();
@@ -1881,7 +1849,10 @@ impl Workspace {
                                     } else {
                                         Icon::Bookmark
                                     }
-                                    .element(px(11.)),
+                                    .element(
+                                        px(11.),
+                                        if bookmarks > 0 { t.warning } else { t.muted },
+                                    ),
                                 )
                                 .child(
                                     div()
@@ -1920,7 +1891,7 @@ impl Workspace {
                         .items_center()
                         .gap_1p5()
                         .text_color(t.accent)
-                        .child(Icon::Check.element(px(12.)))
+                        .child(Icon::Check.element(px(12.), t.accent))
                         .child(feedback),
                 )
             })
@@ -1995,7 +1966,7 @@ impl Render for Workspace {
                                 .min_w_0()
                                 .flex_1()
                                 .text_color(t.muted)
-                                .child(Icon::Lines.element(px(12.)))
+                                .child(Icon::Lines.element(px(12.), t.muted))
                                 .child(
                                     div()
                                         .font_family(t.mono_font.clone())
@@ -2081,9 +2052,8 @@ impl Render for Workspace {
                         .text_size(t.xs_size)
                         .text_color(t.muted)
                         .child(
-                            div()
-                                .text_color(if match_count > 0 { t.accent } else { t.muted })
-                                .child(Icon::ListFilter.element(ICON_XS)),
+                            Icon::ListFilter
+                                .element(ICON_XS, if match_count > 0 { t.accent } else { t.muted }),
                         )
                         .child(
                             div()
@@ -2110,8 +2080,7 @@ impl Render for Workspace {
                                     .id("result-limit")
                                     .flex()
                                     .items_center()
-                                    .text_color(t.warning)
-                                    .child(Icon::AlertTriangle.element(ICON_XS))
+                                    .child(Icon::AlertTriangle.element(ICON_XS, t.warning))
                                     .tooltip_show_delay(TOOLTIP_DELAY)
                                     .tooltip(move |_, cx| {
                                         Tooltip::view(
@@ -2139,19 +2108,17 @@ impl Render for Workspace {
                     )
                 });
 
-            div()
-                .flex_1()
-                .min_h_0()
+            let results_body = div()
+                .h(px(self.config.window.results_height))
+                .max_h(relative(0.45))
+                .flex_shrink_0()
+                .w_full()
                 .flex()
                 .flex_col()
-                .child(source_pane)
-                .child(self.render_search_bar(&options, cx))
-                .child(results_header)
                 .when(result_count == 0, |col| {
                     col.child(
                         div()
-                            .h(px(72.))
-                            .flex_shrink_0()
+                            .flex_1()
                             .flex()
                             .items_center()
                             .justify_center()
@@ -2172,11 +2139,21 @@ impl Render for Workspace {
                         )
                         .with_width_from_item(Some(widest_result))
                         .track_scroll(&result_scroll)
-                        .h(px(self.config.window.results_height))
-                        .max_h(relative(0.45))
-                        .flex_shrink_0(),
+                        .flex_1()
+                        .w_full()
+                        .min_h_0(),
                     )
-                })
+                });
+
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(source_pane)
+                .child(self.render_search_bar(&options, cx))
+                .child(results_header)
+                .child(results_body)
         };
 
         div()
@@ -2321,12 +2298,23 @@ mod tests {
     }
 
     #[gpui::test]
-    fn all_icons_parse_as_valid_svgs(cx: &mut TestAppContext) {
+    fn all_icons_rasterize_with_visible_pixels(cx: &mut TestAppContext) {
         cx.update(|cx| {
             for icon in Icon::ALL {
+                let image = cx
+                    .svg_renderer()
+                    .render_single_frame(icon.svg_bytes(), 2.0)
+                    .unwrap_or_else(|err| panic!("Icon::{icon:?} failed SVG rendering: {err}"));
+                let has_visible_pixel = image
+                    .as_bytes(0)
+                    .expect("icon frame bytes")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|px| px[3] > 0);
                 assert!(
-                    cx.svg_renderer().parse_svg(icon.svg_bytes()).is_ok(),
-                    "Icon::{icon:?} failed SVG parsing"
+                    has_visible_pixel,
+                    "Icon::{icon:?} rasterized completely transparent"
                 );
             }
         });
@@ -2336,7 +2324,7 @@ mod tests {
     fn resolves_preferred_fonts_and_formats_telemetry() {
         let installed = vec![
             "Menlo".to_owned(),
-            ".SF NS Mono".to_owned(),
+            "SauceCodePro Nerd Font Mono".to_owned(),
             "SF Pro Text".to_owned(),
         ];
         assert_eq!(
@@ -2344,8 +2332,12 @@ mod tests {
             "Menlo"
         );
         assert_eq!(
-            theme::resolve_font("SF Mono", &["JetBrains Mono", "Menlo"], &installed),
-            ".SF NS Mono"
+            theme::resolve_font(
+                "JetBrains Mono",
+                &["JetBrains Mono", "SauceCodePro Nerd Font Mono", "Menlo"],
+                &installed,
+            ),
+            "SauceCodePro Nerd Font Mono"
         );
         assert_eq!(
             theme::resolve_font("MissingFont", &["JetBrains Mono", "Menlo"], &installed),

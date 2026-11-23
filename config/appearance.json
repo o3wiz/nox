@@ -2,7 +2,7 @@
   "$schema": "../schemas/appearance.schema.json",
   "ui_font_family": "SF Pro Text",
   "ui_font_size": 13,
-  "font_family": "SF Mono",
+  "font_family": "JetBrains Mono",
   "font_size": 13,
   "background": "#0E1218",
   "panel": "#151B24",

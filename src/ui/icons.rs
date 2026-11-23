@@ -1,4 +1,4 @@
-use gpui::{Pixels, Styled, Svg, svg};
+use gpui::{Hsla, Pixels, Styled, Svg, svg};
 
 /// Consistent 24x24 vector icon catalog (Phosphor-inspired rounded stroke craft).
 /// All SVGs render with explicit white geometry so GPUI tints their alpha mask
@@ -124,7 +124,14 @@ impl Icon {
         }
     }
 
-    pub fn element(self, size: Pixels) -> Svg {
-        svg().data(self.svg_bytes()).size(size).flex_shrink_0()
+    /// Builds an `Svg` element tinted directly with `color`.
+    /// GPUI's `Svg::paint` reads `style.text.color` from the `Svg` itself rather than
+    /// inheriting parent text color, so `color` is always applied directly here.
+    pub fn element(self, size: Pixels, color: Hsla) -> Svg {
+        svg()
+            .data(self.svg_bytes())
+            .size(size)
+            .flex_shrink_0()
+            .text_color(color)
     }
 }

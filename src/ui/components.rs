@@ -79,7 +79,7 @@ pub enum ButtonTone {
 
 /// Crisp icon-only button with stable bounds, semantic state styling, and rich tooltip.
 pub fn icon_button(
-    id: impl Into<ElementId>,
+    id: &'static str,
     icon: Icon,
     tooltip: impl Into<SharedString>,
     shortcut: Option<SharedString>,
@@ -121,6 +121,7 @@ pub fn icon_button(
 
     div()
         .id(id)
+        .group(id)
         .size(px(32.0))
         .flex_shrink_0()
         .flex()
@@ -130,10 +131,12 @@ pub fn icon_button(
         .border_1()
         .border_color(border)
         .bg(bg)
-        .text_color(fg)
         .cursor_pointer()
-        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
-        .child(icon.element(ICON_SM))
+        .hover(move |s| s.bg(hover_bg))
+        .child(
+            icon.element(ICON_SM, fg)
+                .group_hover(id, move |s| s.text_color(hover_fg)),
+        )
         .tooltip_show_delay(TOOLTIP_DELAY)
         .tooltip(move |_window, cx| {
             Tooltip::view(tooltip.clone(), shortcut.clone(), tip_theme.clone(), cx)
@@ -142,7 +145,7 @@ pub fn icon_button(
 
 /// Compact 26x26 toggle icon button designed to live inline inside the search bar.
 pub fn search_toggle(
-    id: impl Into<ElementId>,
+    id: &'static str,
     icon: Icon,
     tooltip: impl Into<SharedString>,
     enabled: bool,
@@ -170,6 +173,7 @@ pub fn search_toggle(
 
     div()
         .id(id)
+        .group(id)
         .size(px(26.0))
         .flex_shrink_0()
         .flex()
@@ -179,10 +183,12 @@ pub fn search_toggle(
         .border_1()
         .border_color(border)
         .bg(bg)
-        .text_color(fg)
         .cursor_pointer()
-        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
-        .child(icon.element(px(14.0)))
+        .hover(move |s| s.bg(hover_bg))
+        .child(
+            icon.element(px(14.0), fg)
+                .group_hover(id, move |s| s.text_color(hover_fg)),
+        )
         .tooltip_show_delay(TOOLTIP_DELAY)
         .tooltip(move |_window, cx| Tooltip::view(tooltip.clone(), None, tip_theme.clone(), cx))
 }

@@ -16,8 +16,6 @@ const UI_FONT_PREFERENCES: &[&str] = &[
 
 const MONO_FONT_PREFERENCES: &[&str] = &[
     "JetBrains Mono",
-    "SF Mono",
-    ".SF NS Mono",
     "SauceCodePro Nerd Font Mono",
     "SauceCodePro NFM",
     "Fira Code",
@@ -177,12 +175,6 @@ pub fn resolve_font(configured: &str, preferences: &[&str], installed: &[String]
     if !is_generic {
         if let Some(exact) = find_installed(trimmed, installed) {
             return exact;
-        }
-        // On macOS, the system SF Mono face is registered internally as `.SF NS Mono`.
-        if trimmed.eq_ignore_ascii_case("SF Mono")
-            && let Some(apple_mono) = find_installed(".SF NS Mono", installed)
-        {
-            return apple_mono;
         }
         // In headless tests or platforms without font enumeration, keep explicit config.
         if installed.is_empty() {
