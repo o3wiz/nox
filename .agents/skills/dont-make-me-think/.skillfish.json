@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "dont-make-me-think",
+  "owner": "lev-os",
+  "repo": "agents",
+  "path": "skills-db/thinking/patterns/dont-make-me-think",
+  "branch": "main",
+  "sha": "a37fc943ab6a29583e76e23b830bbbe09b6e5076",
+  "source": "manual"
+}
