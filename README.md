@@ -13,11 +13,11 @@ Requires a Rust toolchain supporting edition 2024 and the native build prerequis
 
 ## Using the viewer
 
-Open files with **Open**, by dragging files onto the window, the command line, or **Files** (recent files and configured favorites). Click a tab to switch; **Close tab** closes the active file. Enter a search and press **Enter** or **Search**. `.*`, `Aa`, `Word`, and `Not` toggle regex, case sensitivity, whole-word matching, and inversion. Presets apply immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
+Open files with **Open files**, by dragging files onto the window, the command line, or **Recent & favorites**. Click a tab to switch; **Close tab** closes the active file. Enter a search and press **Enter** or **Search**. Expand **Search options** to toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches**. A summary below the search field always shows the active settings. Presets apply immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
 
-Click a result to jump to its source line. Click the gutter or use **Bookmark** to mark a line. Selecting a line stops following; **Follow** resumes scrolling to the end as changes arrive. Watching continues even when following is off. **Reload** retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
+Click a result to jump to its source line. Click the gutter or use **Bookmark** to mark a line. Selecting a line stops following; **Follow new lines** resumes scrolling to the end as changes arrive. Watching continues even when following is off. **Reload** retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
-**Export** writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Copying copies the complete selected line as text. Regex errors and file errors appear in the status bar.
+**Export results** writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Copying copies the complete selected line as text. Regex errors and file errors appear above the viewer, even when the status bar is hidden. Empty search results include guidance for the next step.
 
 Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 

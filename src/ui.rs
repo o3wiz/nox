@@ -123,6 +123,7 @@ pub struct Workspace {
     state_path: Option<PathBuf>,
     recent: Vec<PathBuf>,
     show_files: bool,
+    show_search_options: bool,
 }
 impl Workspace {
     fn new(
@@ -214,6 +215,7 @@ impl Workspace {
             },
             recent: saved.recent,
             show_files: false,
+            show_search_options: false,
         };
         for path in paths {
             this.open(path, cx);
@@ -703,7 +705,9 @@ impl Workspace {
             .whitespace_nowrap()
             .flex_shrink_0()
             .px_3()
-            .py_1()
+            .min_h(px(44.))
+            .flex()
+            .items_center()
             .rounded_md()
             .cursor_pointer()
             .bg(rgb(if active { p.selection } else { p.panel }))
@@ -899,7 +903,7 @@ impl Render for Workspace {
         let result_label = tab
             .map(|t| {
                 format!(
-                    "FILTERED RESULTS   {} matches · {} rows{}{}",
+                    "Search results · {} matches · {} rows{}{}",
                     t.results.matches.len(),
                     result_count,
                     if t.results.limited {
@@ -912,7 +916,7 @@ impl Render for Workspace {
             })
             .unwrap_or_else(|| "FILTERED RESULTS".into());
         let file_label = format!(
-            "SOURCE   {line_count} lines{}",
+            "All lines · {line_count} lines{}",
             if tab.is_some_and(|t| t.loading) {
                 " · indexing…"
             } else {
@@ -950,7 +954,7 @@ impl Render for Workspace {
                     .on_click(cx.listener(move |this, _, _, cx| this.switch(index, cx))),
             );
         }
-        let mut controls = div()
+        let controls = div()
             .flex()
             .items_center()
             .gap_2()
@@ -972,14 +976,40 @@ impl Render for Workspace {
                         .bg(rgb(p.background)),
                 ),
             )
-            .child(self.button("search", "Search", Command::Search, true, cx));
+            .child(self.button("search", "Search", Command::Search, true, cx))
+            .child(
+                div()
+                    .id("search-options")
+                    .px_3()
+                    .min_h(px(44.))
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(p.panel))
+                    .hover(move |s| s.bg(rgb(p.selection)))
+                    .child(if self.show_search_options {
+                        "Hide options"
+                    } else {
+                        "Search options"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_search_options = !this.show_search_options;
+                        cx.notify();
+                    })),
+            );
+        let mut search_options = div().flex().flex_wrap().gap_2().px_3().py_2();
         for (id, label, enabled) in [
-            ("regex", ".*", options.mode == SearchMode::Regex),
-            ("case", "Aa", options.case_sensitive),
-            ("word", "Word", options.whole_word),
-            ("invert", "Not", options.invert),
+            (
+                "regex",
+                "Regular expression",
+                options.mode == SearchMode::Regex,
+            ),
+            ("case", "Match case", options.case_sensitive),
+            ("word", "Whole words", options.whole_word),
+            ("invert", "Exclude matches", options.invert),
         ] {
-            controls = controls.child(
+            search_options = search_options.child(
                 div()
                     .id(id)
                     .px_2()
@@ -988,7 +1018,11 @@ impl Render for Workspace {
                     .cursor_pointer()
                     .text_color(rgb(if enabled { p.accent } else { p.muted }))
                     .bg(rgb(if enabled { p.selection } else { p.panel }))
-                    .child(label)
+                    .min_h(px(44.))
+                    .flex()
+                    .items_center()
+                    .hover(move |s| s.bg(rgb(p.selection)))
+                    .child(format!("{} {label}", if enabled { "✓" } else { "○" }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(tab) = this.tabs.get_mut(this.active) {
                             match id {
@@ -1017,7 +1051,7 @@ impl Render for Workspace {
             .py_1()
             .overflow_x_scroll()
             .text_color(rgb(p.muted))
-            .child("PRESETS");
+            .child("Saved searches");
         for (index, preset) in self.config.search.presets.iter().enumerate() {
             let preset = preset.clone();
             presets = presets.child(
@@ -1038,18 +1072,26 @@ impl Render for Workspace {
                     })),
             );
         }
-        let mut content = div().flex_1().min_h_0().flex().flex_col().child(
+        let mut content =
             div()
-                .key_context("Log")
-                .track_focus(&self.focus)
+                .flex_1()
+                .min_h_0()
                 .flex()
-                .justify_between()
-                .px_3()
-                .py_1()
-                .text_color(rgb(p.muted))
-                .child(file_label)
-                .child("Click gutter to bookmark · F3 next match"),
-        );
+                .flex_col()
+                .when(!self.tabs.is_empty(), |content| {
+                    content.child(
+                        div()
+                            .key_context("Log")
+                            .track_focus(&self.focus)
+                            .flex()
+                            .justify_between()
+                            .px_3()
+                            .py_1()
+                            .text_color(rgb(p.muted))
+                            .child(file_label)
+                            .child("Click gutter to bookmark · F3 next match"),
+                    )
+                });
         if self.tabs.is_empty() {
             let mut welcome = div()
                 .flex_1()
@@ -1059,11 +1101,14 @@ impl Render for Workspace {
                 .justify_center()
                 .gap_4()
                 .child(div().text_3xl().text_color(rgb(p.accent)).child("NOX"))
-                .child("Explore. Filter. Follow.")
+                .child("Open a log file to start exploring")
+                .child("Search for events, bookmark lines, and follow new entries as they arrive.")
+                .child(self.button("welcome-open", "Open log files", Command::Open, true, cx))
                 .child(
-                    "Open a log file with the Open button or pass file paths on the command line.",
-                )
-                .child(self.button("welcome-open", "Open log files", Command::Open, true, cx));
+                    div()
+                        .text_color(rgb(p.muted))
+                        .child("Or drag log files into this window"),
+                );
             for (index, path) in self.config.files.favorites.iter().enumerate() {
                 let path = path.clone();
                 welcome = welcome.child(
@@ -1079,6 +1124,17 @@ impl Render for Workspace {
             }
             content = content.child(welcome);
         } else {
+            if line_count == 0 {
+                content = content.child(div().p_4().text_color(rgb(p.muted)).child(
+                    if tab.is_some_and(|t| t.loading) {
+                        "Opening file…"
+                    } else if tab.is_some_and(|t| t.error.is_some()) {
+                        "Cannot display this file. Reload to retry."
+                    } else {
+                        "This file is empty. New lines will appear here when the file changes."
+                    },
+                ));
+            }
             content = content.child(
                 div()
                     .flex()
@@ -1104,33 +1160,89 @@ impl Render for Workspace {
                     }),
             );
         }
-        content = content
-            .child(controls)
-            .child(presets)
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .px_3()
-                    .py_1()
-                    .bg(rgb(p.panel))
-                    .text_color(rgb(p.muted))
-                    .child(result_label)
-                    .child(self.button("export", "Export", Command::ExportResults, false, cx)),
-            )
-            .child(
-                uniform_list(
-                    "results",
-                    result_count,
-                    cx.processor(|this, range, _, cx| this.rows(range, true, cx)),
+        let empty_results = if tab.is_some_and(|t| t.searching || t.loading) {
+            "Searching the file…"
+        } else if tab.is_some_and(|t| t.error.is_some()) {
+            "Results unavailable. See the error above."
+        } else if tab.is_some_and(|t| t.query.is_empty()) {
+            if self.config.viewer.include_bookmarks {
+                "Search this file or bookmark a line to see it here."
+            } else {
+                "Enter a search above to find lines in this file."
+            }
+        } else {
+            "No matching lines. Try a different search or change Search options."
+        };
+        content = content.when(!self.tabs.is_empty(), |content| {
+            content
+                .child(controls)
+                .child(div().px_3().py_1().text_color(rgb(p.muted)).child(format!(
+                    "{}{}{}{}",
+                    if options.mode == SearchMode::Regex {
+                        "Regular expression"
+                    } else {
+                        "Plain text"
+                    },
+                    if options.case_sensitive {
+                        " · Match case"
+                    } else {
+                        " · Ignore case"
+                    },
+                    if options.whole_word {
+                        " · Whole words"
+                    } else {
+                        ""
+                    },
+                    if options.invert {
+                        " · Exclude matches"
+                    } else {
+                        ""
+                    },
+                )))
+                .when(self.show_search_options, |content| {
+                    content.child(search_options)
+                })
+                .child(presets)
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .px_3()
+                        .py_1()
+                        .bg(rgb(p.panel))
+                        .text_color(rgb(p.muted))
+                        .child(result_label)
+                        .when(result_count > 0, |header| {
+                            header.child(self.button(
+                                "export",
+                                "Export results",
+                                Command::ExportResults,
+                                false,
+                                cx,
+                            ))
+                        }),
                 )
-                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                .with_width_from_item(Some(widest_result))
-                .track_scroll(&result_scroll)
-                .h(px(self.config.window.results_height))
-                .max_h(relative(0.45))
-                .flex_shrink_0(),
-            );
+                .when(result_count == 0, |content| {
+                    content.child(div().p_4().text_color(rgb(p.muted)).child(empty_results))
+                })
+                .when(result_count > 0, |content| {
+                    content.child(
+                        uniform_list(
+                            "results",
+                            result_count,
+                            cx.processor(|this, range, _, cx| this.rows(range, true, cx)),
+                        )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .with_width_from_item(Some(widest_result))
+                        .track_scroll(&result_scroll)
+                        .h(px(self.config.window.results_height))
+                        .max_h(relative(0.45))
+                        .flex_shrink_0(),
+                    )
+                })
+        });
         div()
             .size_full()
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
@@ -1166,21 +1278,40 @@ impl Render for Workspace {
                             .mr_3()
                             .child("NOX"),
                     )
-                    .child(self.button("open", "Open", Command::Open, false, cx))
-                    .child(self.button("library", "Files", Command::ShowFiles, self.show_files, cx))
-                    .child(self.button("reload", "Reload", Command::Reload, false, cx))
+                    .child(self.button("open", "Open files", Command::Open, true, cx))
                     .child(self.button(
-                        "follow",
-                        if follow { "● Following" } else { "Follow" },
-                        Command::ToggleFollow,
-                        follow,
+                        "library",
+                        "Recent & favorites",
+                        Command::ShowFiles,
+                        self.show_files,
                         cx,
                     ))
-                    .child(self.button("mark", "Bookmark", Command::ToggleBookmark, false, cx))
-                    .child(self.button("goto", "Go to line", Command::GoToLine, false, cx))
-                    .child(self.button("close", "Close tab", Command::CloseTab, false, cx)),
+                    .when(!self.tabs.is_empty(), |toolbar| {
+                        toolbar
+                            .child(self.button("reload", "Reload", Command::Reload, false, cx))
+                            .child(self.button(
+                                "follow",
+                                if follow {
+                                    "Following: on"
+                                } else {
+                                    "Follow new lines"
+                                },
+                                Command::ToggleFollow,
+                                follow,
+                                cx,
+                            ))
+                            .child(self.button(
+                                "mark",
+                                "Bookmark",
+                                Command::ToggleBookmark,
+                                false,
+                                cx,
+                            ))
+                            .child(self.button("goto", "Go to line", Command::GoToLine, false, cx))
+                            .child(self.button("close", "Close tab", Command::CloseTab, false, cx))
+                    }),
             )
-            .child(tabs)
+            .when(!self.tabs.is_empty(), |root| root.child(tabs))
             .when(self.show_files, |root| {
                 let mut library = div()
                     .id("file-library")
@@ -1191,7 +1322,13 @@ impl Render for Workspace {
                     .p_3()
                     .gap_1()
                     .bg(rgb(p.panel))
-                    .child("FAVORITES & RECENT FILES");
+                    .child("Recent files & favorites")
+                    .when(
+                        self.recent.is_empty() && self.config.files.favorites.is_empty(),
+                        |library| {
+                            library.child("No recent files yet. Choose Open files to browse.")
+                        },
+                    );
                 for (index, path) in self
                     .config
                     .files
@@ -1204,6 +1341,11 @@ impl Render for Workspace {
                     library = library.child(
                         div()
                             .id(("library-file", index))
+                            .min_h(px(44.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .hover(move |s| s.bg(rgb(p.selection)))
                             .cursor_pointer()
                             .text_color(rgb(p.accent))
                             .child(path.display().to_string())
@@ -1239,6 +1381,16 @@ impl Render for Workspace {
                                 .bg(rgb(p.panel)),
                         )
                         .child(self.button("jump", "Jump", Command::GoToLine, true, cx)),
+                )
+            })
+            .when(tab.is_some_and(|t| t.error.is_some()), |root| {
+                root.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .bg(rgb(p.selection))
+                        .child(message.clone())
+                        .child(" · Check the search options, or Reload to retry opening the file."),
                 )
             })
             .child(content)
