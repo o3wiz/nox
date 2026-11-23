@@ -1261,34 +1261,42 @@ pub fn run(config: Config, paths: Vec<PathBuf>) -> anyhow::Result<()> {
     gpui_platform::application()
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx: &mut App| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
-            cx.bind_keys(bindings);
-            let bounds = Bounds::centered(
-                None,
-                size(px(config.window.width), px(config.window.height)),
-                cx,
-            );
-            let bounds = if config.window.maximized {
-                WindowBounds::Maximized(bounds)
-            } else {
-                WindowBounds::Windowed(bounds)
-            };
-            let options = WindowOptions {
-                window_bounds: Some(bounds),
-                window_min_size: Some(size(px(640.), px(480.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(config.window.title.clone().into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            if let Err(error) = cx.open_window(options, |window, cx| {
-                cx.new(|cx| Workspace::new(config, paths, window, cx))
-            }) {
-                eprintln!("Cannot open window: {error}");
-                cx.quit();
-            }
-            cx.activate(true);
+            // GPUI CE 0.3.0 invokes this callback while holding the macOS
+            // platform mutex. Opening a native window here takes that mutex
+            // again. Schedule startup after the launch callback has returned.
+            cx.spawn(async move |cx| {
+                cx.update(move |cx| {
+                    cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+                    cx.bind_keys(bindings);
+                    let bounds = Bounds::centered(
+                        None,
+                        size(px(config.window.width), px(config.window.height)),
+                        cx,
+                    );
+                    let bounds = if config.window.maximized {
+                        WindowBounds::Maximized(bounds)
+                    } else {
+                        WindowBounds::Windowed(bounds)
+                    };
+                    let options = WindowOptions {
+                        window_bounds: Some(bounds),
+                        window_min_size: Some(size(px(640.), px(480.))),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some(config.window.title.clone().into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    if let Err(error) = cx.open_window(options, |window, cx| {
+                        cx.new(|cx| Workspace::new(config, paths, window, cx))
+                    }) {
+                        eprintln!("Cannot open window: {error}");
+                        cx.quit();
+                    }
+                    cx.activate(true);
+                });
+            })
+            .detach();
         });
     Ok(())
 }
