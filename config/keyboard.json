@@ -1,0 +1,130 @@
+{
+  "$schema": "../schemas/keyboard.schema.json",
+  "bindings": [
+    {
+      "keys": "secondary-o",
+      "action": "open",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-w",
+      "action": "close_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-tab",
+      "action": "next_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-f",
+      "action": "focus_search",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-l",
+      "action": "go_to_line",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-r",
+      "action": "reload",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-e",
+      "action": "export_results",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-q",
+      "action": "quit",
+      "context": "Workspace"
+    },
+    {
+      "keys": "f3",
+      "action": "next_match",
+      "context": "Workspace"
+    },
+    {
+      "keys": "shift-f3",
+      "action": "previous_match",
+      "context": "Workspace"
+    },
+    {
+      "keys": "f",
+      "action": "toggle_follow",
+      "context": "Log"
+    },
+    {
+      "keys": "m",
+      "action": "toggle_bookmark",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-c",
+      "action": "copy_line",
+      "context": "Log"
+    },
+    {
+      "keys": "enter",
+      "action": "search",
+      "context": "Search"
+    },
+    {
+      "keys": "escape",
+      "action": "focus_log",
+      "context": "Search"
+    },
+    {
+      "keys": "enter",
+      "action": "go_to_line",
+      "context": "GoTo"
+    },
+    {
+      "keys": "escape",
+      "action": "focus_log",
+      "context": "GoTo"
+    },
+    {
+      "keys": "down",
+      "action": "next_line",
+      "context": "Log"
+    },
+    {
+      "keys": "up",
+      "action": "previous_line",
+      "context": "Log"
+    },
+    {
+      "keys": "home",
+      "action": "first_line",
+      "context": "Log"
+    },
+    {
+      "keys": "end",
+      "action": "last_line",
+      "context": "Log"
+    },
+    {
+      "keys": "pageup",
+      "action": "page_up",
+      "context": "Log"
+    },
+    {
+      "keys": "pagedown",
+      "action": "page_down",
+      "context": "Log"
+    },
+    {
+      "keys": "b",
+      "action": "next_bookmark",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-b",
+      "action": "previous_bookmark",
+      "context": "Log"
+    }
+  ]
+}

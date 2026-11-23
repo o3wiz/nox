@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FilesConfig",
+  "type": "object",
+  "properties": {
+    "startup": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "favorites": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "restore_session": {
+      "type": "boolean"
+    },
+    "save_session": {
+      "type": "boolean"
+    },
+    "state_file": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recent_limit": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0,
+      "maximum": 1000
+    },
+    "$schema": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

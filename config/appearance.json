@@ -1,0 +1,12 @@
+{
+  "$schema": "../schemas/appearance.schema.json",
+  "font_family": "monospace",
+  "font_size": 13,
+  "background": "#11151C",
+  "panel": "#1A202B",
+  "foreground": "#D8E1EE",
+  "muted": "#8492A6",
+  "accent": "#74C7B8",
+  "selection": "#283F50",
+  "border": "#2B3545"
+}

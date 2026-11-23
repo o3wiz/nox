@@ -1,0 +1,9 @@
+{
+  "$schema": "../schemas/window.schema.json",
+  "title": "Nox \u2014 Log Explorer",
+  "width": 1280,
+  "height": 850,
+  "maximized": false,
+  "results_height": 250,
+  "show_status_bar": true
+}

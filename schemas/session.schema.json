@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Session",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "active": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "tabs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SavedTab"
+      }
+    },
+    "recent": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "active",
+    "tabs",
+    "recent"
+  ],
+  "$defs": {
+    "SavedTab": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "options": {
+          "$ref": "#/$defs/SearchConfig"
+        },
+        "bookmarks": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        },
+        "selected": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "follow": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "query",
+        "options",
+        "bookmarks",
+        "selected",
+        "follow"
+      ]
+    },
+    "SearchConfig": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/SearchMode"
+        },
+        "case_sensitive": {
+          "type": "boolean"
+        },
+        "whole_word": {
+          "type": "boolean"
+        },
+        "invert": {
+          "type": "boolean"
+        },
+        "context_lines": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "max_results": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 1,
+          "maximum": 10000000
+        },
+        "presets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Preset"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "case_sensitive",
+        "whole_word",
+        "invert",
+        "context_lines",
+        "max_results",
+        "presets"
+      ]
+    },
+    "SearchMode": {
+      "type": "string",
+      "enum": [
+        "literal",
+        "regex"
+      ]
+    },
+    "Preset": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/SearchMode"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "pattern",
+        "mode"
+      ]
+    }
+  }
+}

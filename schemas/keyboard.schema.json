@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KeyboardConfig",
+  "type": "object",
+  "properties": {
+    "bindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Binding"
+      }
+    },
+    "$schema": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Binding": {
+      "type": "object",
+      "properties": {
+        "keys": {
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/$defs/KeyContext"
+        },
+        "action": {
+          "$ref": "#/$defs/Command"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "keys",
+        "context",
+        "action"
+      ]
+    },
+    "KeyContext": {
+      "type": "string",
+      "enum": [
+        "Workspace",
+        "Log",
+        "Search",
+        "GoTo"
+      ]
+    },
+    "Command": {
+      "type": "string",
+      "enum": [
+        "open",
+        "close_tab",
+        "next_tab",
+        "search",
+        "focus_search",
+        "focus_log",
+        "toggle_follow",
+        "toggle_bookmark",
+        "next_match",
+        "previous_match",
+        "copy_line",
+        "reload",
+        "go_to_line",
+        "export_results",
+        "quit",
+        "next_line",
+        "previous_line",
+        "first_line",
+        "last_line",
+        "page_up",
+        "page_down",
+        "next_bookmark",
+        "previous_bookmark",
+        "show_files"
+      ]
+    }
+  }
+}

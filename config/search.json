@@ -1,0 +1,26 @@
+{
+  "$schema": "../schemas/search.schema.json",
+  "mode": "regex",
+  "case_sensitive": false,
+  "whole_word": false,
+  "invert": false,
+  "context_lines": 0,
+  "max_results": 100000,
+  "presets": [
+    {
+      "name": "Errors",
+      "pattern": "error|fatal|panic",
+      "mode": "regex"
+    },
+    {
+      "name": "Warnings",
+      "pattern": "warn",
+      "mode": "literal"
+    },
+    {
+      "name": "Requests",
+      "pattern": "GET|POST|PUT|DELETE",
+      "mode": "regex"
+    }
+  ]
+}
