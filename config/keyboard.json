@@ -125,6 +125,51 @@
       "keys": "shift-b",
       "action": "previous_bookmark",
       "context": "Log"
+    },
+    {
+      "keys": "tab",
+      "action": "switch_pane",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-down",
+      "action": "select_next_line",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-up",
+      "action": "select_previous_line",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-home",
+      "action": "select_first_line",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-end",
+      "action": "select_last_line",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-pageup",
+      "action": "select_page_up",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-pagedown",
+      "action": "select_page_down",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-a",
+      "action": "select_all",
+      "context": "Log"
+    },
+    {
+      "keys": "escape",
+      "action": "clear_selection",
+      "context": "Log"
     }
   ]
 }

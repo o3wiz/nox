@@ -70,7 +70,16 @@
         "page_down",
         "next_bookmark",
         "previous_bookmark",
-        "show_files"
+        "show_files",
+        "switch_pane",
+        "select_next_line",
+        "select_previous_line",
+        "select_first_line",
+        "select_last_line",
+        "select_page_up",
+        "select_page_down",
+        "select_all",
+        "clear_selection"
       ]
     }
   }

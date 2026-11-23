@@ -17,6 +17,7 @@ use nox::{
     config::{self, Command, Config, SearchConfig, SearchMode},
     logfile::{LogFile, Stamp},
     search::{self, SearchResults},
+    selection::LineSelection,
     session::{self, SavedTab, Session},
 };
 use regex::Regex;
@@ -59,6 +60,15 @@ pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
         .collect()
 }
 
+const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BULK_BOOKMARK_LINES: usize = 100_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pane {
+    Main,
+    Results,
+}
+
 struct Tab {
     id: usize,
     path: PathBuf,
@@ -73,6 +83,8 @@ struct Tab {
     results: SearchResults,
     bookmarks: BTreeSet<usize>,
     selected: usize,
+    main_selection: LineSelection,
+    result_selection: LineSelection,
     follow: bool,
     scroll: UniformListScrollHandle,
     result_scroll: UniformListScrollHandle,
@@ -88,7 +100,7 @@ impl Drop for Tab {
 
 enum Message {
     Loaded(usize, Result<Arc<LogFile>, String>),
-    Searched(usize, usize, Result<SearchResults, String>),
+    Searched(usize, usize, bool, Result<SearchResults, String>),
     Exported(Result<(), String>),
 }
 
@@ -103,6 +115,9 @@ pub struct Workspace {
     goto: Entity<EditableTextState>,
     show_goto: bool,
     focus: FocusHandle,
+    results_focus: FocusHandle,
+    active_pane: Pane,
+    drag_selecting: Option<Pane>,
     sender: Sender<Message>,
     receiver: Receiver<Message>,
     last_poll: Instant,
@@ -123,6 +138,7 @@ impl Workspace {
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let focus = cx.focus_handle();
+        let results_focus = cx.focus_handle();
         focus.focus(window, cx);
         let timer = cx.spawn(async move |this, cx| {
             loop {
@@ -192,6 +208,9 @@ impl Workspace {
             goto: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
             show_goto: false,
             focus,
+            results_focus,
+            active_pane: Pane::Main,
+            drag_selecting: None,
             sender,
             receiver,
             last_poll: Instant::now(),
@@ -215,6 +234,7 @@ impl Workspace {
                 tab.options = saved.options;
                 tab.bookmarks = saved.bookmarks;
                 tab.selected = saved.selected;
+                tab.main_selection = LineSelection::single(saved.selected);
                 tab.follow = saved.follow;
             }
             this.active = saved.active.min(this.tabs.len().saturating_sub(1));
@@ -290,6 +310,8 @@ impl Workspace {
             results: SearchResults::default(),
             bookmarks: BTreeSet::new(),
             selected: 0,
+            main_selection: LineSelection::single(0),
+            result_selection: LineSelection::empty(),
             follow: self.config.viewer.follow,
             scroll: UniformListScrollHandle::new(),
             result_scroll: UniformListScrollHandle::new(),
@@ -305,6 +327,7 @@ impl Workspace {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.active = index;
+        self.drag_selecting = None;
         let query = self
             .tabs
             .get(index)
@@ -323,9 +346,11 @@ impl Workspace {
         {
             tab.query = self.input.read(cx).as_str().to_string();
         }
+        self.drag_selecting = None;
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = 0;
+            self.active_pane = Pane::Main;
             self.show_goto = false;
             self.input.update(cx, |input, cx| input.emplace("", cx));
         } else {
@@ -368,6 +393,15 @@ impl Workspace {
     }
 
     fn start_search(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.start_search_preserving(index, false, cx);
+    }
+
+    fn start_search_preserving(
+        &mut self,
+        index: usize,
+        preserve_selection: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
@@ -398,7 +432,7 @@ impl Workspace {
         std::thread::spawn(move || {
             let result = search::search(&log, &query, &options, &marks, &cancel)
                 .map_err(|error| error.to_string());
-            let _ = sender.send(Message::Searched(id, revision, result));
+            let _ = sender.send(Message::Searched(id, revision, preserve_selection, result));
         });
         cx.notify();
     }
@@ -419,14 +453,22 @@ impl Workspace {
                         tab.loading = false;
                         match result {
                             Ok(log) => {
+                                let initial = tab.log.is_none();
                                 let replaced =
                                     tab.log.as_ref().is_some_and(|old| old.replaced_by(&log));
                                 if replaced {
                                     tab.bookmarks.clear();
+                                    tab.main_selection =
+                                        LineSelection::single_clamped(0, log.len());
+                                } else if initial || tab.main_selection.is_empty() {
+                                    tab.main_selection =
+                                        LineSelection::single_clamped(tab.selected, log.len());
+                                } else {
+                                    tab.main_selection.clamp(log.len());
                                 }
-                                tab.selected = tab.selected.min(log.len().saturating_sub(1));
+                                tab.selected = tab.main_selection.cursor;
                                 tab.bookmarks.retain(|&line| line < log.len());
-                                if tab.log.is_none() && !tab.follow {
+                                if initial && !tab.follow && !log.is_empty() {
                                     tab.scroll
                                         .scroll_to_item(tab.selected, ScrollStrategy::Center);
                                 }
@@ -435,7 +477,7 @@ impl Workspace {
                                 if tab.follow {
                                     tab.scroll.scroll_to_bottom();
                                 }
-                                self.start_search(index, cx);
+                                self.start_search_preserving(index, !replaced && !initial, cx);
                             }
                             Err(error) => {
                                 tab.error = Some(error);
@@ -443,7 +485,7 @@ impl Workspace {
                         }
                     }
                 }
-                Message::Searched(id, revision, result) => {
+                Message::Searched(id, revision, preserve_selection, result) => {
                     if let Some(tab) = self
                         .tabs
                         .iter_mut()
@@ -452,12 +494,21 @@ impl Workspace {
                         tab.searching = false;
                         match result {
                             Ok(results) => {
-                                tab.results = results;
-                                tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                if preserve_selection {
+                                    tab.result_selection
+                                        .remap_sorted(&tab.results.visible, &results.visible);
+                                    tab.results = results;
+                                } else {
+                                    let len = results.visible.len();
+                                    tab.results = results;
+                                    tab.result_selection = LineSelection::single_clamped(0, len);
+                                    tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                }
                             }
                             Err(error) => {
                                 tab.error = Some(error);
                                 tab.results = SearchResults::default();
+                                tab.result_selection = LineSelection::empty();
                             }
                         }
                     }
@@ -554,6 +605,286 @@ impl Workspace {
         .detach();
     }
 
+    fn active_pane_for(&self, window: &Window) -> Pane {
+        if self.results_focus.is_focused(window) {
+            Pane::Results
+        } else if self.focus.is_focused(window) {
+            Pane::Main
+        } else {
+            self.active_pane
+        }
+    }
+
+    fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        self.show_goto = false;
+        match pane {
+            Pane::Main => self.focus.focus(window, cx),
+            Pane::Results => {
+                if let Some(tab) = self.tabs.get_mut(self.active)
+                    && tab.result_selection.is_empty()
+                    && !tab.results.visible.is_empty()
+                {
+                    let row = tab
+                        .results
+                        .visible
+                        .binary_search(&tab.selected)
+                        .unwrap_or_else(|idx| idx.min(tab.results.visible.len() - 1));
+                    tab.result_selection.select_single(row);
+                    tab.result_scroll
+                        .scroll_to_item(row, ScrollStrategy::Nearest);
+                }
+                self.results_focus.focus(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn selection_count(tab: &Tab, pane: Pane) -> usize {
+        match pane {
+            Pane::Main => {
+                let len = tab.log.as_ref().map_or(0, |log| log.len());
+                if len == 0 {
+                    0
+                } else {
+                    tab.main_selection.count().min(len)
+                }
+            }
+            Pane::Results => {
+                let len = tab.results.visible.len();
+                if len == 0 {
+                    0
+                } else {
+                    tab.result_selection.count().min(len)
+                }
+            }
+        }
+    }
+
+    fn selected_source_lines(tab: &Tab, pane: Pane) -> Box<dyn Iterator<Item = usize> + '_> {
+        match pane {
+            Pane::Main => {
+                let len = tab.log.as_ref().map_or(0, |log| log.len());
+                Box::new(
+                    tab.main_selection
+                        .iter()
+                        .take_while(move |&line| line < len),
+                )
+            }
+            Pane::Results => Box::new(
+                tab.result_selection
+                    .iter()
+                    .filter_map(|row| tab.results.visible.get(row).copied()),
+            ),
+        }
+    }
+
+    fn selection_all_bookmarked(tab: &Tab, pane: Pane) -> bool {
+        let count = Self::selection_count(tab, pane);
+        if count == 0 || count > tab.bookmarks.len() {
+            return false;
+        }
+        Self::selected_source_lines(tab, pane).all(|line| tab.bookmarks.contains(&line))
+    }
+
+    fn sync_main_to_result_cursor(tab: &mut Tab) {
+        if let Some(&source_line) = tab.results.visible.get(tab.result_selection.cursor) {
+            tab.selected = source_line;
+            tab.main_selection.select_single(source_line);
+            tab.follow = false;
+            tab.scroll
+                .scroll_to_item(source_line, ScrollStrategy::Center);
+        }
+    }
+
+    fn handle_row_mouse_down(
+        &mut self,
+        pane: Pane,
+        row: usize,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_pane = pane;
+        self.show_goto = false;
+        match pane {
+            Pane::Main => self.focus.focus(window, cx),
+            Pane::Results => self.results_focus.focus(window, cx),
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            match pane {
+                Pane::Main => {
+                    let len = tab.log.as_ref().map_or(0, |log| log.len());
+                    if row < len {
+                        if modifiers.shift {
+                            tab.main_selection.extend_to(row);
+                            self.drag_selecting = (!modifiers.secondary()).then_some(Pane::Main);
+                        } else if modifiers.secondary() {
+                            tab.main_selection.toggle(row);
+                            self.drag_selecting = None;
+                        } else {
+                            tab.main_selection.select_single(row);
+                            self.drag_selecting = Some(Pane::Main);
+                        }
+                        tab.selected = row;
+                        tab.follow = false;
+                    }
+                }
+                Pane::Results => {
+                    if row < tab.results.visible.len() {
+                        if modifiers.shift {
+                            tab.result_selection.extend_to(row);
+                            self.drag_selecting = (!modifiers.secondary()).then_some(Pane::Results);
+                        } else if modifiers.secondary() {
+                            tab.result_selection.toggle(row);
+                            self.drag_selecting = None;
+                        } else {
+                            tab.result_selection.select_single(row);
+                            self.drag_selecting = Some(Pane::Results);
+                        }
+                        Self::sync_main_to_result_cursor(tab);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_row_mouse_move(
+        &mut self,
+        pane: Pane,
+        row: usize,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag_selecting != Some(pane) {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drag_selecting = None;
+            return;
+        }
+        let mut changed = false;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            match pane {
+                Pane::Main => {
+                    let len = tab.log.as_ref().map_or(0, |log| log.len());
+                    if row < len && tab.main_selection.cursor != row {
+                        tab.main_selection.extend_to(row);
+                        tab.selected = row;
+                        tab.follow = false;
+                        changed = true;
+                    }
+                }
+                Pane::Results => {
+                    if row < tab.results.visible.len() && tab.result_selection.cursor != row {
+                        tab.result_selection.extend_to(row);
+                        Self::sync_main_to_result_cursor(tab);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn toggle_bookmark_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && tab.log.as_ref().is_some_and(|log| line < log.len())
+        {
+            if !tab.bookmarks.remove(&line) {
+                tab.bookmarks.insert(line);
+            }
+            self.start_search_preserving(self.active, true, cx);
+        }
+        cx.notify();
+    }
+
+    fn navigate(
+        &mut self,
+        command: Command,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self.active_pane_for(window);
+        self.active_pane = pane;
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        match pane {
+            Pane::Main => {
+                let Some(log) = &tab.log else {
+                    return;
+                };
+                let len = log.len();
+                if len == 0 {
+                    return;
+                }
+                let step = ((f32::from(window.viewport_size().height)
+                    - self.config.window.results_height
+                    - 180.)
+                    / self.config.viewer.line_height)
+                    .max(1.) as usize;
+                let current = tab.main_selection.cursor.min(len - 1);
+                let target = match command {
+                    Command::NextLine | Command::SelectNextLine => current.saturating_add(1),
+                    Command::PreviousLine | Command::SelectPreviousLine => {
+                        current.saturating_sub(1)
+                    }
+                    Command::FirstLine | Command::SelectFirstLine => 0,
+                    Command::LastLine | Command::SelectLastLine => len - 1,
+                    Command::PageUp | Command::SelectPageUp => current.saturating_sub(step),
+                    _ => current.saturating_add(step),
+                }
+                .min(len - 1);
+                if extend {
+                    tab.main_selection.extend_to(target);
+                } else {
+                    tab.main_selection.select_single(target);
+                }
+                tab.selected = target;
+                tab.follow = false;
+                tab.scroll.scroll_to_item(target, ScrollStrategy::Nearest);
+            }
+            Pane::Results => {
+                let len = tab.results.visible.len();
+                if len == 0 {
+                    return;
+                }
+                let pane_height = self
+                    .config
+                    .window
+                    .results_height
+                    .min(f32::from(window.viewport_size().height) * 0.45);
+                let step = (pane_height / self.config.viewer.line_height).max(1.) as usize;
+                let current = tab.result_selection.cursor.min(len - 1);
+                let target = match command {
+                    Command::NextLine | Command::SelectNextLine => current.saturating_add(1),
+                    Command::PreviousLine | Command::SelectPreviousLine => {
+                        current.saturating_sub(1)
+                    }
+                    Command::FirstLine | Command::SelectFirstLine => 0,
+                    Command::LastLine | Command::SelectLastLine => len - 1,
+                    Command::PageUp | Command::SelectPageUp => current.saturating_sub(step),
+                    _ => current.saturating_add(step),
+                }
+                .min(len - 1);
+                if extend {
+                    tab.result_selection.extend_to(target);
+                } else {
+                    tab.result_selection.select_single(target);
+                }
+                tab.result_scroll
+                    .scroll_to_item(target, ScrollStrategy::Nearest);
+                Self::sync_main_to_result_cursor(tab);
+            }
+        }
+        cx.notify();
+    }
+
     fn command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
             Command::ShowFiles => self.show_files = !self.show_files,
@@ -563,46 +894,125 @@ impl Workspace {
             | Command::LastLine
             | Command::PageUp
             | Command::PageDown => {
-                if let Some(tab) = self.tabs.get_mut(self.active)
-                    && let Some(log) = &tab.log
-                {
-                    let step = ((f32::from(window.viewport_size().height)
-                        - self.config.window.results_height
-                        - 180.)
-                        / self.config.viewer.line_height)
-                        .max(1.) as usize;
-                    tab.selected = match command {
-                        Command::NextLine => tab.selected.saturating_add(1),
-                        Command::PreviousLine => tab.selected.saturating_sub(1),
-                        Command::FirstLine => 0,
-                        Command::LastLine => log.len().saturating_sub(1),
-                        Command::PageUp => tab.selected.saturating_sub(step),
-                        _ => tab.selected.saturating_add(step),
+                self.navigate(command, false, window, cx);
+                return;
+            }
+            Command::SelectNextLine
+            | Command::SelectPreviousLine
+            | Command::SelectFirstLine
+            | Command::SelectLastLine
+            | Command::SelectPageUp
+            | Command::SelectPageDown => {
+                self.navigate(command, true, window, cx);
+                return;
+            }
+            Command::SelectAll => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match pane {
+                        Pane::Main => {
+                            let len = tab.log.as_ref().map_or(0, |log| log.len());
+                            tab.main_selection.select_all(len);
+                            if len > 0 {
+                                tab.selected = tab.main_selection.cursor;
+                            }
+                        }
+                        Pane::Results => {
+                            let len = tab.results.visible.len();
+                            tab.result_selection.select_all(len);
+                        }
                     }
-                    .min(log.len().saturating_sub(1));
-                    tab.follow = false;
-                    tab.scroll
-                        .scroll_to_item(tab.selected, ScrollStrategy::Center);
+                }
+            }
+            Command::ClearSelection => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match pane {
+                        Pane::Main => {
+                            let len = tab.log.as_ref().map_or(0, |log| log.len());
+                            tab.main_selection.collapse_to_cursor(len);
+                            if len > 0 {
+                                tab.selected = tab.main_selection.cursor;
+                            }
+                        }
+                        Pane::Results => {
+                            let len = tab.results.visible.len();
+                            tab.result_selection.collapse_to_cursor(len);
+                            Self::sync_main_to_result_cursor(tab);
+                        }
+                    }
+                }
+            }
+            Command::SwitchPane => {
+                let current = self.active_pane_for(window);
+                match current {
+                    Pane::Main => {
+                        let has_results = self
+                            .tabs
+                            .get(self.active)
+                            .is_some_and(|tab| !tab.results.visible.is_empty());
+                        if has_results {
+                            self.focus_pane(Pane::Results, window, cx);
+                            return;
+                        }
+                    }
+                    Pane::Results => {
+                        self.focus_pane(Pane::Main, window, cx);
+                        return;
+                    }
                 }
             }
             Command::NextBookmark | Command::PreviousBookmark => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    let target = if command == Command::NextBookmark {
-                        tab.bookmarks
-                            .iter()
-                            .find(|&&line| line > tab.selected)
-                            .or(tab.bookmarks.first())
+                    if pane == Pane::Results && !tab.results.visible.is_empty() {
+                        let current_row = tab
+                            .result_selection
+                            .cursor
+                            .min(tab.results.visible.len() - 1);
+                        let target_row = if command == Command::NextBookmark {
+                            ((current_row + 1)..tab.results.visible.len())
+                                .chain(0..=current_row)
+                                .find(|&r| tab.bookmarks.contains(&tab.results.visible[r]))
+                        } else {
+                            (0..current_row)
+                                .rev()
+                                .chain((current_row..tab.results.visible.len()).rev())
+                                .find(|&r| tab.bookmarks.contains(&tab.results.visible[r]))
+                        };
+                        if let Some(row) = target_row {
+                            tab.result_selection.select_single(row);
+                            tab.result_scroll
+                                .scroll_to_item(row, ScrollStrategy::Center);
+                            Self::sync_main_to_result_cursor(tab);
+                        }
                     } else {
-                        tab.bookmarks
-                            .iter()
-                            .rev()
-                            .find(|&&line| line < tab.selected)
-                            .or(tab.bookmarks.last())
-                    };
-                    if let Some(&line) = target {
-                        tab.selected = line;
-                        tab.follow = false;
-                        tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                        let target = if command == Command::NextBookmark {
+                            tab.bookmarks
+                                .iter()
+                                .find(|&&line| line > tab.selected)
+                                .or(tab.bookmarks.first())
+                        } else {
+                            tab.bookmarks
+                                .iter()
+                                .rev()
+                                .find(|&&line| line < tab.selected)
+                                .or(tab.bookmarks.last())
+                        };
+                        if let Some(&line) = target {
+                            tab.selected = line;
+                            tab.main_selection.select_single(line);
+                            tab.follow = false;
+                            tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                            if let Ok(index) = tab.results.visible.binary_search(&line) {
+                                tab.result_selection.select_single(index);
+                                tab.result_scroll
+                                    .scroll_to_item(index, ScrollStrategy::Center);
+                            }
+                        }
                     }
                 }
             }
@@ -613,8 +1023,8 @@ impl Workspace {
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
             }
             Command::FocusLog => {
-                self.show_goto = false;
-                self.focus.focus(window, cx);
+                self.focus_pane(Pane::Main, window, cx);
+                return;
             }
             Command::Search => self.start_search(self.active, cx),
             Command::CloseTab => {
@@ -635,13 +1045,34 @@ impl Workspace {
                 }
             }
             Command::ToggleBookmark => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
                 if let Some(tab) = self.tabs.get_mut(self.active)
                     && tab.log.as_ref().is_some_and(|log| !log.is_empty())
                 {
-                    if !tab.bookmarks.remove(&tab.selected) {
-                        tab.bookmarks.insert(tab.selected);
+                    let count = Self::selection_count(tab, pane);
+                    if count == 0 {
+                        return;
                     }
-                    self.start_search(self.active, cx);
+                    if count > MAX_BULK_BOOKMARK_LINES {
+                        self.status = Some(format!(
+                            "Too many lines selected to bookmark (limit {})",
+                            format_count(MAX_BULK_BOOKMARK_LINES)
+                        ));
+                    } else {
+                        let lines: Vec<usize> = Self::selected_source_lines(tab, pane).collect();
+                        let all_marked = lines.iter().all(|line| tab.bookmarks.contains(line));
+                        if all_marked {
+                            for line in lines {
+                                tab.bookmarks.remove(&line);
+                            }
+                        } else {
+                            for line in lines {
+                                tab.bookmarks.insert(line);
+                            }
+                        }
+                        self.start_search_preserving(self.active, true, cx);
+                    }
                 }
             }
             Command::NextMatch | Command::PreviousMatch => {
@@ -661,9 +1092,11 @@ impl Workspace {
                     };
                     if let Some(&target) = target {
                         tab.selected = target;
+                        tab.main_selection.select_single(target);
                         tab.follow = false;
                         tab.scroll.scroll_to_item(target, ScrollStrategy::Center);
                         if let Ok(index) = tab.results.visible.binary_search(&target) {
+                            tab.result_selection.select_single(index);
                             tab.result_scroll
                                 .scroll_to_item(index, ScrollStrategy::Center);
                         }
@@ -671,16 +1104,56 @@ impl Workspace {
                 }
             }
             Command::CopyLine => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
                 if let Some(tab) = self.tabs.get(self.active)
                     && let Some(log) = &tab.log
                 {
-                    match log.line(tab.selected, usize::MAX) {
-                        Ok(text) => {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            self.status =
-                                Some(format!("Copied Ln {}", format_count(tab.selected + 1)));
+                    let count = Self::selection_count(tab, pane);
+                    if count == 0 {
+                        self.status = Some("No lines selected".into());
+                    } else {
+                        let mut total_bytes: u64 = 0;
+                        let mut lines_to_copy = Vec::with_capacity(count.min(1024));
+                        let mut exceeded = false;
+                        for line in Self::selected_source_lines(tab, pane) {
+                            total_bytes = total_bytes.saturating_add(log.line_bytes(line));
+                            if total_bytes > MAX_COPY_BYTES {
+                                exceeded = true;
+                                break;
+                            }
+                            lines_to_copy.push(line);
                         }
-                        Err(error) => self.status = Some(error.to_string()),
+                        if exceeded {
+                            self.status = Some("Selection too large to copy (limit 64 MB)".into());
+                        } else if lines_to_copy.is_empty() {
+                            self.status = Some("No lines selected".into());
+                        } else {
+                            let mut copied = String::with_capacity(total_bytes as usize);
+                            let mut read_error = None;
+                            for (index, &line) in lines_to_copy.iter().enumerate() {
+                                if index > 0 {
+                                    copied.push('\n');
+                                }
+                                match log.line(line, usize::MAX) {
+                                    Ok(text) => copied.push_str(&text),
+                                    Err(error) => {
+                                        read_error = Some(error.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(error) = read_error {
+                                self.status = Some(error);
+                            } else {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copied));
+                                self.status = Some(if lines_to_copy.len() == 1 {
+                                    format!("Copied Ln {}", format_count(lines_to_copy[0] + 1))
+                                } else {
+                                    format!("Copied {} lines", format_count(lines_to_copy.len()))
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -698,10 +1171,12 @@ impl Workspace {
                         if let (Ok(line), Some(log)) = (line, &tab.log) {
                             if line > 0 && line <= log.len() {
                                 tab.selected = line - 1;
+                                tab.main_selection.select_single(line - 1);
                                 tab.follow = false;
                                 tab.scroll.scroll_to_item(line - 1, ScrollStrategy::Center);
                                 self.show_goto = false;
                                 self.status = None;
+                                self.active_pane = Pane::Main;
                                 self.focus.focus(window, cx);
                             } else {
                                 self.status = Some(format!("Range: 1–{}", format_count(log.len())));
@@ -790,9 +1265,11 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if let Some(tab) = this.tabs.get_mut(this.active) {
                                 tab.selected = line;
+                                tab.main_selection.select_single(line);
                                 tab.follow = false;
                                 tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
                             }
+                            this.active_pane = Pane::Main;
                             this.show_goto = false;
                             this.focus.focus(window, cx);
                             cx.notify();
@@ -807,6 +1284,7 @@ impl Workspace {
         &mut self,
         range: std::ops::Range<usize>,
         results: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(tab) = self.tabs.get(self.active) else {
@@ -815,6 +1293,8 @@ impl Workspace {
         let Some(log) = tab.log.clone() else {
             return Vec::new();
         };
+        let pane = if results { Pane::Results } else { Pane::Main };
+        let pane_focused = self.active_pane_for(window) == pane;
         let t = self.theme.clone();
         range
             .filter_map(|row| {
@@ -841,19 +1321,47 @@ impl Workspace {
                     .find(|(pattern, _)| pattern.is_match(&text))
                     .map(|(_, color)| rgb_to_hsla(rgb(*color)))
                     .unwrap_or(t.foreground);
-                let selected = tab.selected == line;
+                let selection = if results {
+                    &tab.result_selection
+                } else {
+                    &tab.main_selection
+                };
+                let selected = selection.contains(row);
+                let is_cursor = !selection.is_empty() && selection.cursor == row;
                 let marked = tab.bookmarks.contains(&line);
                 let matched = tab.results.matches.binary_search(&line).is_ok();
-                let row_bg = if selected { t.selection } else { t.background };
-                let hover_bg = if selected {
-                    t.selection
+                let row_bg = if selected {
+                    if pane_focused {
+                        t.selection
+                    } else {
+                        t.selection_soft
+                    }
                 } else {
-                    t.selection_soft
+                    t.background
+                };
+                let hover_bg = if selected { row_bg } else { t.selection_soft };
+                let border_color = if is_cursor {
+                    if pane_focused {
+                        t.accent
+                    } else {
+                        t.accent.opacity(0.55)
+                    }
+                } else if selected {
+                    if pane_focused {
+                        t.accent.opacity(0.45)
+                    } else {
+                        t.accent.opacity(0.25)
+                    }
+                } else {
+                    gpui::transparent_black()
                 };
 
                 Some(
                     div()
                         .id((if results { "result" } else { "line" }, line))
+                        .debug_selector(move || {
+                            format!("{}-row-{row}", if results { "result" } else { "main" })
+                        })
                         .flex()
                         .items_center()
                         .h(px(self.config.viewer.line_height))
@@ -864,11 +1372,7 @@ impl Workspace {
                         .bg(row_bg)
                         .hover(move |s| s.bg(hover_bg))
                         .border_l_2()
-                        .border_color(if selected {
-                            t.accent
-                        } else {
-                            gpui::transparent_black()
-                        })
+                        .border_color(border_color)
                         .text_color(text_color)
                         .cursor_pointer()
                         .child(
@@ -888,11 +1392,8 @@ impl Workspace {
                                 })
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        if let Some(tab) = this.tabs.get_mut(this.active) {
-                                            tab.selected = line;
-                                        }
-                                        this.command(Command::ToggleBookmark, window, cx);
+                                    cx.listener(move |this, _, _window, cx| {
+                                        this.toggle_bookmark_line(line, cx);
                                         cx.stop_propagation();
                                     }),
                                 ),
@@ -916,30 +1417,32 @@ impl Workspace {
                             )
                         })
                         .child(div().pr_4().child(text))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(tab) = this.tabs.get_mut(this.active) {
-                                tab.selected = line;
-                                tab.follow = false;
-                                if results {
-                                    tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
-                                }
-                            }
-                            this.show_goto = false;
-                            this.focus.focus(window, cx);
-                            cx.notify();
-                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.handle_row_mouse_down(pane, row, event.modifiers, window, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(
+                            move |this, event: &MouseMoveEvent, _window, cx| {
+                                this.handle_row_mouse_move(pane, row, event, cx);
+                            },
+                        ))
                         .into_any_element(),
                 )
             })
             .collect()
     }
 
-    fn render_header(&self, cx: &Context<Self>) -> Stateful<Div> {
+    fn render_header(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let t = &self.theme;
+        let pane = self.active_pane_for(window);
         let active_tab = self.tabs.get(self.active);
         let has_tabs = !self.tabs.is_empty();
         let follow = active_tab.is_some_and(|tab| tab.follow);
-        let is_bookmarked = active_tab.is_some_and(|tab| tab.bookmarks.contains(&tab.selected));
+        let selected_count = active_tab.map_or(0, |tab| Self::selection_count(tab, pane));
+        let is_bookmarked = active_tab.is_some_and(|tab| Self::selection_all_bookmarked(tab, pane));
 
         let mut tab_strip = div()
             .id("tabs")
@@ -1138,9 +1641,15 @@ impl Workspace {
                                     Icon::Bookmark
                                 },
                                 if is_bookmarked {
-                                    "Remove bookmark"
+                                    if selected_count > 1 {
+                                        format!("Remove {} bookmarks", format_count(selected_count))
+                                    } else {
+                                        "Remove bookmark".to_owned()
+                                    }
+                                } else if selected_count > 1 {
+                                    format!("Bookmark {} lines", format_count(selected_count))
                                 } else {
-                                    "Bookmark line"
+                                    "Bookmark line".to_owned()
                                 },
                                 Command::ToggleBookmark,
                                 if is_bookmarked {
@@ -1170,7 +1679,11 @@ impl Workspace {
                             .child(self.cmd_icon(
                                 "copy",
                                 Icon::Copy,
-                                "Copy selected line",
+                                if selected_count > 1 {
+                                    format!("Copy {} selected lines", format_count(selected_count))
+                                } else {
+                                    "Copy selected line".to_owned()
+                                },
                                 Command::CopyLine,
                                 ButtonTone::Ghost,
                                 cx,
@@ -1831,11 +2344,21 @@ impl Workspace {
         bar
     }
 
-    fn render_status_bar(&self, cx: &Context<Self>) -> Div {
+    fn render_status_bar(&self, window: &Window, cx: &Context<Self>) -> Div {
         let t = &self.theme;
+        let pane = self.active_pane_for(window);
         let tab = self.tabs.get(self.active);
         let line_count = tab.and_then(|tab| tab.log.as_ref()).map_or(0, |l| l.len());
         let selected = tab.map_or(0, |tab| if line_count == 0 { 0 } else { tab.selected + 1 });
+        let result_count = tab.map_or(0, |tab| tab.results.visible.len());
+        let result_row = tab.map_or(0, |tab| {
+            if result_count == 0 {
+                0
+            } else {
+                tab.result_selection.cursor.min(result_count - 1) + 1
+            }
+        });
+        let selected_count = tab.map_or(0, |tab| Self::selection_count(tab, pane));
         let bookmarks = tab.map_or(0, |tab| tab.bookmarks.len());
         let bytes = tab.and_then(|tab| tab.log.as_ref()).map(|l| l.stamp.len);
         let follow = tab.is_some_and(|tab| tab.follow);
@@ -1880,6 +2403,26 @@ impl Workspace {
                                     cx.listener(|this, _, window, cx| this.toggle_goto(window, cx)),
                                 ),
                         )
+                        .when(pane == Pane::Results && result_count > 0, |el| {
+                            el.child(
+                                div()
+                                    .font_family(t.mono_font.clone())
+                                    .text_color(t.foreground)
+                                    .child(format!(
+                                        "Filter {} / {}",
+                                        format_count(result_row),
+                                        format_count(result_count)
+                                    )),
+                            )
+                        })
+                        .when(selected_count > 1, |el| {
+                            el.child(
+                                div()
+                                    .font_family(t.mono_font.clone())
+                                    .text_color(t.accent)
+                                    .child(format!("{} selected", format_count(selected_count))),
+                            )
+                        })
                         .child(
                             div()
                                 .id("status-bookmarks")
@@ -1948,8 +2491,11 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme.clone();
+        let active_pane = self.active_pane_for(window);
+        let main_focused = active_pane == Pane::Main;
+        let results_focused = active_pane == Pane::Results;
         let tab = self.tabs.get(self.active);
         let widest_line = tab
             .and_then(|tab| tab.log.as_ref())
@@ -1991,6 +2537,10 @@ impl Render for Workspace {
             let source_log_area = div()
                 .key_context("Log")
                 .track_focus(&self.focus)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.focus_pane(Pane::Main, window, cx)),
+                )
                 .flex()
                 .flex_1()
                 .min_h_0()
@@ -2012,7 +2562,9 @@ impl Render for Workspace {
                         uniform_list(
                             "source",
                             line_count,
-                            cx.processor(|this, range, _, cx| this.rows(range, false, cx)),
+                            cx.processor(|this, range, window, cx| {
+                                this.rows(range, false, window, cx)
+                            }),
                         )
                         .with_horizontal_sizing_behavior(
                             ListHorizontalSizingBehavior::Unconstrained,
@@ -2046,6 +2598,12 @@ impl Render for Workspace {
                         .bg(t.background)
                         .border_b_1()
                         .border_color(t.border.opacity(0.6))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.focus_pane(Pane::Main, window, cx)
+                            }),
+                        )
                         .child(
                             div()
                                 .flex()
@@ -2053,8 +2611,18 @@ impl Render for Workspace {
                                 .gap_1p5()
                                 .min_w_0()
                                 .flex_1()
-                                .text_color(t.muted)
-                                .child(Icon::Lines.element(px(12.), t.muted))
+                                .text_color(if main_focused { t.foreground } else { t.muted })
+                                .child(div().w(px(2.)).h(px(12.)).rounded_full().bg(
+                                    if main_focused {
+                                        t.accent
+                                    } else {
+                                        gpui::transparent_black()
+                                    },
+                                ))
+                                .child(Icon::Lines.element(
+                                    px(12.),
+                                    if main_focused { t.accent } else { t.muted },
+                                ))
                                 .child(
                                     div()
                                         .font_family(t.mono_font.clone())
@@ -2090,81 +2658,105 @@ impl Render for Workspace {
                         }),
                 );
 
-            let results_header = div()
-                .h(px(30.))
-                .px_3()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_between()
-                .bg(t.panel)
-                .border_y_1()
-                .border_color(t.border)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_size(t.xs_size)
-                        .text_color(t.muted)
-                        .child(
-                            Icon::ListFilter
-                                .element(ICON_XS, if match_count > 0 { t.accent } else { t.muted }),
-                        )
-                        .child(
-                            div()
-                                .font_family(t.mono_font.clone())
-                                .text_color(if result_count > 0 {
-                                    t.foreground
+            let results_header =
+                div()
+                    .h(px(30.))
+                    .px_3()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .bg(t.panel)
+                    .border_y_1()
+                    .border_color(t.border)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.focus_pane(Pane::Results, window, cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(t.xs_size)
+                            .text_color(t.muted)
+                            .child(div().w(px(2.)).h(px(12.)).rounded_full().bg(
+                                if results_focused {
+                                    t.accent
+                                } else {
+                                    gpui::transparent_black()
+                                },
+                            ))
+                            .child(Icon::ListFilter.element(
+                                ICON_XS,
+                                if results_focused || match_count > 0 {
+                                    t.accent
                                 } else {
                                     t.muted
-                                })
-                                .child(if result_count == match_count {
-                                    format_count(match_count)
-                                } else {
-                                    format!(
-                                        "{} · {}",
-                                        format_count(match_count),
-                                        format_count(result_count)
-                                    )
-                                }),
-                        )
-                        .when(results_limited, |el| {
-                            let tip_theme = t.clone();
-                            el.child(
+                                },
+                            ))
+                            .child(
                                 div()
-                                    .id("result-limit")
-                                    .flex()
-                                    .items_center()
-                                    .child(Icon::AlertTriangle.element(ICON_XS, t.warning))
-                                    .tooltip_show_delay(TOOLTIP_DELAY)
-                                    .tooltip(move |_, cx| {
-                                        Tooltip::view(
-                                            "Result limit reached",
-                                            None,
-                                            tip_theme.clone(),
-                                            cx,
+                                    .font_family(t.mono_font.clone())
+                                    .text_color(if result_count > 0 {
+                                        t.foreground
+                                    } else {
+                                        t.muted
+                                    })
+                                    .child(if result_count == match_count {
+                                        format_count(match_count)
+                                    } else {
+                                        format!(
+                                            "{} · {}",
+                                            format_count(match_count),
+                                            format_count(result_count)
                                         )
                                     }),
                             )
-                        })
-                        .when(searching, |el| el.text_color(t.accent).child("Searching…")),
-                )
-                .when(result_count > 0, |header| {
-                    header.child(
-                        self.cmd_icon(
-                            "export",
-                            Icon::Download,
-                            "Export results",
-                            Command::ExportResults,
-                            ButtonTone::Ghost,
-                            cx,
-                        )
-                        .size(px(24.)),
+                            .when(results_limited, |el| {
+                                let tip_theme = t.clone();
+                                el.child(
+                                    div()
+                                        .id("result-limit")
+                                        .flex()
+                                        .items_center()
+                                        .child(Icon::AlertTriangle.element(ICON_XS, t.warning))
+                                        .tooltip_show_delay(TOOLTIP_DELAY)
+                                        .tooltip(move |_, cx| {
+                                            Tooltip::view(
+                                                "Result limit reached",
+                                                None,
+                                                tip_theme.clone(),
+                                                cx,
+                                            )
+                                        }),
+                                )
+                            })
+                            .when(searching, |el| el.text_color(t.accent).child("Searching…")),
                     )
-                });
+                    .when(result_count > 0, |header| {
+                        header.child(
+                            self.cmd_icon(
+                                "export",
+                                Icon::Download,
+                                "Export results",
+                                Command::ExportResults,
+                                ButtonTone::Ghost,
+                                cx,
+                            )
+                            .size(px(24.)),
+                        )
+                    });
 
             let results_body = div()
+                .key_context("Log")
+                .track_focus(&self.results_focus)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.focus_pane(Pane::Results, window, cx)),
+                )
                 .h(px(self.config.window.results_height))
                 .max_h(relative(0.45))
                 .flex_shrink_0()
@@ -2188,7 +2780,9 @@ impl Render for Workspace {
                         uniform_list(
                             "results",
                             result_count,
-                            cx.processor(|this, range, _, cx| this.rows(range, true, cx)),
+                            cx.processor(|this, range, window, cx| {
+                                this.rows(range, true, window, cx)
+                            }),
                         )
                         .with_horizontal_sizing_behavior(
                             ListHorizontalSizingBehavior::Unconstrained,
@@ -2214,6 +2808,18 @@ impl Render for Workspace {
 
         div()
             .size_full()
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.drag_selecting = None;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.drag_selecting = None;
+                }),
+            )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 for path in paths.paths() {
                     this.open(path.clone(), cx);
@@ -2229,7 +2835,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, action: &Execute, window, cx| {
                 this.command(action.command, window, cx)
             }))
-            .child(self.render_header(cx))
+            .child(self.render_header(window, cx))
             .when(self.show_files, |root| {
                 root.child(self.render_file_drawer(cx))
             })
@@ -2238,7 +2844,7 @@ impl Render for Workspace {
             })
             .child(main_area)
             .when(self.config.window.show_status_bar, |root| {
-                root.child(self.render_status_bar(cx))
+                root.child(self.render_status_bar(window, cx))
             })
     }
 }
@@ -2547,5 +3153,210 @@ mod tests {
                 .expect("search input should stay rendered");
             assert_eq!(redrawn.size.height, search_bounds.size.height);
         }
+    }
+
+    #[gpui::test]
+    fn main_pane_supports_keyboard_and_mouse_multi_selection_copy_and_bookmark(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("multi.log");
+        std::fs::write(&path, "zero\none\ntwo\nthree\nfour\nfive\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Keyboard Shift+Down extends contiguous selection in the main pane.
+        cx.simulate_keystrokes("down shift-down shift-down");
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].main_selection.iter().collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            assert_eq!(view.tabs[0].selected, 3);
+        });
+
+        // Copy copies all selected lines in order.
+        let copy_key = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+        let select_all_key = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        cx.simulate_keystrokes(copy_key);
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain copied lines");
+        assert_eq!(copied, "one\ntwo\nthree");
+
+        // Bookmarking toggles all selected lines together.
+        cx.simulate_keystrokes("m");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([1, 2, 3]));
+        });
+        cx.simulate_keystrokes("m");
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.is_empty());
+        });
+
+        // Mouse Shift+Click, Secondary+Click, and Click+Drag in main pane.
+        let row1 = cx.debug_bounds("main-row-1").expect("main row 1").center();
+        let row3 = cx.debug_bounds("main-row-3").expect("main row 3").center();
+        let row5 = cx.debug_bounds("main-row-5").expect("main row 5").center();
+
+        cx.simulate_click(row1, Modifiers::none());
+        cx.simulate_click(row3, Modifiers::shift());
+        cx.simulate_click(row5, Modifiers::secondary_key());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].main_selection.iter().collect::<Vec<_>>(),
+                vec![1, 2, 3, 5]
+            );
+        });
+
+        // Click-and-drag from row 1 to row 3 selects 1..=3.
+        cx.simulate_mouse_down(row1, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(row3, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(row3, MouseButton::Left, Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].main_selection.iter().collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+        });
+
+        // Select All and Escape collapse.
+        cx.simulate_keystrokes(select_all_key);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.count(), 6);
+        });
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.count(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn filter_pane_keeps_focus_navigates_filtered_rows_and_supports_multi_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("filter.log");
+        std::fs::write(
+            &path,
+            "info 0\nERROR one\ninfo 2\ninfo 3\nERROR two\ninfo 5\nERROR three\nERROR four\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let results = SearchResults {
+            matches: vec![1, 4, 6, 7],
+            visible: vec![1, 4, 6, 7],
+            limited: false,
+            widest_row: 0,
+        };
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "ERROR".into();
+            view.tabs[0].results = results;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Clicking a filtered row keeps keyboard focus in the filter pane and syncs the main pane.
+        let res0 = cx
+            .debug_bounds("result-row-0")
+            .expect("result row 0")
+            .center();
+        cx.simulate_click(res0, Modifiers::none());
+        view.update_in(cx, |view, window, _| {
+            assert!(
+                view.results_focus.is_focused(window),
+                "clicking a result row should keep focus in the filter pane"
+            );
+            assert_eq!(view.tabs[0].result_selection.cursor, 0);
+            assert_eq!(view.tabs[0].selected, 1);
+        });
+
+        // Pressing Down moves to the next filtered row (source line 4), NOT line 2 in the main pane.
+        cx.simulate_keystrokes("down");
+        view.update_in(cx, |view, window, _| {
+            assert!(view.results_focus.is_focused(window));
+            assert_eq!(view.tabs[0].result_selection.cursor, 1);
+            assert_eq!(view.tabs[0].selected, 4);
+        });
+
+        // Shift+Down multi-selects only filtered rows 1..=2 (source lines 4 and 6).
+        cx.simulate_keystrokes("shift-down");
+        let copy_key = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+        cx.simulate_keystrokes(copy_key);
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain copied filtered lines");
+        assert_eq!(copied, "ERROR two\nERROR three");
+
+        // Secondary+Click toggles non-contiguous filtered rows (add row 0 -> source lines 1, 4, 6).
+        cx.simulate_click(res0, Modifiers::secondary_key());
+        cx.simulate_keystrokes(copy_key);
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain non-contiguous filtered lines");
+        assert_eq!(copied, "ERROR one\nERROR two\nERROR three");
+
+        // Pressing m bookmarks all selected filtered lines.
+        cx.simulate_keystrokes("m");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([1, 4, 6]));
+        });
+
+        // Pressing Tab switches focus between filter pane and main pane.
+        cx.simulate_keystrokes("tab");
+        view.update_in(cx, |view, window, _| {
+            assert!(
+                view.focus.is_focused(window),
+                "Tab from filter pane should focus main pane"
+            );
+        });
+        cx.simulate_keystrokes("tab");
+        view.update_in(cx, |view, window, _| {
+            assert!(
+                view.results_focus.is_focused(window),
+                "Tab from main pane should focus filter pane"
+            );
+        });
     }
 }

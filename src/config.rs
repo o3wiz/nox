@@ -138,6 +138,15 @@ pub enum Command {
     NextBookmark,
     PreviousBookmark,
     ShowFiles,
+    SwitchPane,
+    SelectNextLine,
+    SelectPreviousLine,
+    SelectFirstLine,
+    SelectLastLine,
+    SelectPageUp,
+    SelectPageDown,
+    SelectAll,
+    ClearSelection,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 pub enum KeyContext {

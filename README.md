@@ -15,9 +15,9 @@ Requires a Rust toolchain supporting edition 2024 and the native build prerequis
 
 Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar. Saved search presets apply immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
 
-Click a result to jump to its source line. Click the gutter or the bookmark icon to mark a line. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
+Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
-The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. The copy icon (or **⌘C** / **Ctrl+C**) copies the complete selected line as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
+The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
 
 Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 
@@ -29,11 +29,14 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Workspace | secondary-r / secondary-e | Reload / export results |
 | Workspace | F3 / shift-F3 | Next / previous match |
 | Workspace | secondary-q | Quit |
-| Log | arrows, home/end, pageup/pagedown | Navigate lines |
-| Log | m | Toggle bookmark |
+| Log | arrows, home/end, pageup/pagedown | Navigate lines (in active pane) |
+| Log | shift-arrows, shift-home/end, shift-pageup/pagedown | Extend selection (in active pane) |
+| Log | secondary-a / escape | Select all / collapse selection |
+| Log | tab | Switch focus between main and filter pane |
+| Log | m | Toggle bookmark on selected lines |
 | Log | b / shift-b | Next / previous bookmark |
 | Log | f | Toggle following |
-| Log | secondary-c | Copy selected line |
+| Log | secondary-c | Copy selected lines |
 | Search | Enter / Escape | Apply search / focus log |
 | GoTo | Enter / Escape | Jump / cancel |
 
@@ -116,7 +119,7 @@ The line index uses approximately eight bytes per line (plus allocation overhead
 
 Files are treated as UTF-8 with replacement characters for invalid sequences. Live monitoring polls metadata and rebuilds the index in the background when a change is detected; it does not yet incrementally index appends. A scan reads up to the file length captured at its start. In-place rewrites during reading can temporarily show inconsistent content until the next refresh. Large scans finish before another automatic reload starts, avoiding search starvation on continuously growing files.
 
-This version covers Klogg's core local-file workflow, not complete feature parity. Remaining differences include encoding detection/selection, archives and URL loading, boolean expression parsing, scratchpads, in-app settings editors, multi-line/substring selection in log panes, configurable highlighter sets, and Klogg's SIMD search optimizations.
+This version covers Klogg's core local-file workflow, not complete feature parity. Remaining differences include encoding detection/selection, archives and URL loading, boolean expression parsing, scratchpads, in-app settings editors, substring selection in log panes, configurable highlighter sets, and Klogg's SIMD search optimizations.
 
 ## Development
 
