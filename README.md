@@ -38,6 +38,10 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Log | f | Toggle following |
 | Log | secondary-c | Copy selected lines |
 | Search | Enter / Escape | Apply search / focus log |
+| Search | secondary-alt-r | Toggle regular expression |
+| Search | secondary-alt-c | Toggle match case |
+| Search | secondary-alt-w | Toggle whole words |
+| Search | secondary-alt-i | Toggle exclude matches (invert) |
 | GoTo | Enter / Escape | Jump / cancel |
 
 Text editing uses GPUI CE's native editable-text element, including clipboard operations, selection, undo, and IME support.

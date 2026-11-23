@@ -62,6 +62,7 @@ pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
 
 const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BULK_BOOKMARK_LINES: usize = 100_000;
+const SEARCH_INDICATOR_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
@@ -75,6 +76,8 @@ struct Tab {
     log: Option<Arc<LogFile>>,
     loading: bool,
     searching: bool,
+    searching_since: Option<Instant>,
+    searching_visible: bool,
     load_cancel: Arc<AtomicBool>,
     search_cancel: Arc<AtomicBool>,
     revision: usize,
@@ -100,7 +103,6 @@ impl Drop for Tab {
 
 enum Message {
     Loaded(usize, Result<Arc<LogFile>, String>),
-    Searched(usize, usize, bool, Result<SearchResults, String>),
     Exported(Result<(), String>),
 }
 
@@ -302,6 +304,8 @@ impl Workspace {
             log: None,
             loading: false,
             searching: false,
+            searching_since: None,
+            searching_visible: false,
             load_cancel: Arc::new(AtomicBool::new(false)),
             search_cancel: Arc::new(AtomicBool::new(false)),
             revision: 0,
@@ -378,6 +382,8 @@ impl Workspace {
         tab.search_cancel.store(true, Ordering::Relaxed);
         tab.revision += 1;
         tab.searching = false;
+        tab.searching_since = None;
+        tab.searching_visible = false;
         let (id, path, cancel, sender) = (
             tab.id,
             tab.path.clone(),
@@ -402,6 +408,7 @@ impl Workspace {
         preserve_selection: bool,
         cx: &mut Context<Self>,
     ) {
+        let include_bookmarks = self.config.viewer.include_bookmarks;
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
@@ -415,25 +422,135 @@ impl Workspace {
             return;
         };
         tab.error = None;
+        let marks = if include_bookmarks {
+            tab.bookmarks.clone()
+        } else {
+            BTreeSet::new()
+        };
+        if tab.query.is_empty() {
+            tab.searching = false;
+            tab.searching_since = None;
+            tab.searching_visible = false;
+            let (visible, widest_row) =
+                search::visible_rows(&log, &[], tab.options.context_lines, &marks);
+            let results = SearchResults {
+                visible,
+                widest_row,
+                ..Default::default()
+            };
+            if preserve_selection {
+                tab.result_selection
+                    .remap_sorted(&tab.results.visible, &results.visible);
+                tab.results = results;
+            } else {
+                let len = results.visible.len();
+                tab.results = results;
+                tab.result_selection = LineSelection::single_clamped(0, len);
+                tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
+            cx.notify();
+            return;
+        }
         tab.searching = true;
-        let (id, revision, query, options, cancel, sender) = (
+        tab.searching_since = Some(Instant::now());
+        tab.searching_visible = false;
+        let (id, revision, query, options, cancel) = (
             tab.id,
             tab.revision,
             tab.query.clone(),
             tab.options.clone(),
             tab.search_cancel.clone(),
-            self.sender.clone(),
         );
-        let marks = if self.config.viewer.include_bookmarks {
-            tab.bookmarks.clone()
-        } else {
-            BTreeSet::new()
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    search::search(&log, &query, &options, &marks, &cancel)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_search_result(id, revision, preserve_selection, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_search_result(
+        &mut self,
+        id: usize,
+        revision: usize,
+        preserve_selection: bool,
+        result: Result<SearchResults, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let include_bookmarks = self.config.viewer.include_bookmarks;
+        let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id && tab.revision == revision)
+        else {
+            return;
         };
-        std::thread::spawn(move || {
-            let result = search::search(&log, &query, &options, &marks, &cancel)
-                .map_err(|error| error.to_string());
-            let _ = sender.send(Message::Searched(id, revision, preserve_selection, result));
-        });
+        tab.searching = false;
+        tab.searching_since = None;
+        tab.searching_visible = false;
+        match result {
+            Ok(mut results) => {
+                if include_bookmarks && let Some(log) = &tab.log {
+                    let (visible, widest_row) = search::visible_rows(
+                        log,
+                        &results.matches,
+                        tab.options.context_lines,
+                        &tab.bookmarks,
+                    );
+                    results.visible = visible;
+                    results.widest_row = widest_row;
+                }
+                if preserve_selection {
+                    tab.result_selection
+                        .remap_sorted(&tab.results.visible, &results.visible);
+                    tab.results = results;
+                } else {
+                    let len = results.visible.len();
+                    tab.results = results;
+                    tab.result_selection = LineSelection::single_clamped(0, len);
+                    tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                }
+            }
+            Err(error) => {
+                tab.error = Some(error);
+                tab.results = SearchResults::default();
+                tab.result_selection = LineSelection::empty();
+            }
+        }
+        cx.notify();
+    }
+
+    fn refresh_bookmarks(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.config.viewer.include_bookmarks {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let Some(log) = &tab.log else {
+            return;
+        };
+        if tab.error.is_some() && !tab.query.is_empty() {
+            return;
+        }
+        let (visible, widest_row) = search::visible_rows(
+            log,
+            &tab.results.matches,
+            tab.options.context_lines,
+            &tab.bookmarks,
+        );
+        tab.result_selection
+            .remap_sorted(&tab.results.visible, &visible);
+        tab.results.visible = visible;
+        tab.results.widest_row = widest_row;
         cx.notify();
     }
 
@@ -485,40 +602,23 @@ impl Workspace {
                         }
                     }
                 }
-                Message::Searched(id, revision, preserve_selection, result) => {
-                    if let Some(tab) = self
-                        .tabs
-                        .iter_mut()
-                        .find(|tab| tab.id == id && tab.revision == revision)
-                    {
-                        tab.searching = false;
-                        match result {
-                            Ok(results) => {
-                                if preserve_selection {
-                                    tab.result_selection
-                                        .remap_sorted(&tab.results.visible, &results.visible);
-                                    tab.results = results;
-                                } else {
-                                    let len = results.visible.len();
-                                    tab.results = results;
-                                    tab.result_selection = LineSelection::single_clamped(0, len);
-                                    tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                                }
-                            }
-                            Err(error) => {
-                                tab.error = Some(error);
-                                tab.results = SearchResults::default();
-                                tab.result_selection = LineSelection::empty();
-                            }
-                        }
-                    }
-                }
                 Message::Exported(result) => {
                     self.status = Some(match result {
                         Ok(()) => "Exported".into(),
                         Err(error) => format!("Export failed: {error}"),
                     });
                 }
+            }
+        }
+        for tab in &mut self.tabs {
+            if tab.searching
+                && !tab.searching_visible
+                && tab
+                    .searching_since
+                    .is_some_and(|since| since.elapsed() >= SEARCH_INDICATOR_DELAY)
+            {
+                tab.searching_visible = true;
+                changed = true;
             }
         }
         if self.last_poll.elapsed() >= Duration::from_millis(self.config.viewer.poll_interval_ms) {
@@ -797,7 +897,7 @@ impl Workspace {
             if !tab.bookmarks.remove(&line) {
                 tab.bookmarks.insert(line);
             }
-            self.start_search_preserving(self.active, true, cx);
+            self.refresh_bookmarks(self.active, cx);
         }
         cx.notify();
     }
@@ -1027,6 +1127,39 @@ impl Workspace {
                 return;
             }
             Command::Search => self.start_search(self.active, cx),
+            Command::ToggleRegex
+            | Command::ToggleCaseSensitive
+            | Command::ToggleWholeWord
+            | Command::ToggleInvert => {
+                let input_empty = self.input.read(cx).as_str().is_empty();
+                let should_search = if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match command {
+                        Command::ToggleRegex => {
+                            tab.options.mode = if tab.options.mode == SearchMode::Regex {
+                                SearchMode::Literal
+                            } else {
+                                SearchMode::Regex
+                            };
+                        }
+                        Command::ToggleCaseSensitive => {
+                            tab.options.case_sensitive = !tab.options.case_sensitive;
+                        }
+                        Command::ToggleWholeWord => {
+                            tab.options.whole_word = !tab.options.whole_word;
+                        }
+                        Command::ToggleInvert => {
+                            tab.options.invert = !tab.options.invert;
+                        }
+                        _ => unreachable!(),
+                    }
+                    !input_empty || !tab.query.is_empty()
+                } else {
+                    false
+                };
+                if should_search {
+                    self.start_search(self.active, cx);
+                }
+            }
             Command::CloseTab => {
                 let index = self.active;
                 self.close_tab_at(index, cx);
@@ -1071,7 +1204,7 @@ impl Workspace {
                                 tab.bookmarks.insert(line);
                             }
                         }
-                        self.start_search_preserving(self.active, true, cx);
+                        self.refresh_bookmarks(self.active, cx);
                     }
                 }
             }
@@ -2099,138 +2232,127 @@ impl Workspace {
         let has_query = !current_input.is_empty();
         let regex_on = options.mode == SearchMode::Regex;
 
-        let search_box = div()
-            .flex_1()
-            .min_w(px(200.))
-            .h(px(34.))
-            .pl_2p5()
-            .pr_1()
-            .rounded_md()
-            .bg(t.background)
-            .border_1()
-            .border_color(t.border)
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .child(Icon::Search.element(ICON_SM, t.muted))
-            .child(
-                div()
-                    .key_context("Search")
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(
-                        text_input("query")
-                            .debug_selector(|| "search-input".into())
-                            .key_context(format!("{DEFAULT_INPUT_CONTEXT} Search").as_str())
-                            .state(self.input.downgrade())
-                            .placeholder("Search…")
-                            .caret_color(t.accent)
-                            .placeholder_color(t.muted)
-                            .font(t.mono_font_spec())
-                            .text_size(t.mono_size)
-                            .line_height(relative(1.35))
-                            .min_w_0()
-                            .w_full()
-                            .whitespace_nowrap()
-                            .overflow_x_scroll(),
-                    ),
-            )
-            .when(has_query, |el| {
-                el.child(
-                    icon_button(
-                        "clear-search",
-                        Icon::Close,
-                        "Clear search",
-                        None,
-                        ButtonTone::Ghost,
+        let search_box =
+            div()
+                .flex_1()
+                .min_w(px(200.))
+                .h(px(34.))
+                .pl_2p5()
+                .pr_1()
+                .rounded_md()
+                .bg(t.background)
+                .border_1()
+                .border_color(t.border)
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(Icon::Search.element(ICON_SM, t.muted))
+                .child(
+                    div()
+                        .key_context("Search")
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(
+                            text_input("query")
+                                .debug_selector(|| "search-input".into())
+                                .key_context(format!("{DEFAULT_INPUT_CONTEXT} Search").as_str())
+                                .state(self.input.downgrade())
+                                .placeholder("Search…")
+                                .caret_color(t.accent)
+                                .placeholder_color(t.muted)
+                                .font(t.mono_font_spec())
+                                .text_size(t.mono_size)
+                                .line_height(relative(1.35))
+                                .min_w_0()
+                                .w_full()
+                                .whitespace_nowrap()
+                                .overflow_x_scroll(),
+                        ),
+                )
+                .when(has_query, |el| {
+                    el.child(
+                        icon_button(
+                            "clear-search",
+                            Icon::Close,
+                            "Clear search",
+                            None,
+                            ButtonTone::Ghost,
+                            t,
+                        )
+                        .size(px(24.))
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_search(cx))),
+                    )
+                })
+                .child(toolbar_divider(t))
+                .child(
+                    search_toggle(
+                        "regex",
+                        Icon::Regex,
+                        if regex_on {
+                            "Regular expression (on)"
+                        } else {
+                            "Regular expression (off)"
+                        },
+                        t.shortcut(Command::ToggleRegex),
+                        regex_on,
                         t,
                     )
-                    .size(px(24.))
-                    .on_click(cx.listener(|this, _, _, cx| this.clear_search(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.command(Command::ToggleRegex, window, cx)
+                    })),
                 )
-            })
-            .child(toolbar_divider(t))
-            .child(
-                search_toggle(
-                    "regex",
-                    Icon::Regex,
-                    if regex_on {
-                        "Regular expression (on)"
-                    } else {
-                        "Regular expression (off)"
-                    },
-                    regex_on,
-                    t,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(tab) = this.tabs.get_mut(this.active) {
-                        tab.options.mode = if tab.options.mode == SearchMode::Regex {
-                            SearchMode::Literal
+                .child(
+                    search_toggle(
+                        "case",
+                        Icon::CaseSensitive,
+                        if options.case_sensitive {
+                            "Match case (on)"
                         } else {
-                            SearchMode::Regex
-                        };
-                        this.start_search(this.active, cx);
-                    }
-                })),
-            )
-            .child(
-                search_toggle(
-                    "case",
-                    Icon::CaseSensitive,
-                    if options.case_sensitive {
-                        "Match case (on)"
-                    } else {
-                        "Match case (off)"
-                    },
-                    options.case_sensitive,
-                    t,
+                            "Match case (off)"
+                        },
+                        t.shortcut(Command::ToggleCaseSensitive),
+                        options.case_sensitive,
+                        t,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.command(Command::ToggleCaseSensitive, window, cx)
+                    })),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(tab) = this.tabs.get_mut(this.active) {
-                        tab.options.case_sensitive = !tab.options.case_sensitive;
-                        this.start_search(this.active, cx);
-                    }
-                })),
-            )
-            .child(
-                search_toggle(
-                    "word",
-                    Icon::WholeWord,
-                    if options.whole_word {
-                        "Whole words (on)"
-                    } else {
-                        "Whole words (off)"
-                    },
-                    options.whole_word,
-                    t,
+                .child(
+                    search_toggle(
+                        "word",
+                        Icon::WholeWord,
+                        if options.whole_word {
+                            "Whole words (on)"
+                        } else {
+                            "Whole words (off)"
+                        },
+                        t.shortcut(Command::ToggleWholeWord),
+                        options.whole_word,
+                        t,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.command(Command::ToggleWholeWord, window, cx)
+                    })),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(tab) = this.tabs.get_mut(this.active) {
-                        tab.options.whole_word = !tab.options.whole_word;
-                        this.start_search(this.active, cx);
-                    }
-                })),
-            )
-            .child(
-                search_toggle(
-                    "invert",
-                    Icon::InvertMatch,
-                    if options.invert {
-                        "Exclude matches (on)"
-                    } else {
-                        "Exclude matches (off)"
-                    },
-                    options.invert,
-                    t,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(tab) = this.tabs.get_mut(this.active) {
-                        tab.options.invert = !tab.options.invert;
-                        this.start_search(this.active, cx);
-                    }
-                })),
-            );
+                .child(
+                    search_toggle(
+                        "invert",
+                        Icon::InvertMatch,
+                        if options.invert {
+                            "Exclude matches (on)"
+                        } else {
+                            "Exclude matches (off)"
+                        },
+                        t.shortcut(Command::ToggleInvert),
+                        options.invert,
+                        t,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.command(Command::ToggleInvert, window, cx)
+                    })),
+                );
 
         let mut bar = div()
             .h(px(48.))
@@ -2509,6 +2631,7 @@ impl Render for Workspace {
         let results_limited = tab.is_some_and(|tab| tab.results.limited);
         let loading = tab.is_some_and(|tab| tab.loading);
         let searching = tab.is_some_and(|tab| tab.searching);
+        let show_searching = tab.is_some_and(|tab| tab.searching_visible);
         let tab_error = tab.and_then(|tab| tab.error.clone());
         let options = tab
             .map(|tab| tab.options.clone())
@@ -2520,8 +2643,10 @@ impl Render for Workspace {
         let main_area = if self.tabs.is_empty() {
             self.render_welcome(cx)
         } else {
-            let empty_results = if searching || loading {
+            let empty_results = if show_searching || loading {
                 "Searching…"
+            } else if searching {
+                ""
             } else if tab_error.is_some() {
                 "Results unavailable"
             } else if tab.is_some_and(|tab| tab.query.is_empty()) {
@@ -2734,7 +2859,9 @@ impl Render for Workspace {
                                         }),
                                 )
                             })
-                            .when(searching, |el| el.text_color(t.accent).child("Searching…")),
+                            .when(show_searching, |el| {
+                                el.text_color(t.accent).child("Searching…")
+                            }),
                     )
                     .when(result_count > 0, |header| {
                         header.child(
@@ -2955,6 +3082,162 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.tabs[0].selected, 2);
             assert!(!view.show_goto);
+        });
+    }
+
+    #[gpui::test]
+    fn search_option_shortcuts_toggle_only_when_search_is_focused(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("search_opts.log");
+        std::fs::write(&path, "ERROR one\nerror two\nterror three\na.b\naxb\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, _| view.tabs[0].log = Some(log));
+
+        let stroke = |key: &str| {
+            if cfg!(target_os = "macos") {
+                format!("cmd-alt-{key}")
+            } else {
+                format!("ctrl-alt-{key}")
+            }
+        };
+
+        // Initial defaults from config/search.json: Regex, case_sensitive/whole_word/invert off.
+        view.read_with(cx, |view, _| {
+            let opts = &view.tabs[0].options;
+            assert_eq!(opts.mode, SearchMode::Regex);
+            assert!(!opts.case_sensitive);
+            assert!(!opts.whole_word);
+            assert!(!opts.invert);
+            let expected = |key: &str| {
+                if cfg!(target_os = "macos") {
+                    format!("⌘⌥{key}")
+                } else {
+                    format!("Ctrl+Alt+{key}")
+                }
+            };
+            assert_eq!(
+                view.theme.shortcut(Command::ToggleRegex).as_deref(),
+                Some(expected("R").as_str())
+            );
+            assert_eq!(
+                view.theme.shortcut(Command::ToggleCaseSensitive).as_deref(),
+                Some(expected("C").as_str())
+            );
+            assert_eq!(
+                view.theme.shortcut(Command::ToggleWholeWord).as_deref(),
+                Some(expected("W").as_str())
+            );
+            assert_eq!(
+                view.theme.shortcut(Command::ToggleInvert).as_deref(),
+                Some(expected("I").as_str())
+            );
+        });
+
+        // While the log pane is focused (Search is not focused), none of the search option shortcuts fire.
+        cx.simulate_keystrokes(&stroke("r"));
+        cx.simulate_keystrokes(&stroke("c"));
+        cx.simulate_keystrokes(&stroke("w"));
+        cx.simulate_keystrokes(&stroke("i"));
+        view.read_with(cx, |view, _| {
+            let opts = &view.tabs[0].options;
+            assert_eq!(opts.mode, SearchMode::Regex);
+            assert!(!opts.case_sensitive);
+            assert!(!opts.whole_word);
+            assert!(!opts.invert);
+        });
+
+        // Focus search with an empty query: toggling options does not start a background search.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx)
+        });
+        cx.simulate_keystrokes(&stroke("r"));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(!view.tabs[0].searching);
+            assert!(!view.tabs[0].searching_visible);
+        });
+        cx.simulate_keystrokes(&stroke("r"));
+
+        // Type a query and toggle each search option via keyboard.
+        cx.simulate_input("a.b");
+
+        cx.simulate_keystrokes(&stroke("r"));
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert_eq!(view.tabs[0].query, "a.b");
+            assert_eq!(view.input.read(cx).as_str(), "a.b");
+            assert!(!view.tabs[0].searching_visible);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].searching);
+            assert!(!view.tabs[0].searching_visible);
+            assert_eq!(view.tabs[0].results.matches, vec![3]);
+        });
+
+        cx.simulate_keystrokes(&stroke("c"));
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].options.case_sensitive);
+            assert_eq!(view.input.read(cx).as_str(), "a.b");
+            assert!(!view.tabs[0].searching_visible);
+        });
+
+        cx.simulate_keystrokes(&stroke("w"));
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].options.whole_word);
+            assert_eq!(view.input.read(cx).as_str(), "a.b");
+            assert!(!view.tabs[0].searching_visible);
+        });
+
+        cx.simulate_keystrokes(&stroke("i"));
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].options.invert);
+            assert_eq!(view.input.read(cx).as_str(), "a.b");
+            assert!(!view.tabs[0].searching_visible);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2, 4]);
+        });
+
+        // Focus stays in the search input and pressing each shortcut again toggles them back.
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+        });
+        cx.simulate_keystrokes(&stroke("r"));
+        cx.simulate_keystrokes(&stroke("c"));
+        cx.simulate_keystrokes(&stroke("w"));
+        cx.simulate_keystrokes(&stroke("i"));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let opts = &view.tabs[0].options;
+            assert_eq!(opts.mode, SearchMode::Regex);
+            assert!(!opts.case_sensitive);
+            assert!(!opts.whole_word);
+            assert!(!opts.invert);
+            assert_eq!(view.tabs[0].results.matches, vec![3, 4]);
+        });
+
+        // Toggling a bookmark updates visible rows synchronously without triggering a search
+        // or consuming unsubmitted text from the search box.
+        cx.simulate_input("extra");
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("m");
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].searching);
+            assert!(!view.tabs[0].searching_visible);
+            assert_eq!(view.tabs[0].query, "a.b");
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
+            assert_eq!(view.tabs[0].results.visible, vec![0, 3, 4]);
         });
     }
 

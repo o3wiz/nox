@@ -32,6 +32,82 @@ pub struct SearchResults {
     pub limited: bool,
     pub widest_row: usize,
 }
+pub fn visible_rows(
+    log: &LogFile,
+    matches: &[usize],
+    context_lines: usize,
+    bookmarks: &BTreeSet<usize>,
+) -> (Vec<usize>, usize) {
+    let len = log.len();
+    if len == 0 {
+        return (Vec::new(), 0);
+    }
+    let last = len - 1;
+    let visible = if matches.windows(2).all(|w| w[0] <= w[1]) {
+        let mut from_matches = Vec::with_capacity(matches.len());
+        let mut next_start = 0;
+        for &index in matches {
+            if index >= len {
+                break;
+            }
+            let start = index.saturating_sub(context_lines).max(next_start);
+            let end = index.saturating_add(context_lines).min(last);
+            if start <= end {
+                from_matches.extend(start..=end);
+                next_start = end + 1;
+            }
+        }
+        let mut merged = Vec::with_capacity(from_matches.len() + bookmarks.len());
+        let mut m_iter = from_matches.into_iter().peekable();
+        let mut b_iter = bookmarks
+            .iter()
+            .copied()
+            .take_while(|&b| b < len)
+            .peekable();
+        loop {
+            match (m_iter.peek().copied(), b_iter.peek().copied()) {
+                (Some(m), Some(b)) if m < b => {
+                    merged.push(m);
+                    m_iter.next();
+                }
+                (Some(m), Some(b)) if b < m => {
+                    merged.push(b);
+                    b_iter.next();
+                }
+                (Some(m), Some(_)) => {
+                    merged.push(m);
+                    m_iter.next();
+                    b_iter.next();
+                }
+                (Some(_), None) => {
+                    merged.extend(m_iter);
+                    break;
+                }
+                (None, Some(_)) => {
+                    merged.extend(b_iter);
+                    break;
+                }
+                (None, None) => break,
+            }
+        }
+        merged
+    } else {
+        let mut set = BTreeSet::new();
+        for &index in matches {
+            if index < len {
+                set.extend(
+                    index.saturating_sub(context_lines)
+                        ..=index.saturating_add(context_lines).min(last),
+                );
+            }
+        }
+        set.extend(bookmarks.iter().copied().filter(|&index| index < len));
+        set.into_iter().collect()
+    };
+    let widest_row = widest(log, &visible);
+    (visible, widest_row)
+}
+
 pub fn search(
     log: &LogFile,
     pattern: &str,
@@ -40,12 +116,7 @@ pub fn search(
     cancel: &AtomicBool,
 ) -> Result<SearchResults> {
     if pattern.is_empty() {
-        let visible: Vec<_> = bookmarks
-            .iter()
-            .copied()
-            .filter(|&i| i < log.len())
-            .collect();
-        let widest_row = widest(log, &visible);
+        let (visible, widest_row) = visible_rows(log, &[], options.context_lines, bookmarks);
         return Ok(SearchResults {
             visible,
             widest_row,
@@ -54,7 +125,6 @@ pub fn search(
     }
     let regex = compile(pattern, options)?;
     let mut result = SearchResults::default();
-    let mut visible = BTreeSet::new();
     let mut reader = log.lines();
     let mut bytes = Vec::new();
     let mut index = 0;
@@ -68,22 +138,19 @@ pub fn search(
             bytes.pop();
         }
         let text = String::from_utf8_lossy(&bytes);
-        if !pattern.is_empty() && (regex.is_match(&text) != options.invert) {
+        if regex.is_match(&text) != options.invert {
             if result.matches.len() == options.max_results {
                 result.limited = true;
                 break;
             }
             result.matches.push(index);
-            visible.extend(
-                index.saturating_sub(options.context_lines)
-                    ..=(index + options.context_lines).min(log.len().saturating_sub(1)),
-            );
         }
         index += 1;
     }
-    visible.extend(bookmarks.iter().copied().filter(|&index| index < log.len()));
-    result.visible = visible.into_iter().collect();
-    result.widest_row = widest(log, &result.visible);
+    let (visible, widest_row) =
+        visible_rows(log, &result.matches, options.context_lines, bookmarks);
+    result.visible = visible;
+    result.widest_row = widest_row;
     Ok(result)
 }
 

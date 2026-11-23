@@ -77,6 +77,26 @@
       "context": "Search"
     },
     {
+      "keys": "secondary-alt-r",
+      "action": "toggle_regex",
+      "context": "Search"
+    },
+    {
+      "keys": "secondary-alt-c",
+      "action": "toggle_case_sensitive",
+      "context": "Search"
+    },
+    {
+      "keys": "secondary-alt-w",
+      "action": "toggle_whole_word",
+      "context": "Search"
+    },
+    {
+      "keys": "secondary-alt-i",
+      "action": "toggle_invert",
+      "context": "Search"
+    },
+    {
       "keys": "enter",
       "action": "go_to_line",
       "context": "GoTo"

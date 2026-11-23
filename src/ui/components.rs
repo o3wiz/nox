@@ -148,6 +148,7 @@ pub fn search_toggle(
     id: &'static str,
     icon: Icon,
     tooltip: impl Into<SharedString>,
+    shortcut: Option<SharedString>,
     enabled: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
@@ -190,7 +191,9 @@ pub fn search_toggle(
                 .group_hover(id, move |s| s.text_color(hover_fg)),
         )
         .tooltip_show_delay(TOOLTIP_DELAY)
-        .tooltip(move |_window, cx| Tooltip::view(tooltip.clone(), None, tip_theme.clone(), cx))
+        .tooltip(move |_window, cx| {
+            Tooltip::view(tooltip.clone(), shortcut.clone(), tip_theme.clone(), cx)
+        })
 }
 
 /// Vertical hairline separator between logical groups of toolbar icons.
