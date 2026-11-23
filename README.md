@@ -13,11 +13,11 @@ Requires a Rust toolchain supporting edition 2024 and the native build prerequis
 
 ## Using the viewer
 
-Open files with **Open files**, by dragging files onto the window, the command line, or **Recent & favorites**. Click a tab to switch; **Close tab** closes the active file. Enter a search and press **Enter** or **Search**. Expand **Search options** to toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches**. A summary below the search field always shows the active settings. Presets apply immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
+Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar. Saved search presets apply immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
 
-Click a result to jump to its source line. Click the gutter or use **Bookmark** to mark a line. Selecting a line stops following; **Follow new lines** resumes scrolling to the end as changes arrive. Watching continues even when following is off. **Reload** retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
+Click a result to jump to its source line. Click the gutter or the bookmark icon to mark a line. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
-**Export results** writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Copying copies the complete selected line as text. Regex errors and file errors appear above the viewer, even when the status bar is hidden. Empty search results include guidance for the next step.
+The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. The copy icon (or **⌘C** / **Ctrl+C**) copies the complete selected line as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
 
 Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 
@@ -61,7 +61,7 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | File | Settings |
 | --- | --- |
 | `window.json` | Title, initial dimensions/maximized state, results-pane height, status bar |
-| `appearance.json` | Font family/size and semantic colors (`#RRGGBB`) |
+| `appearance.json` | UI sans-serif & monospace font families/sizes and semantic colors (`#RRGGBB`) |
 | `viewer.json` | Line numbers/height, match overview visibility/width, tab expansion, display character limit, following, bookmark inclusion, polling interval |
 | `search.json` | Default search mode, case/word/inversion, context lines, match limit, named presets |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |
@@ -110,7 +110,7 @@ Set `NOX_STATE_DIR` or `files.state_file` to change it (`state_file` takes prior
 
 ## Architecture and limits
 
-`src/config.rs` owns typed configuration, validation, and schema generation. `src/logfile.rs` indexes byte offsets and reads source data on demand using positioned reads. `src/search.rs` streams through the file and returns matching/context line indices. `src/session.rs` manages persisted state. `src/ui.rs` owns GPUI presentation and asynchronous job coordination. The executable entry point handles command-line startup.
+`src/config.rs` owns typed configuration, validation, and schema generation. `src/logfile.rs` indexes byte offsets and reads source data on demand using positioned reads. `src/search.rs` streams through the file and returns matching/context line indices. `src/session.rs` manages persisted state. `src/ui/` owns GPUI presentation (`mod.rs`), vector icons (`icons.rs`), design tokens and font resolution (`theme.rs`), and reusable icon-first controls (`components.rs`). The executable entry point handles command-line startup.
 
 The line index uses approximately eight bytes per line (plus allocation overhead). Search buffers one complete line at a time; pathological single-line files can still use substantial memory. Display text is bounded by `max_display_chars`, while matching, copying, and export use complete lines. Search uses Rust's Unicode regex engine, not Klogg's Hyperscan/PCRE engine: lookaround and backreferences are unsupported. `max_results` caps matching lines, not additional context/bookmark rows.
 

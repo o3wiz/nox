@@ -21,6 +21,9 @@ pub struct WindowConfig {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppearanceConfig {
+    pub ui_font_family: String,
+    #[schemars(range(min = 8, max = 32))]
+    pub ui_font_size: f32,
     pub font_family: String,
     #[schemars(range(min = 8, max = 32))]
     pub font_size: f32,
@@ -265,6 +268,10 @@ impl Config {
         ensure!(
             (100.0..=1200.0).contains(&w.results_height),
             "window.results_height must be 100..1200"
+        );
+        ensure!(
+            (8.0..=32.0).contains(&a.ui_font_size),
+            "appearance.ui_font_size must be 8..32"
         );
         ensure!(
             (8.0..=32.0).contains(&a.font_size),

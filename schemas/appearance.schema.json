@@ -3,6 +3,15 @@
   "title": "AppearanceConfig",
   "type": "object",
   "properties": {
+    "ui_font_family": {
+      "type": "string"
+    },
+    "ui_font_size": {
+      "type": "number",
+      "format": "float",
+      "minimum": 8,
+      "maximum": 32
+    },
     "font_family": {
       "type": "string"
     },

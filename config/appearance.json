@@ -1,12 +1,14 @@
 {
   "$schema": "../schemas/appearance.schema.json",
-  "font_family": "monospace",
+  "ui_font_family": "SF Pro Text",
+  "ui_font_size": 13,
+  "font_family": "SF Mono",
   "font_size": 13,
-  "background": "#11151C",
-  "panel": "#1A202B",
-  "foreground": "#D8E1EE",
-  "muted": "#8492A6",
-  "accent": "#74C7B8",
-  "selection": "#283F50",
-  "border": "#2B3545"
+  "background": "#0E1218",
+  "panel": "#151B24",
+  "foreground": "#E2E8F0",
+  "muted": "#8B9BB4",
+  "accent": "#5EEAD4",
+  "selection": "#1F3344",
+  "border": "#263142"
 }
