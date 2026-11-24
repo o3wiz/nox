@@ -2808,11 +2808,7 @@ impl Workspace {
                     search_toggle(
                         "regex",
                         Icon::Regex,
-                        if regex_on {
-                            "Regular expression (on)"
-                        } else {
-                            "Regular expression (off)"
-                        },
+                        "Regular expression",
                         t.shortcut(Command::ToggleRegex),
                         regex_on,
                         t,
@@ -2825,11 +2821,7 @@ impl Workspace {
                     search_toggle(
                         "case",
                         Icon::CaseSensitive,
-                        if options.case_sensitive {
-                            "Match case (on)"
-                        } else {
-                            "Match case (off)"
-                        },
+                        "Match case",
                         t.shortcut(Command::ToggleCaseSensitive),
                         options.case_sensitive,
                         t,
@@ -2842,11 +2834,7 @@ impl Workspace {
                     search_toggle(
                         "word",
                         Icon::WholeWord,
-                        if options.whole_word {
-                            "Whole words (on)"
-                        } else {
-                            "Whole words (off)"
-                        },
+                        "Whole words",
                         t.shortcut(Command::ToggleWholeWord),
                         options.whole_word,
                         t,
@@ -2859,11 +2847,7 @@ impl Workspace {
                     search_toggle(
                         "invert",
                         Icon::InvertMatch,
-                        if options.invert {
-                            "Exclude matches (on)"
-                        } else {
-                            "Exclude matches (off)"
-                        },
+                        "Exclude matches",
                         t.shortcut(Command::ToggleInvert),
                         options.invert,
                         t,
