@@ -93,6 +93,65 @@ impl LineSelection {
         }
     }
 
+    /// Returns `true` when more than one row is currently selected.
+    pub fn has_multi_selection(&self) -> bool {
+        self.ranges.len() > 1 || self.ranges.first().is_some_and(|&(start, end)| end > start)
+    }
+
+    /// Swaps the active cursor and anchor ends of a multi-line selection.
+    ///
+    /// Returns `true` when the cursor or anchor changed.
+    pub fn swap_anchor(&mut self) -> bool {
+        if !self.has_multi_selection() {
+            return false;
+        }
+        // If `select_all` left a single full range whose endpoints do not match `(anchor, cursor)`,
+        // snap to the range's actual endpoints so subsequent extensions adjust the whole range.
+        if self.base_ranges.is_empty() && self.ranges.len() == 1 {
+            let (start, end) = self.ranges[0];
+            if start < end
+                && (self.anchor.min(self.cursor), self.anchor.max(self.cursor)) != (start, end)
+            {
+                if self.cursor == start {
+                    self.anchor = start;
+                    self.cursor = end;
+                } else {
+                    self.anchor = end;
+                    self.cursor = start;
+                }
+                return true;
+            }
+        }
+        if self.anchor != self.cursor {
+            std::mem::swap(&mut self.cursor, &mut self.anchor);
+            return true;
+        }
+        // When `anchor == cursor` (e.g. after Cmd/Ctrl-clicking an adjacent row that merged into a
+        // contiguous range), promote that containing range into the active `(anchor, cursor)` span.
+        if let Some((start, end)) = self
+            .ranges
+            .iter()
+            .copied()
+            .find(|&(start, end)| start <= self.cursor && self.cursor <= end && start < end)
+        {
+            self.base_ranges = self
+                .ranges
+                .iter()
+                .copied()
+                .filter(|&range| range != (start, end))
+                .collect();
+            if self.cursor == start {
+                self.anchor = start;
+                self.cursor = end;
+            } else {
+                self.anchor = end;
+                self.cursor = start;
+            }
+            return true;
+        }
+        false
+    }
+
     pub fn contains(&self, row: usize) -> bool {
         self.ranges
             .binary_search_by(|&(start, end)| {
@@ -359,5 +418,87 @@ mod tests {
         sel.remap_sorted(&old, &new);
         assert_eq!(sel.iter().collect::<Vec<_>>(), vec![2, 4]); // lines 20 and 40
         assert_eq!(sel.cursor, 4);
+    }
+
+    #[test]
+    fn swap_anchor_toggles_between_top_and_bottom_and_supports_subsequent_shrink_and_extend() {
+        let mut sel = LineSelection::single(3);
+        assert!(!sel.has_multi_selection());
+        assert!(!sel.swap_anchor());
+
+        // Select lines 4..=13 (0-based 3..=12), cursor at bottom (12), anchor at top (3).
+        sel.extend_to(12);
+        assert!(sel.has_multi_selection());
+        assert_eq!(sel.ranges(), &[(3, 12)]);
+        assert_eq!((sel.anchor, sel.cursor), (3, 12));
+
+        // Swap moves anchor to bottom (12) and cursor to top (3) without changing selected rows.
+        assert!(sel.swap_anchor());
+        assert_eq!(sel.ranges(), &[(3, 12)]);
+        assert_eq!((sel.anchor, sel.cursor), (12, 3));
+
+        // Extending one line down shrinks from the top to 4..=12 (9 selected, cursor at 4).
+        sel.extend_to(4);
+        assert_eq!(sel.ranges(), &[(4, 12)]);
+        assert_eq!(sel.count(), 9);
+        assert_eq!((sel.anchor, sel.cursor), (12, 4));
+
+        // Swapping again moves cursor back to bottom (12) and anchor to top (4).
+        assert!(sel.swap_anchor());
+        assert_eq!(sel.ranges(), &[(4, 12)]);
+        assert_eq!((sel.anchor, sel.cursor), (4, 12));
+
+        // Extending downward grows the bottom end.
+        sel.extend_to(14);
+        assert_eq!(sel.ranges(), &[(4, 14)]);
+        assert_eq!((sel.anchor, sel.cursor), (4, 14));
+    }
+
+    #[test]
+    fn swap_anchor_handles_select_all_base_ranges_and_merged_toggles() {
+        // Select All from a middle row snaps cleanly to the full range's endpoints.
+        let mut sel = LineSelection::single(5);
+        sel.select_all(18);
+        assert!(sel.swap_anchor());
+        assert_eq!((sel.anchor, sel.cursor), (17, 0));
+        assert_eq!(sel.ranges(), &[(0, 17)]);
+        sel.extend_to(1);
+        assert_eq!(sel.ranges(), &[(1, 17)]);
+        assert!(sel.swap_anchor());
+        assert_eq!((sel.anchor, sel.cursor), (1, 17));
+
+        // Select All when cursor starts at row 0 jumps cursor to the bottom row first.
+        let mut sel = LineSelection::single(0);
+        sel.select_all(10);
+        assert!(sel.swap_anchor());
+        assert_eq!((sel.anchor, sel.cursor), (0, 9));
+        assert!(sel.swap_anchor());
+        assert_eq!((sel.anchor, sel.cursor), (9, 0));
+
+        // Disjoint base_ranges are preserved when swapping the active Shift-range.
+        let mut sel = LineSelection::single(1);
+        sel.extend_to(3);
+        sel.toggle(7);
+        sel.extend_to(10);
+        assert!(sel.swap_anchor());
+        assert_eq!((sel.anchor, sel.cursor), (10, 7));
+        sel.extend_to(8);
+        assert_eq!(sel.ranges(), &[(1, 3), (8, 10)]);
+
+        // Adjacent Cmd/Ctrl-toggled rows merged into a contiguous range promote cleanly.
+        let mut sel = LineSelection::single(2);
+        sel.toggle(3);
+        sel.toggle(4);
+        assert_eq!(sel.ranges(), &[(2, 4)]);
+        assert_eq!((sel.anchor, sel.cursor), (4, 4));
+        assert!(sel.swap_anchor());
+        assert_eq!((sel.anchor, sel.cursor), (4, 2));
+        sel.extend_to(3);
+        assert_eq!(sel.ranges(), &[(3, 4)]);
+
+        // Empty selection is a no-op.
+        let mut empty = LineSelection::empty();
+        assert!(!empty.has_multi_selection());
+        assert!(!empty.swap_anchor());
     }
 }

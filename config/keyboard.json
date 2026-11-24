@@ -197,6 +197,11 @@
       "context": "Log"
     },
     {
+      "keys": "alt-o",
+      "action": "swap_selection_anchor",
+      "context": "Selection"
+    },
+    {
       "keys": "down",
       "action": "next_line",
       "context": "Presets"

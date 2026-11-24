@@ -151,6 +151,7 @@ pub enum Command {
     SelectPageDown,
     SelectAll,
     ClearSelection,
+    SwapSelectionAnchor,
     TogglePresets,
     ApplyPreset,
 }
@@ -158,6 +159,7 @@ pub enum Command {
 pub enum KeyContext {
     Workspace,
     Log,
+    Selection,
     Search,
     GoTo,
     Presets,
@@ -167,6 +169,7 @@ impl KeyContext {
         match self {
             Self::Workspace => "Workspace",
             Self::Log => "Log",
+            Self::Selection => "Selection",
             Self::Search => "Search",
             Self::GoTo => "GoTo",
             Self::Presets => "Presets",

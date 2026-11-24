@@ -1138,6 +1138,34 @@ impl Workspace {
                     }
                 }
             }
+            Command::SwapSelectionAnchor => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match pane {
+                        Pane::Main => {
+                            let len = tab.log.as_ref().map_or(0, |log| log.len());
+                            if len > 0 && tab.main_selection.swap_anchor() {
+                                let cursor = tab.main_selection.cursor.min(len - 1);
+                                tab.main_selection.cursor = cursor;
+                                tab.selected = cursor;
+                                tab.follow = false;
+                                tab.scroll.scroll_to_item(cursor, ScrollStrategy::Nearest);
+                            }
+                        }
+                        Pane::Results => {
+                            let len = tab.results.visible.len();
+                            if len > 0 && tab.result_selection.swap_anchor() {
+                                let cursor = tab.result_selection.cursor.min(len - 1);
+                                tab.result_selection.cursor = cursor;
+                                tab.result_scroll
+                                    .scroll_to_item(cursor, ScrollStrategy::Nearest);
+                                Self::sync_main_to_result_cursor(tab);
+                            }
+                        }
+                    }
+                }
+            }
             Command::SwitchPane => {
                 let current = self.active_pane_for(window);
                 match current {
@@ -3064,6 +3092,9 @@ impl Render for Workspace {
         let scroll = tab.map(|tab| tab.scroll.clone()).unwrap_or_default();
         let result_scroll = tab.map(|tab| tab.result_scroll.clone()).unwrap_or_default();
         let file_path = tab.map(|tab| tab.path.display().to_string());
+        let main_multi_selected = tab.is_some_and(|tab| tab.main_selection.has_multi_selection());
+        let results_multi_selected =
+            tab.is_some_and(|tab| tab.result_selection.has_multi_selection());
 
         let main_area = if self.tabs.is_empty() {
             self.render_welcome(cx)
@@ -3084,51 +3115,53 @@ impl Render for Workspace {
                 "No matches"
             };
 
-            let source_log_area = div()
-                .key_context("Log")
-                .track_focus(&self.focus)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.focus_pane(Pane::Main, window, cx)),
-                )
-                .flex()
-                .flex_1()
-                .min_h_0()
-                .when(line_count == 0, |area| {
-                    area.items_center()
-                        .justify_center()
-                        .text_size(t.small_size)
-                        .text_color(t.muted)
-                        .child(if loading {
-                            "Opening file…"
-                        } else if tab_error.is_some() {
-                            "Cannot read file"
-                        } else {
-                            "Empty file"
-                        })
-                })
-                .when(line_count > 0, |area| {
-                    area.child(
-                        uniform_list(
-                            "source",
-                            line_count,
-                            cx.processor(|this, range, window, cx| {
-                                this.rows(range, false, window, cx)
-                            }),
-                        )
-                        .with_horizontal_sizing_behavior(
-                            ListHorizontalSizingBehavior::Unconstrained,
-                        )
-                        .with_width_from_item(Some(widest_line))
-                        .track_scroll(&scroll)
-                        .flex_1()
-                        .min_w_0()
-                        .h_full(),
+            let source_log_area = div().key_context("Log").flex().flex_1().min_h_0().child(
+                div()
+                    .when(main_multi_selected, |area| area.key_context("Selection"))
+                    .track_focus(&self.focus)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.focus_pane(Pane::Main, window, cx)),
                     )
-                    .when(self.config.viewer.show_overview, |row| {
-                        row.child(self.overview(cx))
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .when(line_count == 0, |area| {
+                        area.items_center()
+                            .justify_center()
+                            .text_size(t.small_size)
+                            .text_color(t.muted)
+                            .child(if loading {
+                                "Opening file…"
+                            } else if tab_error.is_some() {
+                                "Cannot read file"
+                            } else {
+                                "Empty file"
+                            })
                     })
-                });
+                    .when(line_count > 0, |area| {
+                        area.child(
+                            uniform_list(
+                                "source",
+                                line_count,
+                                cx.processor(|this, range, window, cx| {
+                                    this.rows(range, false, window, cx)
+                                }),
+                            )
+                            .with_horizontal_sizing_behavior(
+                                ListHorizontalSizingBehavior::Unconstrained,
+                            )
+                            .with_width_from_item(Some(widest_line))
+                            .track_scroll(&scroll)
+                            .flex_1()
+                            .min_w_0()
+                            .h_full(),
+                        )
+                        .when(self.config.viewer.show_overview, |row| {
+                            row.child(self.overview(cx))
+                        })
+                    }),
+            );
 
             let source_pane = div()
                 .flex_1()
@@ -3304,48 +3337,59 @@ impl Render for Workspace {
 
             let results_body = div()
                 .key_context("Log")
-                .track_focus(&self.results_focus)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.focus_pane(Pane::Results, window, cx)),
-                )
                 .h(px(self.config.window.results_height))
                 .max_h(relative(0.45))
                 .flex_shrink_0()
                 .w_full()
                 .flex()
                 .flex_col()
-                .when(result_count == 0, |col| {
-                    col.child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(t.small_size)
-                            .text_color(t.muted)
-                            .child(empty_results),
-                    )
-                })
-                .when(result_count > 0, |col| {
-                    col.child(
-                        uniform_list(
-                            "results",
-                            result_count,
-                            cx.processor(|this, range, window, cx| {
-                                this.rows(range, true, window, cx)
+                .child(
+                    div()
+                        .when(results_multi_selected, |body| body.key_context("Selection"))
+                        .track_focus(&self.results_focus)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.focus_pane(Pane::Results, window, cx)
                             }),
                         )
-                        .with_horizontal_sizing_behavior(
-                            ListHorizontalSizingBehavior::Unconstrained,
-                        )
-                        .with_width_from_item(Some(widest_result))
-                        .track_scroll(&result_scroll)
                         .flex_1()
                         .w_full()
-                        .min_h_0(),
-                    )
-                });
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .when(result_count == 0, |col| {
+                            col.child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(t.small_size)
+                                    .text_color(t.muted)
+                                    .child(empty_results),
+                            )
+                        })
+                        .when(result_count > 0, |col| {
+                            col.child(
+                                uniform_list(
+                                    "results",
+                                    result_count,
+                                    cx.processor(|this, range, window, cx| {
+                                        this.rows(range, true, window, cx)
+                                    }),
+                                )
+                                .with_horizontal_sizing_behavior(
+                                    ListHorizontalSizingBehavior::Unconstrained,
+                                )
+                                .with_width_from_item(Some(widest_result))
+                                .track_scroll(&result_scroll)
+                                .flex_1()
+                                .w_full()
+                                .min_h_0(),
+                            )
+                        }),
+                );
 
             div()
                 .flex_1()
@@ -4322,6 +4366,228 @@ mod tests {
             assert_eq!(view.status, None);
             assert!(!view.show_goto);
             assert_eq!(view.tabs[0].selected, 1);
+        });
+    }
+
+    #[gpui::test]
+    fn alt_o_swaps_selection_anchor_in_main_and_filter_panes_using_selection_context(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("anchor.log");
+        let content = (0..18)
+            .map(|i| {
+                if matches!(i, 2 | 5 | 8 | 11 | 14) {
+                    format!("ERROR line {i}\n")
+                } else {
+                    format!("INFO line {i}\n")
+                }
+            })
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let results = SearchResults {
+            matches: vec![2, 5, 8, 11, 14],
+            visible: vec![2, 5, 8, 11, 14],
+            limited: false,
+            widest_row: 0,
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "ERROR".into();
+            view.tabs[0].results = results;
+            view.tabs[0].main_selection = LineSelection::single(3);
+            view.tabs[0].selected = 3;
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Single-line selection does not activate Selection context.
+        cx.simulate_keystrokes("alt-o");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.anchor, 3);
+            assert_eq!(view.tabs[0].main_selection.cursor, 3);
+            assert_eq!(view.tabs[0].selected, 3);
+        });
+
+        // Select rows 3..=12 (10 selected, cursor at bottom = 12, anchor at top = 3).
+        view.update(cx, |view, cx| {
+            view.tabs[0].main_selection.extend_to(12);
+            view.tabs[0].selected = 12;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Pressing alt-o flips anchor to bottom (12) and cursor to top (3).
+        cx.simulate_keystrokes("alt-o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(3, 12)]);
+            assert_eq!(view.tabs[0].main_selection.anchor, 12);
+            assert_eq!(view.tabs[0].main_selection.cursor, 3);
+            assert_eq!(view.tabs[0].selected, 3);
+        });
+
+        // Shift+Down shrinks from the top to rows 4..=12 (9 selected, cursor = 4, anchor = 12).
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(4, 12)]);
+            assert_eq!(view.tabs[0].main_selection.count(), 9);
+            assert_eq!(view.tabs[0].main_selection.anchor, 12);
+            assert_eq!(view.tabs[0].main_selection.cursor, 4);
+            assert_eq!(view.tabs[0].selected, 4);
+        });
+
+        // Pressing alt-o again flips back so cursor is at bottom (12) and anchor is at top (4).
+        cx.simulate_keystrokes("alt-o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(4, 12)]);
+            assert_eq!(view.tabs[0].main_selection.anchor, 4);
+            assert_eq!(view.tabs[0].main_selection.cursor, 12);
+            assert_eq!(view.tabs[0].selected, 12);
+        });
+
+        // Focusing Search does not run Selection bindings even while main pane has a multi-selection.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.anchor, 4);
+            assert_eq!(view.tabs[0].main_selection.cursor, 12);
+        });
+
+        // Switch to filter pane (only 1 filtered row selected): alt-o must not affect main or filter selection.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.anchor, 4);
+            assert_eq!(view.tabs[0].main_selection.cursor, 12);
+            assert_eq!(view.tabs[0].result_selection.anchor, 0);
+            assert_eq!(view.tabs[0].result_selection.cursor, 0);
+        });
+
+        // Multi-select filtered rows 0..=3 (source lines 2, 5, 8, 11).
+        cx.simulate_keystrokes("shift-down shift-down shift-down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(0, 3)]);
+            assert_eq!(view.tabs[0].result_selection.anchor, 0);
+            assert_eq!(view.tabs[0].result_selection.cursor, 3);
+            assert_eq!(view.tabs[0].selected, 11);
+        });
+
+        // Pressing alt-o in the filter pane swaps anchor/cursor to top (row 0 -> source line 2).
+        cx.simulate_keystrokes("alt-o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(0, 3)]);
+            assert_eq!(view.tabs[0].result_selection.anchor, 3);
+            assert_eq!(view.tabs[0].result_selection.cursor, 0);
+            assert_eq!(view.tabs[0].selected, 2);
+        });
+
+        // Shift+Down shrinks filtered selection from the top to rows 1..=3 (source line 5 active).
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(1, 3)]);
+            assert_eq!(view.tabs[0].result_selection.anchor, 3);
+            assert_eq!(view.tabs[0].result_selection.cursor, 1);
+            assert_eq!(view.tabs[0].selected, 5);
+        });
+
+        // Pressing alt-o again moves cursor back to bottom of filtered selection (row 3 -> source line 11).
+        cx.simulate_keystrokes("alt-o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(1, 3)]);
+            assert_eq!(view.tabs[0].result_selection.anchor, 1);
+            assert_eq!(view.tabs[0].result_selection.cursor, 3);
+            assert_eq!(view.tabs[0].selected, 11);
+        });
+    }
+
+    #[gpui::test]
+    fn selection_context_overrides_log_context_only_when_multiple_lines_are_selected(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Bind `o` to bookmark in Log, and to swap_selection_anchor in Selection.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "o".into(),
+            context: config::KeyContext::Log,
+            action: Command::ToggleBookmark,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "o".into(),
+            context: config::KeyContext::Selection,
+            action: Command::SwapSelectionAnchor,
+        });
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("precedence.log");
+        std::fs::write(&path, "zero\none\ntwo\nthree\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // With a single line selected, `Log` handles `o` (bookmark).
+        cx.simulate_keystrokes("o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
+        });
+
+        // With multiple lines selected, `Selection` takes precedence over `Log` and swaps anchor.
+        cx.simulate_keystrokes("shift-down shift-down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
+            assert_eq!(view.tabs[0].main_selection.anchor, 2);
+            assert_eq!(view.tabs[0].main_selection.cursor, 0);
+        });
+
+        // After collapsing selection with Escape, `Log` handles `o` again (unbookmark line 0).
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("o");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.is_empty());
         });
     }
 }

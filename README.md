@@ -15,7 +15,7 @@ Requires a Rust toolchain supporting edition 2024 and the native build prerequis
 
 Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar. Open saved patterns from the **Patterns** dropdown (or **⌘P** / **Ctrl+P**), navigate with **↑**/**↓** (**Home**/**End**), and press **Enter** or click an item to apply it immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
 
-Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
+Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Alt+O** / **⌥O** flips the selection anchor between the top and bottom ends, and **Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
 The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
 
@@ -38,6 +38,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Log | b / shift-b | Next / previous bookmark |
 | Log | f | Toggle following |
 | Log | secondary-c | Copy selected lines |
+| Selection | alt-o | Toggle selection anchor between top and bottom |
 | Search | Enter / Escape | Apply search / focus log |
 | Search | secondary-alt-r | Toggle regular expression |
 | Search | secondary-alt-c | Toggle match case |
@@ -75,7 +76,7 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | `search.json` | Default search mode, case/word/inversion, context lines, match limit, named presets |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |
 | `files.json` | Startup paths, favorites, session restore/save, session path, recent-file limit |
-| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Search`, `GoTo`, or `Presets` contexts |
+| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Selection`, `Search`, `GoTo`, or `Presets` contexts |
 
 Each JSON file has a `$schema` link for editor completion and validation. Schemas are generated from the same Rust types used to deserialize configuration. Top-level properties are optional because files are overlays; objects inside replacement arrays require their fields. Additional semantic checks (for example regex syntax and shortcut conflicts) run in the application.
 

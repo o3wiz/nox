@@ -40,6 +40,7 @@
       "enum": [
         "Workspace",
         "Log",
+        "Selection",
         "Search",
         "GoTo",
         "Presets"
@@ -85,6 +86,7 @@
         "select_page_down",
         "select_all",
         "clear_selection",
+        "swap_selection_anchor",
         "toggle_presets",
         "apply_preset"
       ]
