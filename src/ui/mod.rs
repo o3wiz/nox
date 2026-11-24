@@ -2102,10 +2102,18 @@ impl Workspace {
             );
         }
 
+        let header_left_padding = if cfg!(target_os = "macos") && !window.is_fullscreen() {
+            px(80.)
+        } else {
+            px(12.)
+        };
+
         div()
             .id("header")
             .h(px(46.))
-            .px_3()
+            .pl(header_left_padding)
+            .pr_3()
+            .window_control_area(WindowControlArea::Drag)
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -3759,7 +3767,8 @@ pub fn run(config: Config, paths: Vec<PathBuf>) -> anyhow::Result<()> {
                         window_min_size: Some(size(px(640.), px(480.))),
                         titlebar: Some(TitlebarOptions {
                             title: Some(config.window.title.clone().into()),
-                            ..Default::default()
+                            appears_transparent: true,
+                            traffic_light_position: Some(point(px(14.), px(16.))),
                         }),
                         ..Default::default()
                     };
