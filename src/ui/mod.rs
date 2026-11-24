@@ -3041,6 +3041,7 @@ impl Workspace {
 
         let mut tab_strip = div()
             .id("tabs")
+            .debug_selector(|| "tab-strip".into())
             .flex_1()
             .min_w_0()
             .h_full()
@@ -3064,6 +3065,7 @@ impl Workspace {
             tab_strip = tab_strip.child(
                 div()
                     .id(("tab", tab.id))
+                    .debug_selector(move || format!("tab-{index}"))
                     .h(px(30.))
                     .pl_2p5()
                     .pr_1p5()
@@ -3111,6 +3113,7 @@ impl Workspace {
                     .child(
                         div()
                             .id(("tab-close", tab.id))
+                            .debug_selector(move || format!("tab-close-{index}"))
                             .size(px(18.))
                             .rounded_sm()
                             .flex()
@@ -3139,7 +3142,13 @@ impl Workspace {
                     .tooltip(move |_window, cx| {
                         Tooltip::view(full_path.clone(), None, tip_theme.clone(), cx)
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| this.switch(index, cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| this.switch(index, cx)))
+                    .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        if event.is_middle_click() {
+                            cx.stop_propagation();
+                            this.close_tab_at(index, cx);
+                        }
+                    })),
             );
         }
 
@@ -7797,6 +7806,146 @@ mod tests {
             let re = Regex::new(&expected_combined).unwrap();
             assert!(re.is_match(part_a));
             assert!(re.is_match(part_b));
+        });
+    }
+
+    #[gpui::test]
+    fn middle_clicking_a_tab_closes_only_that_tab(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        let third = directory.path().join("third.log");
+        let fourth = directory.path().join("fourth.log");
+        std::fs::write(&first, "one\n").unwrap();
+        std::fs::write(&second, "two\n").unwrap();
+        std::fs::write(&third, "three\n").unwrap();
+        std::fs::write(&fourth, "four\n").unwrap();
+        let first_canon = first.canonicalize().unwrap_or_else(|_| first.clone());
+        let second_canon = second.canonicalize().unwrap_or_else(|_| second.clone());
+        let third_canon = third.canonicalize().unwrap_or_else(|_| third.clone());
+        let fourth_canon = fourth.canonicalize().unwrap_or_else(|_| fourth.clone());
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(config, vec![first, second, third, fourth], window, cx)
+        });
+        view.update(cx, |view, cx| {
+            view.switch(1, cx);
+            view.input
+                .update(cx, |input, cx| input.emplace("active-query", cx));
+        });
+        cx.run_until_parked();
+
+        // Right-clicking a tab does not close it.
+        let tab0_bounds = cx.debug_bounds("tab-0").expect("tab 0 bounds");
+        let tab0_body = point(tab0_bounds.left() + px(12.), tab0_bounds.center().y);
+        cx.simulate_mouse_down(tab0_body, MouseButton::Right, Modifiers::none());
+        cx.simulate_mouse_up(tab0_body, MouseButton::Right, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 4);
+            assert_eq!(view.active, 1);
+        });
+
+        // Middle-clicking empty space in the tab strip does not close any tab.
+        let strip_bounds = cx.debug_bounds("tab-strip").expect("tab strip bounds");
+        let tab3_bounds = cx.debug_bounds("tab-3").expect("tab 3 bounds");
+        assert!(
+            strip_bounds.right() > tab3_bounds.right() + px(8.),
+            "expected empty space in tab strip to test non-tab middle clicks"
+        );
+        let empty_strip_pt = point(strip_bounds.right() - px(4.), strip_bounds.center().y);
+        cx.simulate_mouse_down(empty_strip_pt, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_up(empty_strip_pt, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 4);
+            assert_eq!(view.active, 1);
+        });
+
+        // Pressing middle mouse on a tab and releasing off the tab cancels closing.
+        let tab2_bounds = cx.debug_bounds("tab-2").expect("tab 2 bounds");
+        let tab2_body = point(tab2_bounds.left() + px(12.), tab2_bounds.center().y);
+        cx.simulate_mouse_down(tab0_body, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_move(tab2_body, Some(MouseButton::Middle), Modifiers::none());
+        cx.simulate_mouse_up(tab2_body, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 4);
+            assert_eq!(view.active, 1);
+        });
+
+        // Pressing middle mouse outside tabs and releasing over a tab does not close it.
+        cx.simulate_mouse_down(empty_strip_pt, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_move(tab0_body, Some(MouseButton::Middle), Modifiers::none());
+        cx.simulate_mouse_up(tab0_body, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 4);
+            assert_eq!(view.active, 1);
+        });
+
+        // Middle-clicking an inactive tab closes it without switching away or losing active query.
+        cx.simulate_mouse_down(tab0_body, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_up(tab0_body, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let paths: Vec<_> = view.tabs.iter().map(|tab| tab.path.clone()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    second_canon.clone(),
+                    third_canon.clone(),
+                    fourth_canon.clone()
+                ]
+            );
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "active-query");
+            assert_ne!(view.tabs[0].path, first_canon);
+        });
+
+        // Middle-clicking on a tab's inline close button closes that tab once.
+        let tab1_close = cx
+            .debug_bounds("tab-close-1")
+            .expect("tab 1 close button bounds")
+            .center();
+        cx.simulate_mouse_down(tab1_close, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_up(tab1_close, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let paths: Vec<_> = view.tabs.iter().map(|tab| tab.path.clone()).collect();
+            assert_eq!(paths, vec![second_canon.clone(), fourth_canon.clone()]);
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "active-query");
+        });
+
+        // Middle-clicking the active tab closes it and activates the remaining tab.
+        let active_tab_bounds = cx.debug_bounds("tab-0").expect("active tab bounds");
+        let active_tab_body = point(
+            active_tab_bounds.left() + px(12.),
+            active_tab_bounds.center().y,
+        );
+        cx.simulate_mouse_down(active_tab_body, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_up(active_tab_body, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let paths: Vec<_> = view.tabs.iter().map(|tab| tab.path.clone()).collect();
+            assert_eq!(paths, vec![fourth_canon.clone()]);
+            assert_eq!(view.active, 0);
+        });
+
+        // Middle-clicking the last remaining tab empties the tab list cleanly.
+        let last_tab_bounds = cx.debug_bounds("tab-0").expect("last tab bounds");
+        let last_tab_body = point(last_tab_bounds.left() + px(12.), last_tab_bounds.center().y);
+        cx.simulate_mouse_down(last_tab_body, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_up(last_tab_body, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs.is_empty());
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "");
         });
     }
 }
