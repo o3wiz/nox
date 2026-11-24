@@ -2487,6 +2487,7 @@ impl Workspace {
             .id("presets-trigger")
             .debug_selector(|| "presets-trigger".into())
             .relative()
+            .w(px(180.))
             .h(px(32.))
             .pl_2p5()
             .pr_2()
@@ -2504,9 +2505,11 @@ impl Workspace {
             .child(Icon::ListFilter.element(ICON_XS, icon_color))
             .child(
                 div()
-                    .max_w(px(136.))
+                    .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
+                    .text_ellipsis()
                     .text_size(t.small_size)
                     .font_weight(FontWeight::MEDIUM)
                     .child(label),
@@ -4176,6 +4179,17 @@ mod tests {
             assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
         });
         assert!(cx.debug_bounds("presets-menu").is_none());
+        let trigger_after_warnings = cx
+            .debug_bounds("presets-trigger")
+            .expect("presets trigger after applying Warnings");
+        assert_eq!(
+            trigger_after_warnings.size.width, trigger_bounds.size.width,
+            "presets trigger width should remain constant when switching presets"
+        );
+        assert_eq!(
+            trigger_after_warnings.origin.x, trigger_bounds.origin.x,
+            "presets trigger position should remain constant when switching presets"
+        );
 
         // Reopening highlights the active preset and Escape closes without changing query.
         cx.simulate_keystrokes(presets_key);
@@ -4240,6 +4254,17 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| assert!(!view.show_presets));
         assert!(cx.debug_bounds("presets-menu").is_none());
+        let trigger_after_http = cx
+            .debug_bounds("presets-trigger")
+            .expect("presets trigger after applying third preset");
+        assert_eq!(
+            trigger_after_http.size.width, trigger_bounds.size.width,
+            "presets trigger width should remain constant when switching presets"
+        );
+        assert_eq!(
+            trigger_after_http.origin.x, trigger_bounds.origin.x,
+            "presets trigger position should remain constant when switching presets"
+        );
     }
 
     #[test]
