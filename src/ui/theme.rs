@@ -91,6 +91,8 @@ impl Theme {
         let accent_hex = config::color(&a.accent).unwrap();
         let selection_hex = config::color(&a.selection).unwrap();
         let border_hex = config::color(&a.border).unwrap();
+        let match_fg_hex = config::color(&a.match_foreground).unwrap();
+        let match_bg_hex = config::color(&a.match_background).unwrap();
         let danger_hex = 0xF38BA8;
         let warning_hex = 0xF9D58B;
 
@@ -113,13 +115,8 @@ impl Theme {
         let danger = rgb_to_hsla(rgb(danger_hex));
         let danger_subtle = mix_hex(panel_hex, danger_hex, 0.14);
         let warning = rgb_to_hsla(rgb(warning_hex));
-        let match_highlight_hex = if relative_luminance(bg_hex) > 0.45 {
-            0xF5C542
-        } else {
-            0xE0AF4B
-        };
-        let match_highlight_bg = rgb_to_hsla(rgb(match_highlight_hex));
-        let match_highlight_fg = contrast_ink(match_highlight_hex);
+        let match_highlight_bg = rgb_to_hsla(rgb(match_bg_hex));
+        let match_highlight_fg = rgb_to_hsla(rgb(match_fg_hex));
 
         let ui_font = resolve_font(&a.ui_font_family, UI_FONT_PREFERENCES, installed_fonts);
         let mono_font = resolve_font(&a.font_family, MONO_FONT_PREFERENCES, installed_fonts);

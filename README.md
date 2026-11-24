@@ -73,7 +73,7 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | File | Settings |
 | --- | --- |
 | `window.json` | Title, initial dimensions/maximized state, results-pane height, status bar |
-| `appearance.json` | UI sans-serif & monospace font families/sizes and semantic colors (`#RRGGBB`) |
+| `appearance.json` | UI sans-serif & monospace font families/sizes, semantic colors, and match foreground/background colors (`#RRGGBB`) |
 | `viewer.json` | Line numbers/height, match overview visibility/width, tab expansion, display character limit, following, bookmark inclusion, polling interval |
 | `search.json` | Default search mode, case/word/inversion/match highlighting, context lines, match limit, named presets (pattern, mode, `highlight_match`) |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |

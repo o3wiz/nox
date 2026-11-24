@@ -6013,23 +6013,31 @@ mod tests {
     }
 
     #[test]
-    fn theme_derives_accessible_match_highlight_tokens_for_dark_and_light_backgrounds() {
-        let dark_config = Config::load(None).unwrap();
-        let dark_theme = Theme::from_config_with_fonts(&dark_config, &[]);
-        assert_ne!(dark_theme.match_highlight_bg, dark_theme.match_highlight_fg);
-        assert_ne!(dark_theme.match_highlight_bg, dark_theme.background);
-        assert_ne!(dark_theme.match_highlight_bg, dark_theme.selection);
-
-        let mut light_config = dark_config;
-        light_config.appearance.background = "#FFFFFF".into();
-        let light_theme = Theme::from_config_with_fonts(&light_config, &[]);
+    fn theme_uses_configured_match_highlight_foreground_and_background_colors() {
+        let default_config = Config::load(None).unwrap();
+        let default_theme = Theme::from_config_with_fonts(&default_config, &[]);
+        assert_eq!(default_theme.match_highlight_fg, rgb_to_hsla(rgb(0x0B1016)));
+        assert_eq!(default_theme.match_highlight_bg, rgb_to_hsla(rgb(0xE0AF4B)));
         assert_ne!(
-            light_theme.match_highlight_bg,
-            light_theme.match_highlight_fg
+            default_theme.match_highlight_bg,
+            default_theme.match_highlight_fg
+        );
+        assert_ne!(default_theme.match_highlight_bg, default_theme.background);
+        assert_ne!(default_theme.match_highlight_bg, default_theme.selection);
+
+        let mut custom_config = default_config;
+        custom_config.appearance.match_foreground = "#FFFFFF".into();
+        custom_config.appearance.match_background = "#2563EB".into();
+        let custom_theme = Theme::from_config_with_fonts(&custom_config, &[]);
+        assert_eq!(custom_theme.match_highlight_fg, rgb_to_hsla(rgb(0xFFFFFF)));
+        assert_eq!(custom_theme.match_highlight_bg, rgb_to_hsla(rgb(0x2563EB)));
+        assert_ne!(
+            custom_theme.match_highlight_fg,
+            default_theme.match_highlight_fg
         );
         assert_ne!(
-            light_theme.match_highlight_bg,
-            dark_theme.match_highlight_bg
+            custom_theme.match_highlight_bg,
+            default_theme.match_highlight_bg
         );
     }
 

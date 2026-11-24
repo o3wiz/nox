@@ -49,6 +49,14 @@
       "type": "string",
       "pattern": "^#[0-9A-Fa-f]{6}$"
     },
+    "match_foreground": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "match_background": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
     "$schema": {
       "type": "string"
     }

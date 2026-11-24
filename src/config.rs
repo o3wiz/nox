@@ -41,6 +41,10 @@ pub struct AppearanceConfig {
     pub selection: String,
     #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
     pub border: String,
+    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    pub match_foreground: String,
+    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    pub match_background: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -333,6 +337,8 @@ impl Config {
             &a.accent,
             &a.selection,
             &a.border,
+            &a.match_foreground,
+            &a.match_background,
         ] {
             color(value)?;
         }

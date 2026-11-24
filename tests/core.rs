@@ -167,6 +167,12 @@ fn validates_highlights_colors_presets_and_duplicate_shortcuts() {
     config.appearance.accent = "red".into();
     assert!(config.validate().is_err());
     let mut config = Config::load(None).unwrap();
+    config.appearance.match_foreground = "red".into();
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.appearance.match_background = "#12345".into();
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
     config.highlighting.rules[0].pattern = "[".into();
     assert!(config.validate().is_err());
     let mut config = Config::load(None).unwrap();
@@ -210,6 +216,47 @@ fn presets_parse_highlight_match_default_true_and_reject_non_booleans() {
         assert!(
             Config::load(Some(dir.path())).is_err(),
             "accepted invalid preset highlight_match {invalid}"
+        );
+    }
+}
+
+#[test]
+fn appearance_overlays_configurable_match_foreground_and_background_colors() {
+    let defaults = Config::load(None).unwrap();
+    assert_eq!(defaults.appearance.match_foreground, "#0B1016");
+    assert_eq!(defaults.appearance.match_background, "#E0AF4B");
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("appearance.json");
+    fs::write(
+        &path,
+        r##"{"match_foreground":"#FFFFFF","match_background":"#2563EB"}"##,
+    )
+    .unwrap();
+    let custom = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(custom.appearance.match_foreground, "#FFFFFF");
+    assert_eq!(custom.appearance.match_background, "#2563EB");
+    assert_eq!(custom.appearance.background, defaults.appearance.background);
+
+    // Partial override preserves the unspecified match color default.
+    fs::write(&path, r##"{"match_background":"#FF00AA"}"##).unwrap();
+    let partial = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(
+        partial.appearance.match_foreground,
+        defaults.appearance.match_foreground
+    );
+    assert_eq!(partial.appearance.match_background, "#FF00AA");
+
+    for invalid in [
+        r##"{"match_foreground":"white"}"##,
+        r##"{"match_background":"#FFF"}"##,
+        r##"{"match_foreground":123456}"##,
+        r##"{"match_background":null}"##,
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert!(
+            Config::load(Some(dir.path())).is_err(),
+            "accepted invalid match color {invalid}"
         );
     }
 }
