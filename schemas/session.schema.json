@@ -148,6 +148,10 @@
         },
         "mode": {
           "$ref": "#/$defs/SearchMode"
+        },
+        "highlight_match": {
+          "type": "boolean",
+          "default": true
         }
       },
       "additionalProperties": false,

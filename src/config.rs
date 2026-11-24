@@ -66,15 +66,18 @@ pub enum SearchMode {
     Literal,
     Regex,
 }
+fn default_highlight_matches() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Preset {
     pub name: String,
     pub pattern: String,
     pub mode: SearchMode,
-}
-fn default_highlight_matches() -> bool {
-    true
+    #[serde(default = "default_highlight_matches")]
+    pub highlight_match: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

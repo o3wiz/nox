@@ -1630,17 +1630,21 @@ impl Workspace {
         }
     }
 
+    fn matching_preset_index(&self, current_input: &str, options: &SearchConfig) -> Option<usize> {
+        self.config.search.presets.iter().position(|preset| {
+            preset.pattern == current_input
+                && preset.mode == options.mode
+                && preset.highlight_match == options.highlight_matches
+        })
+    }
+
     fn active_preset_index(&self, cx: &App) -> Option<usize> {
         let current_input = self.input.read(cx).as_str();
-        let mode = self
+        let options = self
             .tabs
             .get(self.active)
-            .map_or(self.config.search.mode, |tab| tab.options.mode);
-        self.config
-            .search
-            .presets
-            .iter()
-            .position(|preset| preset.pattern == current_input && preset.mode == mode)
+            .map_or(&self.config.search, |tab| &tab.options);
+        self.matching_preset_index(current_input, options)
     }
 
     fn toggle_presets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1673,6 +1677,7 @@ impl Workspace {
             .update(cx, |input, cx| input.emplace(&preset.pattern, cx));
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.options.mode = preset.mode;
+            tab.options.highlight_matches = preset.highlight_match;
         }
         self.show_presets = false;
         self.preset_index = index;
@@ -3167,12 +3172,7 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> Div {
         let t = &self.theme;
-        let active_index = self
-            .config
-            .search
-            .presets
-            .iter()
-            .position(|preset| preset.pattern == current_input && preset.mode == options.mode);
+        let active_index = self.matching_preset_index(current_input, options);
         let active_name = active_index
             .and_then(|idx| self.config.search.presets.get(idx))
             .map(|preset| preset.name.clone());
@@ -3359,26 +3359,17 @@ impl Workspace {
                                 )
                                 .child(
                                     div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1p5()
                                         .flex_shrink_0()
-                                        .child(
-                                            div()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded_sm()
-                                                .bg(t.background)
-                                                .border_1()
-                                                .border_color(t.border)
-                                                .font(t.mono_font_spec())
-                                                .text_size(px(10.))
-                                                .text_color(t.muted)
-                                                .child(mode_label),
-                                        )
-                                        .when(item_active, |row| {
-                                            row.child(Icon::Check.element(ICON_XS, t.accent))
-                                        }),
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .bg(t.background)
+                                        .border_1()
+                                        .border_color(t.border)
+                                        .font(t.mono_font_spec())
+                                        .text_size(px(10.))
+                                        .text_color(t.muted)
+                                        .child(mode_label),
                                 ),
                         )
                         .child(
@@ -5153,6 +5144,75 @@ mod tests {
             trigger_after_http.origin.x, trigger_bounds.origin.x,
             "presets trigger position should remain constant when switching presets"
         );
+    }
+
+    #[gpui::test]
+    fn applying_preset_updates_highlight_matches_and_active_preset_matching(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets[0].highlight_match = false;
+        config.search.presets[1].highlight_match = true;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preset-highlight.log");
+        std::fs::write(&path, "info boot\nWARN slow query\nERROR panic\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Initially highlight_matches is true from SearchConfig defaults.
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+
+        // Applying preset 0 (highlight_match = false) disables match highlighting and matches preset 0.
+        view.update_in(cx, |view, window, cx| view.apply_preset(0, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].query, "error|fatal|panic");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(!view.tabs[0].options.highlight_matches);
+            assert_eq!(view.active_preset_index(cx), Some(0));
+        });
+
+        // Toggling match highlighting manually detaches the active preset match.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleHighlightMatches, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].options.highlight_matches);
+            assert_eq!(view.active_preset_index(cx), None);
+        });
+
+        // Re-applying preset 0 turns highlighting back off; applying preset 1 (highlight_match = true) turns it on.
+        view.update_in(cx, |view, window, cx| view.apply_preset(0, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.tabs[0].options.highlight_matches);
+            assert_eq!(view.active_preset_index(cx), Some(0));
+        });
+
+        view.update_in(cx, |view, window, cx| view.apply_preset(1, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].query, "warn");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.highlight_matches);
+            assert_eq!(view.active_preset_index(cx), Some(1));
+        });
     }
 
     #[test]

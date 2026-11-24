@@ -179,6 +179,40 @@ fn validates_highlights_colors_presets_and_duplicate_shortcuts() {
         .push(config.keyboard.bindings[0].clone());
     assert!(config.validate().is_err());
 }
+
+#[test]
+fn presets_parse_highlight_match_default_true_and_reject_non_booleans() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search.json");
+    fs::write(
+        &path,
+        r#"{
+            "presets": [
+                { "name": "Highlighted", "pattern": "err", "mode": "regex", "highlight_match": true },
+                { "name": "Plain", "pattern": "warn", "mode": "literal", "highlight_match": false },
+                { "name": "Defaulted", "pattern": "info", "mode": "literal" }
+            ]
+        }"#,
+    )
+    .unwrap();
+    let config = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(config.search.presets.len(), 3);
+    assert!(config.search.presets[0].highlight_match);
+    assert!(!config.search.presets[1].highlight_match);
+    assert!(config.search.presets[2].highlight_match);
+
+    for invalid in [
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","highlight_match":"on"}]}"#,
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","highlight_match":1}]}"#,
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","highlight_match":null}]}"#,
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert!(
+            Config::load(Some(dir.path())).is_err(),
+            "accepted invalid preset highlight_match {invalid}"
+        );
+    }
+}
 #[test]
 fn generated_config_round_trips_and_preserves_existing_files() {
     let dir = tempdir().unwrap();
@@ -259,11 +293,24 @@ fn legacy_session_without_highlight_matches_or_results_height_loads_and_rejects_
         .as_object_mut()
         .unwrap()
         .remove("highlight_matches");
+    for preset in legacy["tabs"][0]["options"]["presets"]
+        .as_array_mut()
+        .unwrap()
+    {
+        preset.as_object_mut().unwrap().remove("highlight_match");
+    }
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
 
     let restored = Session::load(&path, &config).unwrap();
     assert!(restored.tabs[0].options.highlight_matches);
+    assert!(
+        restored.tabs[0]
+            .options
+            .presets
+            .iter()
+            .all(|preset| preset.highlight_match)
+    );
     assert_eq!(restored.results_height, None);
 
     // Hidden filter pane (`0.0`) is a valid persisted height.

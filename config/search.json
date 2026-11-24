@@ -11,17 +11,20 @@
     {
       "name": "Errors",
       "pattern": "error|fatal|panic",
-      "mode": "regex"
+      "mode": "regex",
+      "highlight_match": true
     },
     {
       "name": "Warnings",
       "pattern": "warn",
-      "mode": "literal"
+      "mode": "literal",
+      "highlight_match": true
     },
     {
       "name": "Requests",
       "pattern": "GET|POST|PUT|DELETE",
-      "mode": "regex"
+      "mode": "regex",
+      "highlight_match": true
     }
   ]
 }
