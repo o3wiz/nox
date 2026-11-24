@@ -1,4 +1,6 @@
-use gpui::{App, Font, FontFallbacks, Hsla, Pixels, SharedString, font, px, rgb, rgb_to_hsla};
+use gpui::{
+    App, ColorExt, Font, FontFallbacks, Hsla, Pixels, SharedString, font, px, rgb, rgb_to_hsla,
+};
 use nox::config::{self, Command, Config};
 use std::collections::HashMap;
 
@@ -66,6 +68,8 @@ pub struct Theme {
     pub accent_border: Hsla,
     pub selection: Hsla,
     pub selection_soft: Hsla,
+    pub text_selection: Hsla,
+    pub text_selection_soft: Hsla,
     pub border: Hsla,
     pub danger: Hsla,
     pub danger_subtle: Hsla,
@@ -90,6 +94,8 @@ impl Theme {
         let muted_hex = config::color(&a.muted).unwrap();
         let accent_hex = config::color(&a.accent).unwrap();
         let selection_hex = config::color(&a.selection).unwrap();
+        let text_selection_hex = config::color(&a.text_selection_color).unwrap();
+        let text_selection_opacity = a.text_selection_opacity.clamp(0.0, 1.0);
         let border_hex = config::color(&a.border).unwrap();
         let match_fg_hex = config::color(&a.match_foreground).unwrap();
         let match_bg_hex = config::color(&a.match_background).unwrap();
@@ -102,6 +108,9 @@ impl Theme {
         let muted = rgb_to_hsla(rgb(muted_hex));
         let accent = rgb_to_hsla(rgb(accent_hex));
         let selection = rgb_to_hsla(rgb(selection_hex));
+        let text_selection_base = rgb_to_hsla(rgb(text_selection_hex));
+        let text_selection = text_selection_base.opacity(text_selection_opacity);
+        let text_selection_soft = text_selection_base.opacity(text_selection_opacity * 0.55);
         let border = rgb_to_hsla(rgb(border_hex));
 
         // Derive elevation, hover, and semantic tints cleanly from user tokens in RGB space.
@@ -152,6 +161,8 @@ impl Theme {
             accent_border,
             selection,
             selection_soft,
+            text_selection,
+            text_selection_soft,
             border,
             danger,
             danger_subtle,

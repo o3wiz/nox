@@ -217,6 +217,16 @@
       "context": "Selection"
     },
     {
+      "keys": "secondary-c",
+      "action": "copy_selected_text",
+      "context": "TextSelected"
+    },
+    {
+      "keys": "escape",
+      "action": "clear_text_selection",
+      "context": "TextSelected"
+    },
+    {
       "keys": "down",
       "action": "next_line",
       "context": "Presets"

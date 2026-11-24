@@ -1,4 +1,6 @@
-//! Interval-backed multi-line selection that scales to large log files in O(ranges) space.
+//! Interval-backed multi-line selection and character-accurate text selection for log panes.
+
+use std::ops::{Range, RangeInclusive};
 
 /// Tracks the cursor, anchor, and selected row indices for a single list pane.
 ///
@@ -327,6 +329,193 @@ fn clamp_ranges(ranges: &mut Vec<(usize, usize)>, max: usize) {
     });
 }
 
+/// A UTF-8 byte position within a displayed pane row.
+///
+/// `row` is a pane-local row index (`0..log.len()` for the main pane,
+/// `0..results.visible.len()` for the filter pane), and `offset` is a UTF-8 byte
+/// offset into that row's displayed text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPosition {
+    pub row: usize,
+    pub offset: usize,
+}
+
+impl TextPosition {
+    pub const fn new(row: usize, offset: usize) -> Self {
+        Self { row, offset }
+    }
+}
+
+/// Character-level text selection spanning one or more displayed rows in a single pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: TextPosition,
+    pub head: TextPosition,
+}
+
+impl TextSelection {
+    pub const fn new(anchor: TextPosition, head: TextPosition) -> Self {
+        Self { anchor, head }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// Returns `(start, end)` ordered so `start <= end`.
+    pub fn ordered(&self) -> (TextPosition, TextPosition) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    pub fn row_range(&self) -> RangeInclusive<usize> {
+        let (start, end) = self.ordered();
+        start.row..=end.row
+    }
+
+    /// Returns the selected UTF-8 byte range within `row`'s `text`, or `None` when `row`
+    /// has no highlighted characters. All returned bounds are valid UTF-8 character boundaries.
+    pub fn byte_range_for_row(&self, row: usize, text: &str) -> Option<Range<usize>> {
+        if self.is_empty() {
+            return None;
+        }
+        let (start, end) = self.ordered();
+        if row < start.row || row > end.row {
+            return None;
+        }
+        let len = text.len();
+        let (raw_start, raw_end) = if start.row == end.row {
+            (start.offset.min(len), end.offset.min(len))
+        } else if row == start.row {
+            (start.offset.min(len), len)
+        } else if row == end.row {
+            (0, end.offset.min(len))
+        } else {
+            (0, len)
+        };
+        let s = clamp_char_boundary(text, raw_start);
+        let e = clamp_char_boundary(text, raw_end);
+        (s < e).then_some(s..e)
+    }
+
+    /// Clamps row indices to `0..len`. Returns `false` if the selection falls out of range.
+    pub fn clamp_rows(&mut self, len: usize) -> bool {
+        if len == 0 || self.is_empty() {
+            return false;
+        }
+        let (start, end) = self.ordered();
+        start.row < len && end.row < len
+    }
+
+    /// Remaps row indices from `old_lines` into `new_lines` (both sorted ascending) so a
+    /// filter-pane text selection survives bookmark toggles and live appends when all spanned
+    /// rows remain contiguous. Returns `false` if the selection should be cleared.
+    pub fn remap_sorted(&mut self, old_lines: &[usize], new_lines: &[usize]) -> bool {
+        if new_lines.is_empty() || self.is_empty() {
+            return false;
+        }
+        if old_lines == new_lines {
+            return self.clamp_rows(new_lines.len());
+        }
+        let (start, end) = self.ordered();
+        let Some(&start_line) = old_lines.get(start.row) else {
+            return false;
+        };
+        let Some(&end_line) = old_lines.get(end.row) else {
+            return false;
+        };
+        let Ok(new_start_row) = new_lines.binary_search(&start_line) else {
+            return false;
+        };
+        let Ok(new_end_row) = new_lines.binary_search(&end_line) else {
+            return false;
+        };
+        if new_end_row.saturating_sub(new_start_row) != end.row.saturating_sub(start.row) {
+            return false;
+        }
+        for offset in 0..=(end.row - start.row) {
+            if old_lines.get(start.row + offset) != new_lines.get(new_start_row + offset) {
+                return false;
+            }
+        }
+        if self.anchor <= self.head {
+            self.anchor.row = new_start_row;
+            self.head.row = new_end_row;
+        } else {
+            self.anchor.row = new_end_row;
+            self.head.row = new_start_row;
+        }
+        true
+    }
+}
+
+/// Clamps `offset` to `0..=text.len()` on a valid UTF-8 character boundary (rounding down).
+pub fn clamp_char_boundary(text: &str, offset: usize) -> usize {
+    let mut idx = offset.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Word,
+    Whitespace,
+    Punctuation,
+}
+
+fn char_class(ch: char) -> CharClass {
+    if ch.is_alphanumeric() || ch == '_' {
+        CharClass::Word
+    } else if ch.is_whitespace() {
+        CharClass::Whitespace
+    } else {
+        CharClass::Punctuation
+    }
+}
+
+/// Returns the byte range of the word (or contiguous whitespace/punctuation run) containing
+/// `byte_offset` in `text`. Used for double-click word selection in log rows.
+pub fn word_range_at(text: &str, byte_offset: usize) -> Range<usize> {
+    if text.is_empty() {
+        return 0..0;
+    }
+    let idx = clamp_char_boundary(text, byte_offset);
+    let target_start = if idx < text.len() {
+        idx
+    } else {
+        text.char_indices().next_back().map_or(0, |(i, _)| i)
+    };
+    let Some(target_char) = text[target_start..].chars().next() else {
+        return 0..0;
+    };
+    let class = char_class(target_char);
+
+    let mut start = target_start;
+    for (i, ch) in text[..target_start].char_indices().rev() {
+        if char_class(ch) == class {
+            start = i;
+        } else {
+            break;
+        }
+    }
+
+    let mut end = target_start + target_char.len_utf8();
+    for (rel_i, ch) in text[end..].char_indices() {
+        if char_class(ch) == class {
+            end = target_start + target_char.len_utf8() + rel_i + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    start..end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +689,72 @@ mod tests {
         let mut empty = LineSelection::empty();
         assert!(!empty.has_multi_selection());
         assert!(!empty.swap_anchor());
+    }
+
+    #[test]
+    fn text_selection_computes_single_and_multi_row_ranges_with_unicode_safety() {
+        let single = TextSelection::new(TextPosition::new(2, 11), TextPosition::new(2, 5));
+        assert!(!single.is_empty());
+        assert_eq!(single.row_range(), 2..=2);
+        assert_eq!(single.byte_range_for_row(1, "hello world"), None);
+        assert_eq!(
+            single.byte_range_for_row(2, "INFO ERROR timeout"),
+            Some(5..11)
+        );
+        assert_eq!(single.byte_range_for_row(3, "hello world"), None);
+
+        // Multi-row reversed selection normalizes cleanly.
+        let multi = TextSelection::new(TextPosition::new(4, 3), TextPosition::new(2, 5));
+        assert_eq!(multi.row_range(), 2..=4);
+        assert_eq!(multi.byte_range_for_row(2, "0123456789"), Some(5..10));
+        assert_eq!(multi.byte_range_for_row(3, "middle"), Some(0..6));
+        assert_eq!(multi.byte_range_for_row(3, ""), None);
+        assert_eq!(multi.byte_range_for_row(4, "abcdef"), Some(0..3));
+
+        // Out-of-bounds or mid-codepoint offsets clamp safely to UTF-8 boundaries.
+        let unicode = "שלום世界";
+        let sel = TextSelection::new(TextPosition::new(0, 1), TextPosition::new(0, 99));
+        let range = sel.byte_range_for_row(0, unicode).unwrap();
+        assert_eq!(&unicode[range], unicode);
+
+        // Empty selection yields no range.
+        let empty = TextSelection::new(TextPosition::new(1, 4), TextPosition::new(1, 4));
+        assert!(empty.is_empty());
+        assert_eq!(empty.byte_range_for_row(1, "abcdef"), None);
+    }
+
+    #[test]
+    fn text_selection_remap_sorted_tracks_contiguous_rows_and_clears_broken_spans() {
+        let old = vec![10, 20, 30, 40];
+        let new = vec![5, 10, 20, 30, 40];
+        let mut sel = TextSelection::new(TextPosition::new(1, 2), TextPosition::new(2, 6));
+        assert!(sel.remap_sorted(&old, &new));
+        assert_eq!(sel.anchor, TextPosition::new(2, 2));
+        assert_eq!(sel.head, TextPosition::new(3, 6));
+
+        // Inserting a row in the middle of a multi-row span invalidates the selection.
+        let split = vec![5, 10, 20, 25, 30, 40];
+        assert!(!sel.remap_sorted(&new, &split));
+
+        // Single-row selection survives insertions elsewhere.
+        let mut single = TextSelection::new(TextPosition::new(2, 1), TextPosition::new(2, 4));
+        assert!(single.remap_sorted(&new, &split));
+        assert_eq!(single.anchor, TextPosition::new(2, 1));
+        assert_eq!(single.head, TextPosition::new(2, 4));
+
+        // Removing the selected row clears the selection.
+        assert!(!single.remap_sorted(&split, &[5, 10, 30]));
+    }
+
+    #[test]
+    fn word_range_at_selects_identifiers_punctuation_whitespace_and_unicode() {
+        let line = "INFO user_id=alice_42 [ERROR] שלום";
+        assert_eq!(&line[word_range_at(line, 0)], "INFO");
+        assert_eq!(&line[word_range_at(line, 6)], "user_id");
+        assert_eq!(&line[word_range_at(line, 12)], "=");
+        assert_eq!(&line[word_range_at(line, 15)], "alice_42");
+        assert_eq!(&line[word_range_at(line, 23)], "ERROR");
+        assert_eq!(&line[word_range_at(line, line.len())], "שלום");
+        assert_eq!(word_range_at("", 0), 0..0);
     }
 }

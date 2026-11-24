@@ -45,6 +45,16 @@
       "type": "string",
       "pattern": "^#[0-9A-Fa-f]{6}$"
     },
+    "text_selection_color": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "text_selection_opacity": {
+      "type": "number",
+      "format": "float",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
     "border": {
       "type": "string",
       "pattern": "^#[0-9A-Fa-f]{6}$"

@@ -173,6 +173,18 @@ fn validates_highlights_colors_presets_and_duplicate_shortcuts() {
     config.appearance.match_background = "#12345".into();
     assert!(config.validate().is_err());
     let mut config = Config::load(None).unwrap();
+    config.appearance.text_selection_color = "blue".into();
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.appearance.text_selection_opacity = -0.05;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.appearance.text_selection_opacity = 1.2;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.appearance.text_selection_opacity = f32::NAN;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
     config.highlighting.rules[0].pattern = "[".into();
     assert!(config.validate().is_err());
     let mut config = Config::load(None).unwrap();
@@ -257,6 +269,54 @@ fn appearance_overlays_configurable_match_foreground_and_background_colors() {
         assert!(
             Config::load(Some(dir.path())).is_err(),
             "accepted invalid match color {invalid}"
+        );
+    }
+}
+
+#[test]
+fn appearance_overlays_configurable_text_selection_color_and_opacity() {
+    let defaults = Config::load(None).unwrap();
+    assert_eq!(defaults.appearance.text_selection_color, "#38BDF8");
+    assert!((defaults.appearance.text_selection_opacity - 0.35).abs() < 1e-6);
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("appearance.json");
+    fs::write(
+        &path,
+        r##"{"text_selection_color":"#FF5500","text_selection_opacity":0.65}"##,
+    )
+    .unwrap();
+    let custom = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(custom.appearance.text_selection_color, "#FF5500");
+    assert!((custom.appearance.text_selection_opacity - 0.65).abs() < 1e-6);
+    assert_eq!(custom.appearance.selection, defaults.appearance.selection);
+
+    // Partial overrides and boundary opacity values (0.0 and 1.0) work cleanly.
+    fs::write(&path, r##"{"text_selection_opacity":0.0}"##).unwrap();
+    let transparent = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(
+        transparent.appearance.text_selection_color,
+        defaults.appearance.text_selection_color
+    );
+    assert_eq!(transparent.appearance.text_selection_opacity, 0.0);
+
+    fs::write(&path, r##"{"text_selection_opacity":1.0}"##).unwrap();
+    let opaque = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(opaque.appearance.text_selection_opacity, 1.0);
+
+    for invalid in [
+        r##"{"text_selection_color":"blue"}"##,
+        r##"{"text_selection_color":"#FFF"}"##,
+        r##"{"text_selection_color":123}"##,
+        r##"{"text_selection_opacity":-0.1}"##,
+        r##"{"text_selection_opacity":1.05}"##,
+        r##"{"text_selection_opacity":"0.5"}"##,
+        r##"{"text_selection_opacity":null}"##,
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert!(
+            Config::load(Some(dir.path())).is_err(),
+            "accepted invalid text selection appearance {invalid}"
         );
     }
 }

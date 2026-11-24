@@ -41,6 +41,7 @@
         "Workspace",
         "Log",
         "Selection",
+        "TextSelected",
         "Search",
         "GoTo",
         "Presets"
@@ -65,6 +66,7 @@
         "next_match",
         "previous_match",
         "copy_line",
+        "copy_selected_text",
         "reload",
         "go_to_line",
         "export_results",
@@ -87,6 +89,7 @@
         "select_page_down",
         "select_all",
         "clear_selection",
+        "clear_text_selection",
         "swap_selection_anchor",
         "toggle_presets",
         "apply_preset",

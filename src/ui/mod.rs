@@ -2,6 +2,7 @@ mod components;
 mod icons;
 mod resize;
 mod scrollbar;
+mod selectable_text;
 mod theme;
 
 use components::{
@@ -19,7 +20,7 @@ use nox::{
     config::{self, Command, Config, SearchConfig, SearchMode},
     logfile::{LogFile, Stamp},
     search::{self, SearchResults},
-    selection::LineSelection,
+    selection::{LineSelection, TextPosition, TextSelection, word_range_at},
     session::{self, SavedTab, Session},
 };
 use regex::Regex;
@@ -31,6 +32,7 @@ use scrollbar::{
     DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, ScrollAxis, ScrollbarTrackState,
     resolve_track_press, scroll_offset_for_drag, scrollbar_canvas, set_uniform_list_axis_offset,
 };
+use selectable_text::{RowLayoutCache, SelectableRowText, TextPressEvent};
 use serde::Deserialize;
 use std::{
     cell::Cell,
@@ -139,6 +141,21 @@ struct ScrollbarDrag {
     grab_offset: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextDragGranularity {
+    Char,
+    Word,
+    Line,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TextDrag {
+    pane: Pane,
+    granularity: TextDragGranularity,
+    anchor_start: TextPosition,
+    anchor_end: TextPosition,
+}
+
 struct Tab {
     id: usize,
     path: PathBuf,
@@ -158,6 +175,8 @@ struct Tab {
     selected: usize,
     main_selection: LineSelection,
     result_selection: LineSelection,
+    main_text_selection: Option<TextSelection>,
+    result_text_selection: Option<TextSelection>,
     follow: bool,
     scroll: UniformListScrollHandle,
     result_scroll: UniformListScrollHandle,
@@ -171,6 +190,25 @@ impl Tab {
         } else {
             search::compile(&self.query, &self.options).ok()
         };
+    }
+
+    fn text_selection(&self, pane: Pane) -> Option<TextSelection> {
+        match pane {
+            Pane::Main => self.main_text_selection,
+            Pane::Results => self.result_text_selection,
+        }
+        .filter(|selection| !selection.is_empty())
+    }
+
+    fn text_selection_mut(&mut self, pane: Pane) -> &mut Option<TextSelection> {
+        match pane {
+            Pane::Main => &mut self.main_text_selection,
+            Pane::Results => &mut self.result_text_selection,
+        }
+    }
+
+    fn has_text_selection(&self, pane: Pane) -> bool {
+        self.text_selection(pane).is_some()
     }
 }
 
@@ -249,6 +287,10 @@ pub struct Workspace {
     results_focus: FocusHandle,
     active_pane: Pane,
     drag_selecting: Option<Pane>,
+    text_drag: Option<TextDrag>,
+    main_row_layouts: RowLayoutCache,
+    results_row_layouts: RowLayoutCache,
+    render_frame: u64,
     scrollbar_drag: Option<ScrollbarDrag>,
     results_height: f32,
     target_results_height: f32,
@@ -345,7 +387,14 @@ impl Workspace {
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.resize_motion.release_hold();
+                    let mut changed = false;
                     if this.results_resize_drag.take().is_some() {
+                        changed = true;
+                    }
+                    if this.text_drag.take().is_some() {
+                        changed = true;
+                    }
+                    if changed {
                         cx.notify();
                     }
                 }
@@ -371,6 +420,10 @@ impl Workspace {
             results_focus,
             active_pane: Pane::Main,
             drag_selecting: None,
+            text_drag: None,
+            main_row_layouts: RowLayoutCache::new(),
+            results_row_layouts: RowLayoutCache::new(),
+            render_frame: 0,
             scrollbar_drag: None,
             results_height,
             target_results_height: results_height,
@@ -489,6 +542,8 @@ impl Workspace {
             selected: 0,
             main_selection: LineSelection::single(0),
             result_selection: LineSelection::empty(),
+            main_text_selection: None,
+            result_text_selection: None,
             follow: self.config.viewer.follow,
             scroll: UniformListScrollHandle::new(),
             result_scroll: UniformListScrollHandle::new(),
@@ -505,11 +560,13 @@ impl Workspace {
         }
         self.active = index;
         self.drag_selecting = None;
+        self.text_drag = None;
         self.scrollbar_drag = None;
         self.results_resize_drag = None;
         self.resize_motion.cancel();
         self.results_height = self.target_results_height;
         self.clear_scrollbar_states();
+        self.clear_row_layouts();
         self.show_presets = false;
         let query = self
             .tabs
@@ -530,11 +587,13 @@ impl Workspace {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.drag_selecting = None;
+        self.text_drag = None;
         self.scrollbar_drag = None;
         self.results_resize_drag = None;
         self.resize_motion.cancel();
         self.results_height = self.target_results_height;
         self.clear_scrollbar_states();
+        self.clear_row_layouts();
         self.show_presets = false;
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -627,11 +686,17 @@ impl Workspace {
             if preserve_selection {
                 tab.result_selection
                     .remap_sorted(&tab.results.visible, &results.visible);
+                if let Some(sel) = &mut tab.result_text_selection
+                    && !sel.remap_sorted(&tab.results.visible, &results.visible)
+                {
+                    tab.result_text_selection = None;
+                }
                 tab.results = results;
             } else {
                 let len = results.visible.len();
                 tab.results = results;
                 tab.result_selection = LineSelection::single_clamped(0, len);
+                tab.result_text_selection = None;
                 tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
             cx.notify();
@@ -698,11 +763,17 @@ impl Workspace {
                 if preserve_selection {
                     tab.result_selection
                         .remap_sorted(&tab.results.visible, &results.visible);
+                    if let Some(sel) = &mut tab.result_text_selection
+                        && !sel.remap_sorted(&tab.results.visible, &results.visible)
+                    {
+                        tab.result_text_selection = None;
+                    }
                     tab.results = results;
                 } else {
                     let len = results.visible.len();
                     tab.results = results;
                     tab.result_selection = LineSelection::single_clamped(0, len);
+                    tab.result_text_selection = None;
                     tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 }
             }
@@ -711,6 +782,7 @@ impl Workspace {
                 tab.highlight_regex = None;
                 tab.results = SearchResults::default();
                 tab.result_selection = LineSelection::empty();
+                tab.result_text_selection = None;
             }
         }
         cx.notify();
@@ -737,6 +809,11 @@ impl Workspace {
         );
         tab.result_selection
             .remap_sorted(&tab.results.visible, &visible);
+        if let Some(sel) = &mut tab.result_text_selection
+            && !sel.remap_sorted(&tab.results.visible, &visible)
+        {
+            tab.result_text_selection = None;
+        }
         tab.results.visible = visible;
         tab.results.widest_row = widest_row;
         cx.notify();
@@ -765,11 +842,19 @@ impl Workspace {
                                     tab.bookmarks.clear();
                                     tab.main_selection =
                                         LineSelection::single_clamped(0, log.len());
+                                    tab.main_text_selection = None;
+                                    tab.result_text_selection = None;
                                 } else if initial || tab.main_selection.is_empty() {
                                     tab.main_selection =
                                         LineSelection::single_clamped(tab.selected, log.len());
+                                    tab.main_text_selection = None;
                                 } else {
                                     tab.main_selection.clamp(log.len());
+                                    if let Some(sel) = &mut tab.main_text_selection
+                                        && !sel.clamp_rows(log.len())
+                                    {
+                                        tab.main_text_selection = None;
+                                    }
                                 }
                                 tab.selected = tab.main_selection.cursor;
                                 tab.bookmarks.retain(|&line| line < log.len());
@@ -984,6 +1069,7 @@ impl Workspace {
         if let Some(&source_line) = tab.results.visible.get(tab.result_selection.cursor) {
             tab.selected = source_line;
             tab.main_selection.select_single(source_line);
+            tab.main_text_selection = None;
             tab.follow = false;
             tab.scroll
                 .scroll_to_item(source_line, ScrollStrategy::Center);
@@ -1001,11 +1087,13 @@ impl Workspace {
         self.active_pane = pane;
         self.show_goto = false;
         self.show_presets = false;
+        self.text_drag = None;
         match pane {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => self.results_focus.focus(window, cx),
         }
         if let Some(tab) = self.tabs.get_mut(self.active) {
+            *tab.text_selection_mut(pane) = None;
             match pane {
                 Pane::Main => {
                     let len = tab.log.as_ref().map_or(0, |log| log.len());
@@ -1042,6 +1130,282 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    fn handle_text_mouse_down(
+        &mut self,
+        pane: Pane,
+        press: TextPressEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if press.modifiers.secondary() {
+            return false;
+        }
+        if press.modifiers.shift {
+            let existing = self
+                .tabs
+                .get(self.active)
+                .and_then(|tab| tab.text_selection(pane));
+            let Some(existing) = existing else {
+                return false;
+            };
+            self.active_pane = pane;
+            self.show_goto = false;
+            self.show_presets = false;
+            self.drag_selecting = None;
+            self.scrollbar_drag = None;
+            match pane {
+                Pane::Main => self.focus.focus(window, cx),
+                Pane::Results => self.results_focus.focus(window, cx),
+            }
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                let head = TextPosition::new(press.row, press.closest_offset);
+                let next =
+                    (existing.anchor != head).then_some(TextSelection::new(existing.anchor, head));
+                *tab.text_selection_mut(pane) = next;
+                self.text_drag = Some(TextDrag {
+                    pane,
+                    granularity: TextDragGranularity::Char,
+                    anchor_start: existing.anchor,
+                    anchor_end: existing.anchor,
+                });
+            }
+            cx.notify();
+            return true;
+        }
+
+        self.active_pane = pane;
+        self.show_goto = false;
+        self.show_presets = false;
+        self.drag_selecting = None;
+        self.scrollbar_drag = None;
+        match pane {
+            Pane::Main => self.focus.focus(window, cx),
+            Pane::Results => self.results_focus.focus(window, cx),
+        }
+
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            let in_bounds = match pane {
+                Pane::Main => {
+                    let len = tab.log.as_ref().map_or(0, |log| log.len());
+                    if press.row < len {
+                        tab.main_selection.select_single(press.row);
+                        tab.selected = press.row;
+                        tab.follow = false;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Pane::Results => {
+                    if press.row < tab.results.visible.len() {
+                        tab.result_selection.select_single(press.row);
+                        Self::sync_main_to_result_cursor(tab);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if in_bounds {
+                match press.click_count {
+                    2 => {
+                        let selectable = &press.text[..press.selectable_len];
+                        let word = word_range_at(selectable, press.hit_offset);
+                        let start = TextPosition::new(press.row, word.start);
+                        let end = TextPosition::new(press.row, word.end);
+                        *tab.text_selection_mut(pane) =
+                            (start != end).then_some(TextSelection::new(start, end));
+                        self.text_drag = Some(TextDrag {
+                            pane,
+                            granularity: TextDragGranularity::Word,
+                            anchor_start: start,
+                            anchor_end: end,
+                        });
+                    }
+                    count if count >= 3 => {
+                        let start = TextPosition::new(press.row, 0);
+                        let end = TextPosition::new(press.row, press.selectable_len);
+                        *tab.text_selection_mut(pane) =
+                            (start != end).then_some(TextSelection::new(start, end));
+                        self.text_drag = Some(TextDrag {
+                            pane,
+                            granularity: TextDragGranularity::Line,
+                            anchor_start: start,
+                            anchor_end: end,
+                        });
+                    }
+                    _ => {
+                        *tab.text_selection_mut(pane) = None;
+                        let pos = TextPosition::new(press.row, press.closest_offset);
+                        self.text_drag = Some(TextDrag {
+                            pane,
+                            granularity: TextDragGranularity::Char,
+                            anchor_start: pos,
+                            anchor_end: pos,
+                        });
+                    }
+                }
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn handle_text_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.text_drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.text_drag = None;
+            cx.notify();
+            return;
+        }
+        let Some(target) = self.row_layouts(drag.pane).row_at_y(event.position.y) else {
+            return;
+        };
+        let (anchor, head) = match drag.granularity {
+            TextDragGranularity::Char => {
+                let offset = target.closest_byte_offset(event.position.x);
+                (drag.anchor_start, TextPosition::new(target.row, offset))
+            }
+            TextDragGranularity::Word => {
+                let selectable = &target.text[..target.selectable_len];
+                let hit = target.hit_byte_offset(event.position.x);
+                let word = word_range_at(selectable, hit);
+                let w_start = TextPosition::new(target.row, word.start);
+                let w_end = TextPosition::new(target.row, word.end);
+                if w_end >= drag.anchor_end {
+                    (drag.anchor_start, w_end)
+                } else if w_start < drag.anchor_start {
+                    (drag.anchor_end, w_start)
+                } else {
+                    (drag.anchor_start, drag.anchor_end)
+                }
+            }
+            TextDragGranularity::Line => {
+                if target.row >= drag.anchor_start.row {
+                    (
+                        drag.anchor_start,
+                        TextPosition::new(target.row, target.selectable_len),
+                    )
+                } else {
+                    (drag.anchor_end, TextPosition::new(target.row, 0))
+                }
+            }
+        };
+        let next = (anchor != head).then_some(TextSelection::new(anchor, head));
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            let slot = tab.text_selection_mut(drag.pane);
+            if *slot != next {
+                *slot = next;
+                cx.notify();
+            }
+        }
+    }
+
+    fn copy_selected_text(&mut self, pane: Pane, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(log) = &tab.log else {
+            return;
+        };
+        let Some(selection) = tab.text_selection(pane) else {
+            return;
+        };
+        let (start, end) = selection.ordered();
+        let max_display_chars = self.config.viewer.max_display_chars;
+        let tab_width = self.config.viewer.tab_width;
+        let mut copied = String::new();
+        let mut line_count = 0usize;
+        for row in start.row..=end.row {
+            let Some(line) = (match pane {
+                Pane::Main => (row < log.len()).then_some(row),
+                Pane::Results => tab.results.visible.get(row).copied(),
+            }) else {
+                break;
+            };
+            if line_count > 0 {
+                copied.push('\n');
+            }
+            let (display_text, selectable_len, _) = format_display_line(
+                log,
+                line,
+                max_display_chars,
+                tab_width,
+                None,
+                SearchMode::Literal,
+            );
+            let selectable = &display_text[..selectable_len];
+            if let Some(range) = selection.byte_range_for_row(row, selectable) {
+                copied.push_str(&selectable[range]);
+            }
+            line_count += 1;
+            if copied.len() as u64 > MAX_COPY_BYTES {
+                self.status = Some(StatusMessage::warning(
+                    "Selection too large to copy (limit 64 MB)",
+                ));
+                return;
+            }
+        }
+        let char_count = copied.chars().count();
+        cx.write_to_clipboard(ClipboardItem::new_string(copied));
+        self.status = Some(StatusMessage::success(if line_count > 1 {
+            format!(
+                "Copied {} {} ({} lines)",
+                format_count(char_count),
+                if char_count == 1 { "char" } else { "chars" },
+                format_count(line_count)
+            )
+        } else {
+            format!(
+                "Copied {} {}",
+                format_count(char_count),
+                if char_count == 1 { "char" } else { "chars" }
+            )
+        }));
+    }
+
+    fn selected_text_label(&self, tab: &Tab, pane: Pane) -> Option<String> {
+        let selection = tab.text_selection(pane)?;
+        let log = tab.log.as_ref()?;
+        let (start, end) = selection.ordered();
+        let rows = end.row - start.row + 1;
+        const MAX_INLINE_CHAR_COUNT_ROWS: usize = 64;
+        if rows > MAX_INLINE_CHAR_COUNT_ROWS {
+            return Some(format!("{} lines selected", format_count(rows)));
+        }
+        let max_display_chars = self.config.viewer.max_display_chars;
+        let tab_width = self.config.viewer.tab_width;
+        let mut chars = 0usize;
+        for row in start.row..=end.row {
+            let line = match pane {
+                Pane::Main => (row < log.len()).then_some(row)?,
+                Pane::Results => *tab.results.visible.get(row)?,
+            };
+            if row > start.row {
+                chars += 1;
+            }
+            let (display_text, selectable_len, _) = format_display_line(
+                log,
+                line,
+                max_display_chars,
+                tab_width,
+                None,
+                SearchMode::Literal,
+            );
+            let selectable = &display_text[..selectable_len];
+            if let Some(range) = selection.byte_range_for_row(row, selectable) {
+                chars += selectable[range].chars().count();
+            }
+        }
+        Some(format!(
+            "{} {} selected",
+            format_count(chars),
+            if chars == 1 { "char" } else { "chars" }
+        ))
     }
 
     fn handle_row_mouse_move(
@@ -1118,6 +1482,7 @@ impl Workspace {
                 if len == 0 {
                     return;
                 }
+                tab.main_text_selection = None;
                 let step = ((f32::from(window.viewport_size().height) - results_h - 180.)
                     / self.config.viewer.line_height)
                     .max(1.) as usize;
@@ -1147,6 +1512,7 @@ impl Workspace {
                 if len == 0 {
                     return;
                 }
+                tab.result_text_selection = None;
                 let step = (results_h / self.config.viewer.line_height).max(1.) as usize;
                 let current = tab.result_selection.cursor.min(len - 1);
                 let target = match command {
@@ -1224,6 +1590,7 @@ impl Workspace {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
+                    *tab.text_selection_mut(pane) = None;
                     match pane {
                         Pane::Main => {
                             let len = tab.log.as_ref().map_or(0, |log| log.len());
@@ -1239,10 +1606,20 @@ impl Workspace {
                     }
                 }
             }
+            Command::ClearTextSelection => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                self.text_drag = None;
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    *tab.text_selection_mut(pane) = None;
+                }
+            }
             Command::ClearSelection => {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
+                self.text_drag = None;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
+                    *tab.text_selection_mut(pane) = None;
                     match pane {
                         Pane::Main => {
                             let len = tab.log.as_ref().map_or(0, |log| log.len());
@@ -1331,6 +1708,7 @@ impl Workspace {
                         };
                         if let Some(row) = target_row {
                             tab.result_selection.select_single(row);
+                            tab.result_text_selection = None;
                             tab.result_scroll
                                 .scroll_to_item(row, ScrollStrategy::Center);
                             Self::sync_main_to_result_cursor(tab);
@@ -1351,10 +1729,12 @@ impl Workspace {
                         if let Some(&line) = target {
                             tab.selected = line;
                             tab.main_selection.select_single(line);
+                            tab.main_text_selection = None;
                             tab.follow = false;
                             tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
                             if let Ok(index) = tab.results.visible.binary_search(&line) {
                                 tab.result_selection.select_single(index);
+                                tab.result_text_selection = None;
                                 tab.result_scroll
                                     .scroll_to_item(index, ScrollStrategy::Center);
                             }
@@ -1488,15 +1868,22 @@ impl Workspace {
                     if let Some(&target) = target {
                         tab.selected = target;
                         tab.main_selection.select_single(target);
+                        tab.main_text_selection = None;
                         tab.follow = false;
                         tab.scroll.scroll_to_item(target, ScrollStrategy::Center);
                         if let Ok(index) = tab.results.visible.binary_search(&target) {
                             tab.result_selection.select_single(index);
+                            tab.result_text_selection = None;
                             tab.result_scroll
                                 .scroll_to_item(index, ScrollStrategy::Center);
                         }
                     }
                 }
+            }
+            Command::CopySelectedText => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                self.copy_selected_text(pane, cx);
             }
             Command::CopyLine => {
                 let pane = self.active_pane_for(window);
@@ -1574,6 +1961,7 @@ impl Workspace {
                             if line > 0 && line <= log.len() {
                                 tab.selected = line - 1;
                                 tab.main_selection.select_single(line - 1);
+                                tab.main_text_selection = None;
                                 tab.follow = false;
                                 tab.scroll.scroll_to_item(line - 1, ScrollStrategy::Center);
                                 self.show_goto = false;
@@ -1735,6 +2123,18 @@ impl Workspace {
         self.main_hscroll_state.clear();
         self.results_vscroll_state.clear();
         self.results_hscroll_state.clear();
+    }
+
+    fn row_layouts(&self, pane: Pane) -> &RowLayoutCache {
+        match pane {
+            Pane::Main => &self.main_row_layouts,
+            Pane::Results => &self.results_row_layouts,
+        }
+    }
+
+    fn clear_row_layouts(&self) {
+        self.main_row_layouts.clear();
+        self.results_row_layouts.clear();
     }
 
     fn overview_lane_width(&self) -> f32 {
@@ -1923,6 +2323,7 @@ impl Workspace {
             return;
         }
         self.drag_selecting = None;
+        self.text_drag = None;
         self.scrollbar_drag = None;
         self.show_presets = false;
         if event.click_count >= 2 {
@@ -2110,6 +2511,7 @@ impl Workspace {
         }
         let press = resolve_track_press(layout, id.axis, position);
         self.drag_selecting = None;
+        self.text_drag = None;
         self.scrollbar_drag = Some(ScrollbarDrag {
             id,
             grab_offset: press.grab_offset,
@@ -2206,6 +2608,7 @@ impl Workspace {
                             if let Some(tab) = this.tabs.get_mut(this.active) {
                                 tab.selected = line;
                                 tab.main_selection.select_single(line);
+                                tab.main_text_selection = None;
                                 tab.follow = false;
                                 tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
                             }
@@ -2331,6 +2734,16 @@ impl Workspace {
         let search_mode = tab.options.mode;
         let max_display_chars = self.config.viewer.max_display_chars;
         let tab_width = self.config.viewer.tab_width;
+        let row_height = px(self.config.viewer.line_height);
+        let frame = self.render_frame;
+        let cache = self.row_layouts(pane).clone();
+        let text_selection = tab.text_selection(pane);
+        let text_selection_color = if pane_focused {
+            t.text_selection
+        } else {
+            t.text_selection_soft
+        };
+        let view = cx.entity().downgrade();
         range
             .filter_map(|row| {
                 let line = if results {
@@ -2338,52 +2751,54 @@ impl Workspace {
                 } else {
                     row
                 };
-                let (text, highlight_ranges) =
-                    match log.line(line, max_display_chars.saturating_mul(4)) {
-                        Ok(raw) => {
-                            let mut chars = raw.chars();
-                            let display_source: String =
-                                chars.by_ref().take(max_display_chars).collect();
-                            let truncated = chars.next().is_some();
-                            let raw_ranges = highlight_regex
-                                .map(|regex| {
-                                    search::highlight_ranges(&display_source, regex, search_mode)
-                                })
-                                .unwrap_or_default();
-                            let (mut text, mapped_ranges) = search::expand_tabs_with_highlights(
-                                &display_source,
-                                &raw_ranges,
-                                tab_width,
-                            );
-                            if truncated {
-                                text.push_str(" … [truncated]");
-                            }
-                            (text, mapped_ranges)
-                        }
-                        Err(e) => (format!("Read error: {e}"), Vec::new()),
-                    };
+                let (text, selectable_len, highlight_ranges) = format_display_line(
+                    &log,
+                    line,
+                    max_display_chars,
+                    tab_width,
+                    highlight_regex,
+                    search_mode,
+                );
                 let text_color: Hsla = self
                     .highlights
                     .iter()
                     .find(|(pattern, _)| pattern.is_match(&text))
                     .map(|(_, color)| rgb_to_hsla(rgb(*color)))
                     .unwrap_or(t.foreground);
-                let line_content: AnyElement = if highlight_ranges.is_empty() {
-                    text.into_any_element()
+                let highlights = if highlight_ranges.is_empty() {
+                    Vec::new()
                 } else {
                     let match_style = HighlightStyle {
                         background_color: Some(t.match_highlight_bg),
                         color: Some(t.match_highlight_fg),
                         ..Default::default()
                     };
-                    StyledText::new(text)
-                        .with_highlights(
-                            highlight_ranges
-                                .into_iter()
-                                .map(|range| (range, match_style)),
-                        )
-                        .into_any_element()
+                    highlight_ranges
+                        .into_iter()
+                        .map(|range| (range, match_style))
+                        .collect()
                 };
+                let row_text_selection = text_selection
+                    .and_then(|sel| sel.byte_range_for_row(row, &text[..selectable_len]));
+                let view_for_press = view.clone();
+                let line_content = SelectableRowText::new(
+                    text,
+                    selectable_len,
+                    highlights,
+                    row,
+                    row_height,
+                    frame,
+                    cache.clone(),
+                    row_text_selection,
+                    text_selection_color,
+                    move |press, window, cx| {
+                        view_for_press
+                            .update(cx, |this, cx| {
+                                this.handle_text_mouse_down(pane, press, window, cx)
+                            })
+                            .unwrap_or(false)
+                    },
+                );
                 let selection = if results {
                     &tab.result_selection
                 } else {
@@ -2479,7 +2894,18 @@ impl Workspace {
                                     .child(format!("{}", line + 1)),
                             )
                         })
-                        .child(div().pr_4().child(line_content))
+                        .child(
+                            div().pr_4().child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!(
+                                            "{}-text-{row}",
+                                            if results { "result" } else { "main" }
+                                        )
+                                    })
+                                    .child(line_content),
+                            ),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -2505,6 +2931,7 @@ impl Workspace {
         let has_tabs = !self.tabs.is_empty();
         let follow = active_tab.is_some_and(|tab| tab.follow);
         let selected_count = active_tab.map_or(0, |tab| Self::selection_count(tab, pane));
+        let has_text_selection = active_tab.is_some_and(|tab| tab.has_text_selection(pane));
         let is_bookmarked = active_tab.is_some_and(|tab| Self::selection_all_bookmarked(tab, pane));
 
         let mut tab_strip = div()
@@ -2750,12 +3177,18 @@ impl Workspace {
                             .child(self.cmd_icon(
                                 "copy",
                                 Icon::Copy,
-                                if selected_count > 1 {
+                                if has_text_selection {
+                                    "Copy selected text".to_owned()
+                                } else if selected_count > 1 {
                                     format!("Copy {} selected lines", format_count(selected_count))
                                 } else {
                                     "Copy selected line".to_owned()
                                 },
-                                Command::CopyLine,
+                                if has_text_selection {
+                                    Command::CopySelectedText
+                                } else {
+                                    Command::CopyLine
+                                },
                                 ButtonTone::Ghost,
                                 cx,
                             ))
@@ -3662,6 +4095,7 @@ impl Workspace {
             }
         });
         let selected_count = tab.map_or(0, |tab| Self::selection_count(tab, pane));
+        let text_selection_label = tab.and_then(|tab| self.selected_text_label(tab, pane));
         let bookmarks = tab.map_or(0, |tab| tab.bookmarks.len());
         let bytes = tab.and_then(|tab| tab.log.as_ref()).map(|l| l.stamp.len);
         let follow = tab.is_some_and(|tab| tab.follow);
@@ -3716,6 +4150,14 @@ impl Workspace {
                                         format_count(result_row),
                                         format_count(result_count)
                                     )),
+                            )
+                        })
+                        .when_some(text_selection_label, |el, label| {
+                            el.child(
+                                div()
+                                    .font(t.mono_font_spec())
+                                    .text_color(t.accent)
+                                    .child(label),
                             )
                         })
                         .when(selected_count > 1, |el| {
@@ -3796,6 +4238,10 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_frame = self.render_frame.wrapping_add(1);
+        self.main_row_layouts.begin_frame(self.render_frame);
+        self.results_row_layouts.begin_frame(self.render_frame);
+
         let t = self.theme.clone();
         let active_pane = self.active_pane_for(window);
         let main_focused = active_pane == Pane::Main;
@@ -3824,6 +4270,8 @@ impl Render for Workspace {
         let main_multi_selected = tab.is_some_and(|tab| tab.main_selection.has_multi_selection());
         let results_multi_selected =
             tab.is_some_and(|tab| tab.result_selection.has_multi_selection());
+        let main_text_selected = tab.is_some_and(|tab| tab.has_text_selection(Pane::Main));
+        let results_text_selected = tab.is_some_and(|tab| tab.has_text_selection(Pane::Results));
         let (min_results_h, max_results_h) = self.results_height_bounds(window);
         let effective_results_h = self.results_height.clamp(min_results_h, max_results_h);
         let main_hidden = is_main_hidden(effective_results_h, max_results_h);
@@ -3831,10 +4279,12 @@ impl Render for Workspace {
         if line_count == 0 || main_hidden {
             self.main_vscroll_state.clear();
             self.main_hscroll_state.clear();
+            self.main_row_layouts.clear();
         }
         if result_count == 0 || results_hidden {
             self.results_vscroll_state.clear();
             self.results_hscroll_state.clear();
+            self.results_row_layouts.clear();
         }
 
         let main_area = if self.tabs.is_empty() {
@@ -3859,68 +4309,79 @@ impl Render for Workspace {
             let source_log_area = div().key_context("Log").flex().flex_1().min_h_0().child(
                 div()
                     .when(main_multi_selected, |area| area.key_context("Selection"))
-                    .track_focus(&self.focus)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.focus_pane(Pane::Main, window, cx)),
-                    )
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .when(line_count == 0, |area| {
-                        area.items_center()
-                            .justify_center()
-                            .text_size(t.small_size)
-                            .text_color(t.muted)
-                            .child(if loading {
-                                "Opening file…"
-                            } else if tab_error.is_some() {
-                                "Cannot read file"
-                            } else {
-                                "Empty file"
+                    .child(
+                        div()
+                            .when(main_text_selected, |area| area.key_context("TextSelected"))
+                            .track_focus(&self.focus)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.focus_pane(Pane::Main, window, cx)
+                                }),
+                            )
+                            .flex()
+                            .flex_1()
+                            .min_h_0()
+                            .when(line_count == 0, |area| {
+                                area.items_center()
+                                    .justify_center()
+                                    .text_size(t.small_size)
+                                    .text_color(t.muted)
+                                    .child(if loading {
+                                        "Opening file…"
+                                    } else if tab_error.is_some() {
+                                        "Cannot read file"
+                                    } else {
+                                        "Empty file"
+                                    })
                             })
-                    })
-                    .when(line_count > 0, |area| {
-                        area.child(
-                            div()
-                                .relative()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .child(
-                                    uniform_list(
-                                        "source",
-                                        line_count,
-                                        cx.processor(|this, range, window, cx| {
-                                            this.rows(range, false, window, cx)
-                                        }),
-                                    )
-                                    .with_horizontal_sizing_behavior(
-                                        ListHorizontalSizingBehavior::Unconstrained,
-                                    )
-                                    .with_width_from_item(Some(widest_line))
-                                    .track_scroll(&scroll)
-                                    .size_full(),
+                            .when(line_count > 0, |area| {
+                                area.child(
+                                    div()
+                                        .relative()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .child(
+                                            uniform_list(
+                                                "source",
+                                                line_count,
+                                                cx.processor(|this, range, window, cx| {
+                                                    this.rows(range, false, window, cx)
+                                                }),
+                                            )
+                                            .with_horizontal_sizing_behavior(
+                                                ListHorizontalSizingBehavior::Unconstrained,
+                                            )
+                                            .with_width_from_item(Some(widest_line))
+                                            .track_scroll(&scroll)
+                                            .size_full(),
+                                        )
+                                        .child(self.render_horizontal_scrollbar(
+                                            Pane::Main,
+                                            scroll.clone(),
+                                            "main-hscroll",
+                                            cx,
+                                        )),
                                 )
-                                .child(self.render_horizontal_scrollbar(
-                                    Pane::Main,
-                                    scroll.clone(),
-                                    "main-hscroll",
-                                    cx,
-                                )),
-                        )
-                        .when(self.config.viewer.show_overview, |area| {
-                            area.child(self.render_overview_lane(cx))
-                        })
-                        .child(self.render_vertical_scrollbar(
-                            Pane::Main,
-                            scroll.clone(),
-                            !self.config.viewer.show_overview,
-                            DEFAULT_SCROLLBAR_WIDTH,
-                            "main-vscroll",
-                            cx,
-                        ))
-                    }),
+                                .when(self.config.viewer.show_overview, |area| {
+                                    area.child(self.render_overview_lane(cx))
+                                })
+                                .child(
+                                    self.render_vertical_scrollbar(
+                                        Pane::Main,
+                                        scroll.clone(),
+                                        !self.config.viewer.show_overview,
+                                        DEFAULT_SCROLLBAR_WIDTH,
+                                        "main-vscroll",
+                                        cx,
+                                    ),
+                                )
+                            }),
+                    ),
             );
 
             let source_pane = div()
@@ -4142,75 +4603,90 @@ impl Render for Workspace {
                 .child(
                     div()
                         .when(results_multi_selected, |body| body.key_context("Selection"))
-                        .track_focus(&self.results_focus)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                this.focus_pane(Pane::Results, window, cx)
-                            }),
-                        )
                         .flex_1()
                         .w_full()
                         .min_h_0()
                         .flex()
                         .flex_col()
-                        .when(result_count == 0, |col| {
-                            col.child(
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(t.small_size)
-                                    .text_color(t.muted)
-                                    .child(empty_results),
-                            )
-                        })
-                        .when(result_count > 0, |col| {
-                            col.child(
-                                div()
-                                    .flex_1()
-                                    .w_full()
-                                    .min_h_0()
-                                    .flex()
-                                    .child(
+                        .child(
+                            div()
+                                .when(results_text_selected, |body| {
+                                    body.key_context("TextSelected")
+                                })
+                                .track_focus(&self.results_focus)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.focus_pane(Pane::Results, window, cx)
+                                    }),
+                                )
+                                .flex_1()
+                                .w_full()
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .when(result_count == 0, |col| {
+                                    col.child(
                                         div()
-                                            .relative()
                                             .flex_1()
-                                            .min_w_0()
-                                            .h_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(t.small_size)
+                                            .text_color(t.muted)
+                                            .child(empty_results),
+                                    )
+                                })
+                                .when(result_count > 0, |col| {
+                                    col.child(
+                                        div()
+                                            .flex_1()
+                                            .w_full()
+                                            .min_h_0()
+                                            .flex()
                                             .child(
-                                                uniform_list(
-                                                    "results",
-                                                    result_count,
-                                                    cx.processor(|this, range, window, cx| {
-                                                        this.rows(range, true, window, cx)
-                                                    }),
-                                                )
-                                                .with_horizontal_sizing_behavior(
-                                                    ListHorizontalSizingBehavior::Unconstrained,
-                                                )
-                                                .with_width_from_item(Some(widest_result))
-                                                .track_scroll(&result_scroll)
-                                                .size_full(),
+                                                div()
+                                                    .relative()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .h_full()
+                                                    .child(
+                                                        uniform_list(
+                                                            "results",
+                                                            result_count,
+                                                            cx.processor(
+                                                                |this, range, window, cx| {
+                                                                    this.rows(
+                                                                        range, true, window, cx,
+                                                                    )
+                                                                },
+                                                            ),
+                                                        )
+                                                        .with_horizontal_sizing_behavior(
+                                                            ListHorizontalSizingBehavior::Unconstrained,
+                                                        )
+                                                        .with_width_from_item(Some(widest_result))
+                                                        .track_scroll(&result_scroll)
+                                                        .size_full(),
+                                                    )
+                                                    .child(self.render_horizontal_scrollbar(
+                                                        Pane::Results,
+                                                        result_scroll.clone(),
+                                                        "results-hscroll",
+                                                        cx,
+                                                    )),
                                             )
-                                            .child(self.render_horizontal_scrollbar(
+                                            .child(self.render_vertical_scrollbar(
                                                 Pane::Results,
                                                 result_scroll.clone(),
-                                                "results-hscroll",
+                                                true,
+                                                DEFAULT_SCROLLBAR_WIDTH,
+                                                "results-vscroll",
                                                 cx,
                                             )),
                                     )
-                                    .child(self.render_vertical_scrollbar(
-                                        Pane::Results,
-                                        result_scroll.clone(),
-                                        true,
-                                        DEFAULT_SCROLLBAR_WIDTH,
-                                        "results-vscroll",
-                                        cx,
-                                    )),
-                            )
-                        }),
+                                }),
+                        ),
                 );
 
             div()
@@ -4230,6 +4706,7 @@ impl Render for Workspace {
             .when(self.results_resize_drag.is_some(), |root| {
                 root.cursor_row_resize()
             })
+            .when(self.text_drag.is_some(), |root| root.cursor_text())
             .capture_key_up(cx.listener(|this, _event: &KeyUpEvent, _window, _cx| {
                 this.resize_motion.release_hold();
             }))
@@ -4245,6 +4722,7 @@ impl Render for Workspace {
                         let _ = view.update(cx, |this, cx| {
                             this.handle_results_resize_move(event, window, cx);
                             this.handle_scrollbar_drag_move(event, cx);
+                            this.handle_text_drag_move(event, cx);
                         });
                     }
                 }
@@ -4254,6 +4732,9 @@ impl Render for Workspace {
                 cx.listener(|this, _, _, cx| {
                     this.drag_selecting = None;
                     let mut changed = false;
+                    if this.text_drag.take().is_some() {
+                        changed = true;
+                    }
                     if this.scrollbar_drag.take().is_some() {
                         changed = true;
                     }
@@ -4270,6 +4751,9 @@ impl Render for Workspace {
                 cx.listener(|this, _, _, cx| {
                     this.drag_selecting = None;
                     let mut changed = false;
+                    if this.text_drag.take().is_some() {
+                        changed = true;
+                    }
                     if this.scrollbar_drag.take().is_some() {
                         changed = true;
                     }
@@ -4307,6 +4791,38 @@ impl Render for Workspace {
             .when(self.config.window.show_status_bar, |root| {
                 root.child(self.render_status_bar(window, cx))
             })
+    }
+}
+
+fn format_display_line(
+    log: &LogFile,
+    line: usize,
+    max_display_chars: usize,
+    tab_width: usize,
+    highlight_regex: Option<&Regex>,
+    search_mode: SearchMode,
+) -> (String, usize, Vec<std::ops::Range<usize>>) {
+    match log.line(line, max_display_chars.saturating_mul(4)) {
+        Ok(raw) => {
+            let mut chars = raw.chars();
+            let display_source: String = chars.by_ref().take(max_display_chars).collect();
+            let truncated = chars.next().is_some();
+            let raw_ranges = highlight_regex
+                .map(|regex| search::highlight_ranges(&display_source, regex, search_mode))
+                .unwrap_or_default();
+            let (mut text, mapped_ranges) =
+                search::expand_tabs_with_highlights(&display_source, &raw_ranges, tab_width);
+            let selectable_len = text.len();
+            if truncated {
+                text.push_str(" … [truncated]");
+            }
+            (text, selectable_len, mapped_ranges)
+        }
+        Err(e) => {
+            let text = format!("Read error: {e}");
+            let len = text.len();
+            (text, len, Vec::new())
+        }
     }
 }
 
@@ -6399,6 +6915,373 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(!view.resize_motion.is_animating());
             assert_eq!(view.results_height, view.target_results_height);
+        });
+    }
+
+    #[test]
+    fn theme_uses_configured_text_selection_color_and_opacity() {
+        let default_config = Config::load(None).unwrap();
+        let default_theme = Theme::from_config_with_fonts(&default_config, &[]);
+        let expected_default = rgb_to_hsla(rgb(0x38BDF8)).opacity(0.35);
+        assert_eq!(default_theme.text_selection, expected_default);
+        assert_eq!(
+            default_theme.text_selection_soft,
+            rgb_to_hsla(rgb(0x38BDF8)).opacity(0.35 * 0.55)
+        );
+
+        let mut custom_config = default_config;
+        custom_config.appearance.text_selection_color = "#FF5500".into();
+        custom_config.appearance.text_selection_opacity = 0.72;
+        let custom_theme = Theme::from_config_with_fonts(&custom_config, &[]);
+        assert_eq!(
+            custom_theme.text_selection,
+            rgb_to_hsla(rgb(0xFF5500)).opacity(0.72)
+        );
+        assert_eq!(
+            custom_theme.text_selection_soft,
+            rgb_to_hsla(rgb(0xFF5500)).opacity(0.72 * 0.55)
+        );
+    }
+
+    #[gpui::test]
+    fn row_text_selection_works_in_main_and_filter_panes_with_drag_word_triple_click_and_shift(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.max_display_chars = 48;
+        config.appearance.text_selection_color = "#FF5500".into();
+        config.appearance.text_selection_opacity = 0.6;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("text-select.log");
+        let lines = [
+            "INFO service started request_id=req_1001",
+            "ERROR database timeout user=alice_42 retry=3",
+            "INFO skipping unrelated noise",
+            "ERROR gateway failed status=503 host=edge",
+            "ERROR truncated payload 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        ];
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let results = SearchResults {
+            matches: vec![1, 3, 4],
+            visible: vec![1, 3, 4],
+            limited: false,
+            widest_row: 2,
+        };
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "ERROR".into();
+            view.tabs[0].sync_highlight_regex();
+            view.tabs[0].results = results;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let copy_key = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+
+        // 1. Horizontal drag on main-text-0 selects a substring (not the whole line) and copies it.
+        let main0 = cx
+            .debug_bounds("main-text-0")
+            .expect("main text 0 should render");
+        let drag_start = point(main0.origin.x + px(1.0), main0.center().y);
+        let drag_end = point(main0.origin.x + main0.size.width * 0.3, main0.center().y);
+        cx.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(drag_end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(drag_end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].has_text_selection(Pane::Main));
+            assert!(view.text_drag.is_none());
+            let sel = view.tabs[0].main_text_selection.unwrap();
+            assert_eq!(sel.row_range(), 0..=0);
+            assert!(sel.ordered().0.offset < sel.ordered().1.offset);
+        });
+        cx.simulate_keystrokes(copy_key);
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain copied substring");
+        assert!(
+            !copied.is_empty() && copied.len() < lines[0].len() && lines[0].starts_with(&copied),
+            "expected prefix substring of line 0, got {copied:?}"
+        );
+
+        // 2. Shift+click on main-text-1 extends the active text selection across rows 0..=1.
+        let main1 = cx
+            .debug_bounds("main-text-1")
+            .expect("main text 1 should render");
+        let shift_target = point(main1.origin.x + main1.size.width * 0.25, main1.center().y);
+        cx.simulate_click(shift_target, Modifiers::shift());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(copy_key);
+        let multi_copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain multi-row substring");
+        assert!(
+            multi_copied.contains('\n'),
+            "multi-row text selection should include newline: {multi_copied:?}"
+        );
+        let parts: Vec<&str> = multi_copied.split('\n').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(lines[0].ends_with(parts[0]));
+        assert!(lines[1].starts_with(parts[1]));
+
+        // 3. Escape clears only the text selection.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].has_text_selection(Pane::Main));
+        });
+
+        // 4. Double-click on main-text-1 selects the word under the pointer.
+        let word_pt = point(main1.origin.x + px(4.0), main1.center().y);
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: word_pt,
+            modifiers: Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(word_pt, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(copy_key);
+        let word_copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain double-clicked word");
+        assert_eq!(word_copied, "ERROR");
+
+        // 5. Triple-click on truncated main-text-4 selects the displayed line text excluding the truncation marker.
+        let main4 = cx
+            .debug_bounds("main-text-4")
+            .expect("main text 4 should render");
+        let triple_pt = point(main4.origin.x + px(8.0), main4.center().y);
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: triple_pt,
+            modifiers: Modifiers::none(),
+            click_count: 3,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(triple_pt, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(copy_key);
+        let triple_copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain triple-clicked line");
+        assert_eq!(triple_copied.chars().count(), 48);
+        assert!(!triple_copied.contains("[truncated]"));
+
+        // 6. Filter (results) pane: horizontal drag, multi-row drag, double-click, and Escape all work.
+        let res0 = cx
+            .debug_bounds("result-text-0")
+            .expect("result text 0 should render");
+        let res1 = cx
+            .debug_bounds("result-text-1")
+            .expect("result text 1 should render");
+        let r_start = point(res0.origin.x + px(1.0), res0.center().y);
+        let r_end = point(res0.origin.x + res0.size.width * 0.35, res0.center().y);
+        cx.simulate_mouse_down(r_start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(r_end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(r_end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, _| {
+            assert!(view.results_focus.is_focused(window));
+            assert!(view.tabs[0].has_text_selection(Pane::Results));
+        });
+        cx.simulate_keystrokes(copy_key);
+        let res_copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain copied filter-pane substring");
+        assert!(
+            !res_copied.is_empty()
+                && res_copied.len() < lines[1].len()
+                && lines[1].starts_with(&res_copied),
+            "expected prefix substring of filtered line 1, got {res_copied:?}"
+        );
+
+        // Multi-row drag across filtered rows 0 -> 1 skips non-matching source line 2.
+        let r_multi_end = point(res1.origin.x + res1.size.width * 0.25, res1.center().y);
+        cx.simulate_mouse_down(r_start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(r_multi_end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(r_multi_end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(copy_key);
+        let res_multi = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain multi-row filter selection");
+        let res_parts: Vec<&str> = res_multi.split('\n').collect();
+        assert_eq!(res_parts.len(), 2);
+        assert!(lines[1].ends_with(res_parts[0]));
+        assert!(lines[3].starts_with(res_parts[1]));
+        assert!(!res_multi.contains("skipping unrelated noise"));
+
+        // Escape clears filter-pane text selection.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].has_text_selection(Pane::Results));
+        });
+    }
+
+    #[gpui::test]
+    fn text_selected_context_overrides_log_and_selection_only_when_focused_pane_has_text_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Bind `x` to bookmark in Log, swap_selection_anchor in Selection, and copy_selected_text in TextSelected.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "x".into(),
+            context: config::KeyContext::Log,
+            action: Command::ToggleBookmark,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "x".into(),
+            context: config::KeyContext::Selection,
+            action: Command::SwapSelectionAnchor,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "x".into(),
+            context: config::KeyContext::TextSelected,
+            action: Command::CopySelectedText,
+        });
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("text-ctx.log");
+        std::fs::write(
+            &path,
+            "ERROR alpha token\nINFO beta token\nERROR gamma token\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let results = SearchResults {
+            matches: vec![0, 2],
+            visible: vec![0, 2],
+            limited: false,
+            widest_row: 0,
+        };
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "ERROR".into();
+            view.tabs[0].results = results;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Without text selection, `x` runs Log (ToggleBookmark on line 0).
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
+        });
+
+        // With BOTH multi-line selection AND text selection in main pane, TextSelected takes precedence over Selection and Log.
+        view.update(cx, |view, cx| {
+            view.tabs[0].main_selection.extend_to(2);
+            view.tabs[0].main_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 6),
+                TextPosition::new(0, 11),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("alpha")
+        );
+        view.read_with(cx, |view, _| {
+            // Neither Log (ToggleBookmark) nor Selection (SwapSelectionAnchor) ran.
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
+            assert_eq!(view.tabs[0].main_selection.anchor, 0);
+            assert_eq!(view.tabs[0].main_selection.cursor, 2);
+        });
+
+        // Focusing Search while main pane has text selected must NOT activate TextSelected.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("x");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "x");
+        });
+
+        // Focusing Filter pane (no text selection there) while main pane still has text selected must NOT activate TextSelected.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            // Filter row 0 maps to source line 0, so Log's ToggleBookmark unbookmarked line 0.
+            assert!(view.tabs[0].bookmarks.is_empty());
+        });
+
+        // Selecting text in Filter pane activates TextSelected for Filter pane.
+        view.update(cx, |view, cx| {
+            view.tabs[0].result_text_selection = Some(TextSelection::new(
+                TextPosition::new(1, 6),
+                TextPosition::new(1, 11),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("gamma")
+        );
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.is_empty());
+        });
+
+        // Pressing Escape clears filter text selection, returning `x` to Log context.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].has_text_selection(Pane::Results));
+        });
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
         });
     }
 }

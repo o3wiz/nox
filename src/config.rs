@@ -40,6 +40,10 @@ pub struct AppearanceConfig {
     #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
     pub selection: String,
     #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    pub text_selection_color: String,
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub text_selection_opacity: f32,
+    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
     pub border: String,
     #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
     pub match_foreground: String,
@@ -143,6 +147,7 @@ pub enum Command {
     NextMatch,
     PreviousMatch,
     CopyLine,
+    CopySelectedText,
     Reload,
     GoToLine,
     ExportResults,
@@ -165,6 +170,7 @@ pub enum Command {
     SelectPageDown,
     SelectAll,
     ClearSelection,
+    ClearTextSelection,
     SwapSelectionAnchor,
     TogglePresets,
     ApplyPreset,
@@ -176,6 +182,7 @@ pub enum KeyContext {
     Workspace,
     Log,
     Selection,
+    TextSelected,
     Search,
     GoTo,
     Presets,
@@ -186,6 +193,7 @@ impl KeyContext {
             Self::Workspace => "Workspace",
             Self::Log => "Log",
             Self::Selection => "Selection",
+            Self::TextSelected => "TextSelected",
             Self::Search => "Search",
             Self::GoTo => "GoTo",
             Self::Presets => "Presets",
@@ -329,6 +337,10 @@ impl Config {
             s.context_lines <= 100 && (1..=10000000).contains(&s.max_results),
             "search: invalid context or result limit"
         );
+        ensure!(
+            a.text_selection_opacity.is_finite() && (0.0..=1.0).contains(&a.text_selection_opacity),
+            "appearance.text_selection_opacity must be 0.0..=1.0"
+        );
         for value in [
             &a.background,
             &a.panel,
@@ -336,6 +348,7 @@ impl Config {
             &a.muted,
             &a.accent,
             &a.selection,
+            &a.text_selection_color,
             &a.border,
             &a.match_foreground,
             &a.match_background,

@@ -15,7 +15,7 @@ Requires a Rust toolchain supporting edition 2024 and the native build prerequis
 
 Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar, and toggle search match background highlighting from the highlighter icon on the left side of the search bar (or **⌘⌥H** / **Ctrl+Alt+H**). In regex mode, highlighting emphasizes only capturing groups when present (or the full match if there are none); in literal mode, it highlights the matched literal text across both panes. Open saved patterns from the **Patterns** dropdown (or **⌘P** / **Ctrl+P**), navigate with **↑**/**↓** (**Home**/**End**), and press **Enter** or click an item to apply it immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
 
-Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Alt+O** / **⌥O** flips the selection anchor between the top and bottom ends, and **Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
+Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Select text directly inside displayed rows in either pane by clicking and dragging across characters or multiple rows, double-clicking a word, triple-clicking a line, or **Shift+Clicking** to extend an active text selection (**⌘C** / **Ctrl+C** copies the selected text and **Escape** clears it). Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Alt+O** / **⌥O** flips the selection anchor between the top and bottom ends, and **Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
 The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Resize the filter pane vertically all the way from the bottom (hiding the filter pane) to the top (hiding the main log pane) by dragging the horizontal split handle above the search bar (double-click it to reset to `window.results_height`), clicking the resize buttons in the results header, or pressing **-** (taller) and **⇧-** / **Shift+-** (shorter) in the log/filter panes — holding either key smoothly glides with an automatic acceleration gradient. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
 
@@ -41,6 +41,8 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Log | secondary-c | Copy selected lines |
 | Log | - / shift-- | Make filter pane taller / shorter (smooth glide on long press) |
 | Selection | alt-o | Toggle selection anchor between top and bottom |
+| TextSelected | secondary-c | Copy selected text |
+| TextSelected | escape | Clear text selection |
 | Search | Enter / Escape | Apply search / focus log |
 | Search | secondary-alt-r | Toggle regular expression |
 | Search | secondary-alt-c | Toggle match case |
@@ -73,12 +75,12 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | File | Settings |
 | --- | --- |
 | `window.json` | Title, initial dimensions/maximized state, results-pane height, status bar |
-| `appearance.json` | UI sans-serif & monospace font families/sizes, semantic colors, and match foreground/background colors (`#RRGGBB`) |
+| `appearance.json` | UI sans-serif & monospace font families/sizes, semantic colors, text selection color & opacity (`0.0`–`1.0`), and match foreground/background colors (`#RRGGBB`) |
 | `viewer.json` | Line numbers/height, match overview visibility/width, tab expansion, display character limit, following, bookmark inclusion, polling interval |
 | `search.json` | Default search mode, case/word/inversion/match highlighting, context lines, match limit, named presets (pattern, mode, `highlight_match`) |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |
 | `files.json` | Startup paths, favorites, session restore/save, session path, recent-file limit |
-| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Selection`, `Search`, `GoTo`, or `Presets` contexts |
+| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Selection`, `TextSelected`, `Search`, `GoTo`, or `Presets` contexts |
 
 Each JSON file has a `$schema` link for editor completion and validation. Schemas are generated from the same Rust types used to deserialize configuration. Top-level properties are optional because files are overlays; objects inside replacement arrays require their fields. Additional semantic checks (for example regex syntax and shortcut conflicts) run in the application.
 
@@ -128,7 +130,7 @@ The line index uses approximately eight bytes per line (plus allocation overhead
 
 Files are treated as UTF-8 with replacement characters for invalid sequences. Live monitoring polls metadata and rebuilds the index in the background when a change is detected; it does not yet incrementally index appends. A scan reads up to the file length captured at its start. In-place rewrites during reading can temporarily show inconsistent content until the next refresh. Large scans finish before another automatic reload starts, avoiding search starvation on continuously growing files.
 
-This version covers Klogg's core local-file workflow, not complete feature parity. Remaining differences include encoding detection/selection, archives and URL loading, boolean expression parsing, scratchpads, in-app settings editors, substring selection in log panes, configurable highlighter sets, and Klogg's SIMD search optimizations.
+This version covers Klogg's core local-file workflow, not complete feature parity. Remaining differences include encoding detection/selection, archives and URL loading, boolean expression parsing, scratchpads, in-app settings editors, configurable highlighter sets, and Klogg's SIMD search optimizations.
 
 ## Development
 
