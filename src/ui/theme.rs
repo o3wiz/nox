@@ -276,12 +276,12 @@ fn contrast_ink(hex: u32) -> Hsla {
     }
 }
 
-/// Converts a GPUI keybinding sequence (e.g. `secondary-o`, `shift-f3`) into a concise keycap label.
+/// Converts a GPUI keybinding sequence (e.g. `secondary-o`, `alt-shift--`) into a concise keycap label.
 pub fn format_shortcut(keys: &str) -> String {
     let mac = cfg!(target_os = "macos");
     keys.split_whitespace()
         .map(|stroke| {
-            let parts: Vec<&str> = stroke.split('-').collect();
+            let parts = split_keystroke_tokens(stroke);
             let mut out = Vec::with_capacity(parts.len());
             for part in parts {
                 let token = match part.to_ascii_lowercase().as_str() {
@@ -328,4 +328,21 @@ pub fn format_shortcut(keys: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn split_keystroke_tokens(stroke: &str) -> Vec<&str> {
+    if stroke == "-" {
+        return vec!["-"];
+    }
+    if let Some(prefix) = stroke.strip_suffix("--") {
+        let mut parts: Vec<&str> = if prefix.is_empty() {
+            Vec::new()
+        } else {
+            prefix.split('-').filter(|part| !part.is_empty()).collect()
+        };
+        parts.push("-");
+        parts
+    } else {
+        stroke.split('-').collect()
+    }
 }

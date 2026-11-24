@@ -32,6 +32,8 @@ pub enum Icon {
     AlertTriangle,
     MatchDot,
     Check,
+    PanelExpand,
+    PanelShrink,
 }
 
 impl Icon {
@@ -64,6 +66,8 @@ impl Icon {
         Icon::AlertTriangle,
         Icon::MatchDot,
         Icon::Check,
+        Icon::PanelExpand,
+        Icon::PanelShrink,
     ];
 
     pub fn svg_bytes(self) -> &'static [u8] {
@@ -121,6 +125,10 @@ impl Icon {
             Icon::MatchDot => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#ffffff"><circle cx="12" cy="12" r="4.5"/></svg>"##,
 
             Icon::Check => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12.5 9.8 17.2 19 7.5"/></svg>"##,
+
+            Icon::PanelExpand => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="6" x2="19" y2="6"/><polyline points="7.5 15.5 12 10.5 16.5 15.5"/></svg>"##,
+
+            Icon::PanelShrink => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round"><polyline points="7.5 8.5 12 13.5 16.5 8.5"/><line x1="5" y1="18" x2="19" y2="18"/></svg>"##,
         }
     }
 

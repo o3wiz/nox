@@ -24,6 +24,13 @@
       "items": {
         "type": "string"
       }
+    },
+    "results_height": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "float"
     }
   },
   "additionalProperties": false,

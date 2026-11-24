@@ -89,7 +89,9 @@
         "clear_selection",
         "swap_selection_anchor",
         "toggle_presets",
-        "apply_preset"
+        "apply_preset",
+        "increase_filter_height",
+        "decrease_filter_height"
       ]
     }
   }

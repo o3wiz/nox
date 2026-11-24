@@ -17,7 +17,7 @@ Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto 
 
 Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Alt+O** / **⌥O** flips the selection anchor between the top and bottom ends, and **Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
-The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
+The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Resize the filter pane vertically all the way from the bottom (hiding the filter pane) to the top (hiding the main log pane) by dragging the horizontal split handle above the search bar (double-click it to reset to `window.results_height`), clicking the resize buttons in the results header, or pressing **-** (taller) and **⇧-** / **Shift+-** (shorter) in the log/filter panes — holding either key smoothly glides with an automatic acceleration gradient. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
 
 Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 
@@ -39,6 +39,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Log | b / shift-b | Next / previous bookmark |
 | Log | f | Toggle following |
 | Log | secondary-c | Copy selected lines |
+| Log | - / shift-- | Make filter pane taller / shorter (smooth glide on long press) |
 | Selection | alt-o | Toggle selection anchor between top and bottom |
 | Search | Enter / Escape | Apply search / focus log |
 | Search | secondary-alt-r | Toggle regular expression |
@@ -109,7 +110,7 @@ The second example replaces all application bindings. GPUI's standard text-editi
 
 ## Session state
 
-Session state is separate from configuration and has its own `schemas/session.schema.json`. On a normal close or quit, Nox atomically saves open files, active tab, per-tab query/options, selected line, bookmarks, follow state, and recent files. Command-line or configured startup files take priority over restoring the previous tabs. Corrupt/unsupported session files are reported and preserved rather than overwritten.
+Session state is separate from configuration and has its own `schemas/session.schema.json`. On a normal close or quit, Nox atomically saves open files, active tab, per-tab query/options, selected line, bookmarks, follow state, recent files, and the resized filter pane height. Command-line or configured startup files take priority over restoring the previous tabs. Corrupt/unsupported session files are reported and preserved rather than overwritten.
 
 The default state location is:
 
@@ -121,7 +122,7 @@ Set `NOX_STATE_DIR` or `files.state_file` to change it (`state_file` takes prior
 
 ## Architecture and limits
 
-`src/config.rs` owns typed configuration, validation, and schema generation. `src/logfile.rs` indexes byte offsets and reads source data on demand using positioned reads. `src/search.rs` streams through the file and returns matching/context line indices. `src/session.rs` manages persisted state. `src/ui/` owns GPUI presentation (`mod.rs`), vector icons (`icons.rs`), design tokens and font resolution (`theme.rs`), and reusable icon-first controls (`components.rs`). The executable entry point handles command-line startup.
+`src/config.rs` owns typed configuration, validation, and schema generation. `src/logfile.rs` indexes byte offsets and reads source data on demand using positioned reads. `src/search.rs` streams through the file and returns matching/context line indices. `src/session.rs` manages persisted state. `src/ui/` owns GPUI presentation (`mod.rs`), vector icons (`icons.rs`), design tokens and font resolution (`theme.rs`), filter-pane resize math and hold acceleration (`resize.rs`), custom scrollbars (`scrollbar.rs`), and reusable icon-first controls (`components.rs`). The executable entry point handles command-line startup.
 
 The line index uses approximately eight bytes per line (plus allocation overhead). Search buffers one complete line at a time; pathological single-line files can still use substantial memory. Display text is bounded by `max_display_chars`, while matching, copying, and export use complete lines. Search uses Rust's Unicode regex engine, not Klogg's Hyperscan/PCRE engine: lookaround and backreferences are unsupported. `max_results` caps matching lines, not additional context/bookmark rows.
 

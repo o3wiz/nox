@@ -1,5 +1,6 @@
 mod components;
 mod icons;
+mod resize;
 mod scrollbar;
 mod theme;
 
@@ -22,6 +23,10 @@ use nox::{
     session::{self, SavedTab, Session},
 };
 use regex::Regex;
+use resize::{
+    RESIZE_SASH_HEIGHT, ResizeDirection, ResizeMotion, ResultsResizeDrag, height_for_drag,
+    is_main_hidden, is_results_hidden, results_height_bounds,
+};
 use scrollbar::{
     DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, ScrollAxis, ScrollbarTrackState,
     resolve_track_press, scroll_offset_for_drag, scrollbar_canvas, set_uniform_list_axis_offset,
@@ -29,7 +34,7 @@ use scrollbar::{
 use serde::Deserialize;
 use std::{
     cell::Cell,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -48,23 +53,68 @@ struct Execute {
 }
 
 pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
-    config
-        .keyboard
-        .bindings
-        .iter()
-        .map(|binding| {
-            Ok(KeyBinding::load(
-                &binding.keys,
-                Box::new(Execute {
-                    command: binding.action,
-                }),
-                Some(KeyBindingContextPredicate::parse(binding.context.as_str())?.into()),
-                false,
-                None,
-                &DummyKeyboardMapper,
-            )?)
-        })
-        .collect()
+    let mut parsed = Vec::with_capacity(config.keyboard.bindings.len());
+    let mut explicit = HashSet::new();
+    for binding in &config.keyboard.bindings {
+        let loaded = KeyBinding::load(
+            &binding.keys,
+            Box::new(Execute {
+                command: binding.action,
+            }),
+            Some(KeyBindingContextPredicate::parse(binding.context.as_str())?.into()),
+            false,
+            None,
+            &DummyKeyboardMapper,
+        )?;
+        if loaded.keystrokes().len() == 1 {
+            let ks = loaded.keystrokes()[0].inner();
+            explicit.insert((binding.context, ks.modifiers, ks.key.clone()));
+        }
+        parsed.push((binding, loaded));
+    }
+
+    let mut out = Vec::with_capacity(parsed.len() + 2);
+    for (binding, loaded) in parsed {
+        // On macOS (and X11/Windows), pressing Shift + '-' folds Shift into '_' and clears
+        // the shift modifier. Register an automatic companion alias so bindings like
+        // `alt-shift--` match both simulated `alt-shift--` and native `alt-_` keystrokes
+        // unless the user explicitly bound the unshifted `_` combination in the same context.
+        let alias = if loaded.keystrokes().len() == 1 {
+            let ks = loaded.keystrokes()[0].inner();
+            if ks.modifiers.shift && ks.key == "-" {
+                let mut unshifted = ks.modifiers;
+                unshifted.shift = false;
+                if explicit.insert((binding.context, unshifted, "_".to_owned())) {
+                    let alias_ks = Keystroke {
+                        modifiers: unshifted,
+                        key: "_".to_owned(),
+                        key_char: None,
+                    };
+                    Some(KeyBinding::load(
+                        &alias_ks.unparse(),
+                        Box::new(Execute {
+                            command: binding.action,
+                        }),
+                        Some(KeyBindingContextPredicate::parse(binding.context.as_str())?.into()),
+                        false,
+                        None,
+                        &DummyKeyboardMapper,
+                    )?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        out.push(loaded);
+        if let Some(alias) = alias {
+            out.push(alias);
+        }
+    }
+    Ok(out)
 }
 
 const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
@@ -200,6 +250,11 @@ pub struct Workspace {
     active_pane: Pane,
     drag_selecting: Option<Pane>,
     scrollbar_drag: Option<ScrollbarDrag>,
+    results_height: f32,
+    target_results_height: f32,
+    results_resize_drag: Option<ResultsResizeDrag>,
+    resize_motion: ResizeMotion,
+    resize_frame_scheduled: bool,
     main_vscroll_state: ScrollbarTrackState,
     main_hscroll_state: ScrollbarTrackState,
     results_vscroll_state: ScrollbarTrackState,
@@ -276,12 +331,25 @@ impl Workspace {
         } else {
             paths
         };
+        let results_height = if config.files.restore_session {
+            saved.results_height.unwrap_or(config.window.results_height)
+        } else {
+            config.window.results_height
+        };
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
                 this.save_session(cx);
                 async {}
             }),
             cx.on_release(|this, cx| this.save_session(cx)),
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.resize_motion.release_hold();
+                    if this.results_resize_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }
+            }),
         ];
         let theme = Theme::from_config(&config, cx);
         let mut this = Self {
@@ -304,6 +372,11 @@ impl Workspace {
             active_pane: Pane::Main,
             drag_selecting: None,
             scrollbar_drag: None,
+            results_height,
+            target_results_height: results_height,
+            results_resize_drag: None,
+            resize_motion: ResizeMotion::default(),
+            resize_frame_scheduled: false,
             main_vscroll_state: ScrollbarTrackState::new(),
             main_hscroll_state: ScrollbarTrackState::new(),
             results_vscroll_state: ScrollbarTrackState::new(),
@@ -362,6 +435,7 @@ impl Workspace {
             version: 1,
             active: self.active,
             recent: self.recent.clone(),
+            results_height: Some(self.target_results_height.round()),
             tabs: self
                 .tabs
                 .iter()
@@ -432,6 +506,9 @@ impl Workspace {
         self.active = index;
         self.drag_selecting = None;
         self.scrollbar_drag = None;
+        self.results_resize_drag = None;
+        self.resize_motion.cancel();
+        self.results_height = self.target_results_height;
         self.clear_scrollbar_states();
         self.show_presets = false;
         let query = self
@@ -454,6 +531,9 @@ impl Workspace {
         }
         self.drag_selecting = None;
         self.scrollbar_drag = None;
+        self.results_resize_drag = None;
+        self.resize_motion.cancel();
+        self.results_height = self.target_results_height;
         self.clear_scrollbar_states();
         self.show_presets = false;
         self.tabs.remove(index);
@@ -1025,6 +1105,7 @@ impl Workspace {
     ) {
         let pane = self.active_pane_for(window);
         self.active_pane = pane;
+        let results_h = self.effective_results_height(window);
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -1037,9 +1118,7 @@ impl Workspace {
                 if len == 0 {
                     return;
                 }
-                let step = ((f32::from(window.viewport_size().height)
-                    - self.config.window.results_height
-                    - 180.)
+                let step = ((f32::from(window.viewport_size().height) - results_h - 180.)
                     / self.config.viewer.line_height)
                     .max(1.) as usize;
                 let current = tab.main_selection.cursor.min(len - 1);
@@ -1068,12 +1147,7 @@ impl Workspace {
                 if len == 0 {
                     return;
                 }
-                let pane_height = self
-                    .config
-                    .window
-                    .results_height
-                    .min(f32::from(window.viewport_size().height) * 0.45);
-                let step = (pane_height / self.config.viewer.line_height).max(1.) as usize;
+                let step = (results_h / self.config.viewer.line_height).max(1.) as usize;
                 let current = tab.result_selection.cursor.min(len - 1);
                 let target = match command {
                     Command::NextLine | Command::SelectNextLine => current.saturating_add(1),
@@ -1215,20 +1289,24 @@ impl Workspace {
             }
             Command::SwitchPane => {
                 let current = self.active_pane_for(window);
+                let (min_h, max_h) = self.results_height_bounds(window);
+                let eff = self.results_height.clamp(min_h, max_h);
                 match current {
                     Pane::Main => {
                         let has_results = self
                             .tabs
                             .get(self.active)
                             .is_some_and(|tab| !tab.results.visible.is_empty());
-                        if has_results {
+                        if has_results && !is_results_hidden(eff) {
                             self.focus_pane(Pane::Results, window, cx);
                             return;
                         }
                     }
                     Pane::Results => {
-                        self.focus_pane(Pane::Main, window, cx);
-                        return;
+                        if !is_main_hidden(eff, max_h) {
+                            self.focus_pane(Pane::Main, window, cx);
+                            return;
+                        }
                     }
                 }
             }
@@ -1295,7 +1373,13 @@ impl Workspace {
                 if self.show_presets {
                     self.close_presets(window, cx);
                 } else {
-                    self.focus_pane(Pane::Main, window, cx);
+                    let (min_h, max_h) = self.results_height_bounds(window);
+                    let eff = self.results_height.clamp(min_h, max_h);
+                    if is_main_hidden(eff, max_h) && !is_results_hidden(eff) {
+                        self.focus_pane(Pane::Results, window, cx);
+                    } else {
+                        self.focus_pane(Pane::Main, window, cx);
+                    }
                 }
                 return;
             }
@@ -1507,12 +1591,33 @@ impl Workspace {
                         }
                     }
                 } else {
+                    let (min_h, max_h) = self.results_height_bounds(window);
+                    let eff = self.results_height.clamp(min_h, max_h);
+                    if is_main_hidden(eff, max_h) {
+                        let restored = self
+                            .config
+                            .window
+                            .results_height
+                            .min((max_h - 140.0).max(0.0))
+                            .clamp(min_h, max_h);
+                        self.resize_motion.cancel();
+                        self.results_height = restored;
+                        self.target_results_height = restored;
+                    }
                     self.show_goto = true;
                     self.goto.update(cx, |input, cx| input.emplace("", cx));
                     self.goto.read(cx).focus_handle(cx).focus(window, cx);
                 }
             }
             Command::ExportResults => self.export(cx),
+            Command::IncreaseFilterHeight => {
+                self.resize_filter_height_keyboard(ResizeDirection::Grow, window, cx);
+                return;
+            }
+            Command::DecreaseFilterHeight => {
+                self.resize_filter_height_keyboard(ResizeDirection::Shrink, window, cx);
+                return;
+            }
         }
         cx.notify();
     }
@@ -1637,6 +1742,348 @@ impl Workspace {
         } else {
             DEFAULT_SCROLLBAR_WIDTH
         }
+    }
+
+    fn results_height_bounds(&self, window: &Window) -> (f32, f32) {
+        let viewport_h = f32::from(window.viewport_size().height);
+        let has_error = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.error.is_some());
+        results_height_bounds(viewport_h, self.config.window.show_status_bar, has_error)
+    }
+
+    fn effective_results_height(&self, window: &Window) -> f32 {
+        let (min_h, max_h) = self.results_height_bounds(window);
+        self.results_height.clamp(min_h, max_h)
+    }
+
+    fn sync_focus_for_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let (min_h, max_h) = self.results_height_bounds(window);
+        let eff = self.results_height.clamp(min_h, max_h);
+        let main_hidden = is_main_hidden(eff, max_h);
+        let results_hidden = is_results_hidden(eff);
+        if main_hidden && !results_hidden {
+            if self.active_pane == Pane::Main {
+                self.active_pane = Pane::Results;
+            }
+            if self.focus.is_focused(window) {
+                if let Some(tab) = self.tabs.get_mut(self.active)
+                    && tab.result_selection.is_empty()
+                    && !tab.results.visible.is_empty()
+                {
+                    let row = tab
+                        .results
+                        .visible
+                        .binary_search(&tab.selected)
+                        .unwrap_or_else(|idx| idx.min(tab.results.visible.len() - 1));
+                    tab.result_selection.select_single(row);
+                    tab.result_scroll
+                        .scroll_to_item(row, ScrollStrategy::Nearest);
+                }
+                self.results_focus.focus(window, cx);
+            }
+        } else if results_hidden && !main_hidden {
+            if self.active_pane == Pane::Results {
+                self.active_pane = Pane::Main;
+            }
+            if self.results_focus.is_focused(window) {
+                self.focus.focus(window, cx);
+            }
+        }
+    }
+
+    fn schedule_resize_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.resize_frame_scheduled {
+            return;
+        }
+        self.resize_frame_scheduled = true;
+        cx.on_next_frame(window, |this, window, cx| {
+            this.resize_frame_scheduled = false;
+            this.tick_resize_animation(window, cx);
+        });
+    }
+
+    fn tick_resize_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() || self.results_resize_drag.is_some() {
+            self.resize_motion.cancel();
+            return;
+        }
+        let bounds = self.results_height_bounds(window);
+        let now = cx.background_executor().now();
+        let reduce_motion = cx.reduce_motion();
+        let step = self.resize_motion.advance_frame(
+            &mut self.results_height,
+            &mut self.target_results_height,
+            bounds,
+            now,
+            reduce_motion,
+        );
+        self.sync_focus_for_visibility(window, cx);
+        if step.keep_animating {
+            self.schedule_resize_frame(window, cx);
+        }
+        if step.changed || !step.keep_animating {
+            cx.notify();
+        }
+    }
+
+    fn resize_filter_height_keyboard(
+        &mut self,
+        direction: ResizeDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tabs.is_empty() {
+            self.resize_motion.cancel();
+            return;
+        }
+        let bounds = self.results_height_bounds(window);
+        let now = cx.background_executor().now();
+        let schedule = self.resize_motion.on_key_trigger(
+            direction,
+            self.results_height,
+            &mut self.target_results_height,
+            bounds,
+            now,
+        );
+        if cx.reduce_motion() {
+            self.results_height = self.target_results_height;
+            self.sync_focus_for_visibility(window, cx);
+        }
+        if schedule {
+            self.schedule_resize_frame(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn step_filter_height_click(
+        &mut self,
+        direction: ResizeDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let bounds = self.results_height_bounds(window);
+        let now = cx.background_executor().now();
+        self.resize_motion.step_once(
+            direction,
+            self.results_height,
+            &mut self.target_results_height,
+            bounds,
+            now,
+        );
+        if cx.reduce_motion() {
+            self.resize_motion.cancel();
+            self.results_height = self.target_results_height;
+            self.sync_focus_for_visibility(window, cx);
+        } else {
+            self.schedule_resize_frame(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn reset_filter_height(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.results_resize_drag = None;
+        let bounds = self.results_height_bounds(window);
+        let now = cx.background_executor().now();
+        self.resize_motion.animate_to(
+            self.config.window.results_height,
+            &mut self.target_results_height,
+            bounds,
+            now,
+        );
+        if cx.reduce_motion() {
+            self.resize_motion.cancel();
+            self.results_height = self.target_results_height;
+            self.sync_focus_for_visibility(window, cx);
+        } else {
+            self.schedule_resize_frame(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn handle_results_resize_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        self.drag_selecting = None;
+        self.scrollbar_drag = None;
+        self.show_presets = false;
+        if event.click_count >= 2 {
+            self.reset_filter_height(window, cx);
+            return;
+        }
+        self.resize_motion.cancel();
+        let start_height = self.effective_results_height(window);
+        self.results_height = start_height;
+        self.target_results_height = start_height;
+        self.results_resize_drag = Some(ResultsResizeDrag {
+            start_y: f32::from(event.position.y),
+            start_height,
+        });
+        cx.notify();
+    }
+
+    fn handle_results_resize_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.results_resize_drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.results_resize_drag = None;
+            cx.notify();
+            return;
+        }
+        let bounds = self.results_height_bounds(window);
+        let next = height_for_drag(drag, f32::from(event.position.y), bounds);
+        if (next - self.results_height).abs() >= 0.5
+            || (next - self.target_results_height).abs() >= 0.5
+        {
+            self.results_height = next;
+            self.target_results_height = next;
+            self.sync_focus_for_visibility(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn render_results_resize_sash(
+        &self,
+        main_hidden: bool,
+        results_hidden: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let t = &self.theme;
+        let dragging = self.results_resize_drag.is_some();
+        let active = dragging || self.resize_motion.is_animating();
+        let tip_theme = t.clone();
+        let tooltip_text = if main_hidden {
+            "Drag down or double-click to restore main log"
+        } else if results_hidden {
+            "Drag up or double-click to restore filter pane"
+        } else {
+            "Drag to resize filter pane · Double-click to reset"
+        };
+        let border_color = if active { t.accent } else { t.border };
+        let pill_color = if active {
+            t.accent
+        } else {
+            t.border.opacity(0.9)
+        };
+        let hover_border = t.accent;
+        let hover_pill = if active { t.accent } else { t.muted };
+
+        div()
+            .id("results-resize-sash")
+            .group("results-resize-sash")
+            .debug_selector(|| "results-resize-sash".into())
+            .h(px(RESIZE_SASH_HEIGHT))
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(t.panel)
+            .border_t_1()
+            .border_color(border_color)
+            .cursor_row_resize()
+            .hover(move |s| s.border_color(hover_border))
+            .child(
+                div()
+                    .w(px(36.))
+                    .h(px(3.))
+                    .rounded_full()
+                    .bg(pill_color)
+                    .group_hover("results-resize-sash", move |s| s.bg(hover_pill)),
+            )
+            .when(!dragging, |sash| {
+                sash.tooltip_show_delay(Duration::from_millis(450))
+                    .tooltip(move |_window, cx| {
+                        Tooltip::view(tooltip_text, None, tip_theme.clone(), cx)
+                    })
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.handle_results_resize_down(event, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
+    fn render_results_resize_button(
+        &self,
+        direction: ResizeDirection,
+        disabled: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (id, icon, tooltip, command) = match direction {
+            ResizeDirection::Grow => (
+                "results-grow",
+                Icon::PanelExpand,
+                "Make filter pane taller",
+                Command::IncreaseFilterHeight,
+            ),
+            ResizeDirection::Shrink => (
+                "results-shrink",
+                Icon::PanelShrink,
+                "Make filter pane shorter",
+                Command::DecreaseFilterHeight,
+            ),
+        };
+        let t = &self.theme;
+        let tip_theme = t.clone();
+        let shortcut = t.shortcut(command);
+        let fg = if disabled {
+            t.muted.opacity(0.35)
+        } else {
+            t.muted
+        };
+        let hover_bg = t.hover;
+        let hover_fg = t.foreground;
+
+        let mut btn = div()
+            .id(id)
+            .group(id)
+            .debug_selector(move || id.into())
+            .size(px(24.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .child(icon.element(ICON_XS, fg).when(!disabled, |el| {
+                el.group_hover(id, move |s| s.text_color(hover_fg))
+            }))
+            .tooltip_show_delay(TOOLTIP_DELAY)
+            .tooltip(move |_window, cx| {
+                Tooltip::view(tooltip, shortcut.clone(), tip_theme.clone(), cx)
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        if !disabled {
+            btn = btn
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.step_filter_height_click(direction, window, cx);
+                }));
+        }
+        btn
     }
 
     fn handle_scrollbar_press(
@@ -2826,8 +3273,7 @@ impl Workspace {
             .child(trigger);
 
         if is_open {
-            let viewport_h = f32::from(window.viewport_size().height);
-            let results_h = self.config.window.results_height.min(viewport_h * 0.45);
+            let results_h = self.effective_results_height(window);
             let status_h = if self.config.window.show_status_bar {
                 26.0
             } else {
@@ -3157,11 +3603,9 @@ impl Workspace {
         };
 
         let mut bar = div()
-            .h(px(48.))
+            .h(px(44.))
             .flex_shrink_0()
             .bg(t.panel)
-            .border_t_1()
-            .border_color(t.border)
             .px_3()
             .flex()
             .items_center()
@@ -3389,11 +3833,15 @@ impl Render for Workspace {
         let main_multi_selected = tab.is_some_and(|tab| tab.main_selection.has_multi_selection());
         let results_multi_selected =
             tab.is_some_and(|tab| tab.result_selection.has_multi_selection());
-        if line_count == 0 {
+        let (min_results_h, max_results_h) = self.results_height_bounds(window);
+        let effective_results_h = self.results_height.clamp(min_results_h, max_results_h);
+        let main_hidden = is_main_hidden(effective_results_h, max_results_h);
+        let results_hidden = is_results_hidden(effective_results_h);
+        if line_count == 0 || main_hidden {
             self.main_vscroll_state.clear();
             self.main_hscroll_state.clear();
         }
-        if result_count == 0 {
+        if result_count == 0 || results_hidden {
             self.results_vscroll_state.clear();
             self.results_hscroll_state.clear();
         }
@@ -3485,8 +3933,10 @@ impl Render for Workspace {
             );
 
             let source_pane = div()
+                .debug_selector(|| "source-pane".into())
                 .flex_1()
                 .min_h_0()
+                .overflow_hidden()
                 .flex()
                 .flex_col()
                 .child(
@@ -3562,6 +4012,9 @@ impl Render for Workspace {
                         }),
                 );
 
+            let at_max_results_h = main_hidden || effective_results_h >= max_results_h - 0.5;
+            let at_min_results_h = results_hidden || effective_results_h <= min_results_h + 0.5;
+
             let results_header =
                 div()
                     .h(px(30.))
@@ -3571,14 +4024,17 @@ impl Render for Workspace {
                     .items_center()
                     .justify_between()
                     .bg(t.panel)
-                    .border_y_1()
+                    .border_t_1()
+                    .when(!results_hidden, |el| el.border_b_1())
                     .border_color(t.border)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.focus_pane(Pane::Results, window, cx)
-                        }),
-                    )
+                    .when(!results_hidden, |el| {
+                        el.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.focus_pane(Pane::Results, window, cx)
+                            }),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
@@ -3642,25 +4098,53 @@ impl Render for Workspace {
                                 el.text_color(t.accent).child("Searching…")
                             }),
                     )
-                    .when(result_count > 0, |header| {
-                        header.child(
-                            self.cmd_icon(
-                                "export",
-                                Icon::Download,
-                                "Export results",
-                                Command::ExportResults,
-                                ButtonTone::Ghost,
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .flex_shrink_0()
+                            .child(self.render_results_resize_button(
+                                ResizeDirection::Grow,
+                                at_max_results_h,
                                 cx,
-                            )
-                            .size(px(24.)),
-                        )
-                    });
+                            ))
+                            .child(self.render_results_resize_button(
+                                ResizeDirection::Shrink,
+                                at_min_results_h,
+                                cx,
+                            ))
+                            .when(result_count > 0, |actions| {
+                                actions
+                                    .child(
+                                        div()
+                                            .w(px(1.))
+                                            .h(px(14.))
+                                            .mx_0p5()
+                                            .flex_shrink_0()
+                                            .bg(t.border),
+                                    )
+                                    .child(
+                                        self.cmd_icon(
+                                            "export",
+                                            Icon::Download,
+                                            "Export results",
+                                            Command::ExportResults,
+                                            ButtonTone::Ghost,
+                                            cx,
+                                        )
+                                        .size(px(24.)),
+                                    )
+                            }),
+                    );
 
             let results_body = div()
+                .debug_selector(|| "results-body".into())
                 .key_context("Log")
-                .h(px(self.config.window.results_height))
-                .max_h(relative(0.45))
-                .flex_shrink_0()
+                .when(main_hidden, |body| body.flex_1().min_h_0())
+                .when(!main_hidden, |body| {
+                    body.h(px(effective_results_h)).flex_shrink_0()
+                })
                 .w_full()
                 .flex()
                 .flex_col()
@@ -3743,19 +4227,32 @@ impl Render for Workspace {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(source_pane)
+                .when(!main_hidden, |area| area.child(source_pane))
+                .child(self.render_results_resize_sash(main_hidden, results_hidden, cx))
                 .child(self.render_search_bar(&options, window, cx))
                 .child(results_header)
-                .child(results_body)
+                .when(!results_hidden, |area| area.child(results_body))
         };
 
         div()
             .size_full()
+            .when(self.results_resize_drag.is_some(), |root| {
+                root.cursor_row_resize()
+            })
+            .capture_key_up(cx.listener(|this, _event: &KeyUpEvent, _window, _cx| {
+                this.resize_motion.release_hold();
+            }))
+            .on_modifiers_changed(cx.listener(
+                |this, _event: &ModifiersChangedEvent, _window, _cx| {
+                    this.resize_motion.release_hold();
+                },
+            ))
             .on_mouse_move_all({
                 let view = cx.entity().downgrade();
-                move |event: &MouseMoveEvent, phase, _hitbox, _window, cx| {
+                move |event: &MouseMoveEvent, phase, _hitbox, window, cx| {
                     if phase == DispatchPhase::Bubble {
                         let _ = view.update(cx, |this, cx| {
+                            this.handle_results_resize_move(event, window, cx);
                             this.handle_scrollbar_drag_move(event, cx);
                         });
                     }
@@ -3765,7 +4262,14 @@ impl Render for Workspace {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.drag_selecting = None;
+                    let mut changed = false;
                     if this.scrollbar_drag.take().is_some() {
+                        changed = true;
+                    }
+                    if this.results_resize_drag.take().is_some() {
+                        changed = true;
+                    }
+                    if changed {
                         cx.notify();
                     }
                 }),
@@ -3774,7 +4278,14 @@ impl Render for Workspace {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.drag_selecting = None;
+                    let mut changed = false;
                     if this.scrollbar_drag.take().is_some() {
+                        changed = true;
+                    }
+                    if this.results_resize_drag.take().is_some() {
+                        changed = true;
+                    }
+                    if changed {
                         cx.notify();
                     }
                 }),
@@ -5460,5 +5971,366 @@ mod tests {
             light_theme.match_highlight_bg,
             dark_theme.match_highlight_bg
         );
+    }
+
+    #[test]
+    fn formats_minus_and_shifted_minus_shortcuts_and_preserves_explicit_underscore_bindings() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(theme::format_shortcut("shift--"), "⇧-");
+            assert_eq!(theme::format_shortcut("alt--"), "⌥-");
+            assert_eq!(theme::format_shortcut("alt-shift--"), "⌥⇧-");
+            assert_eq!(theme::format_shortcut("secondary-alt-h"), "⌘⌥H");
+        } else {
+            assert_eq!(theme::format_shortcut("shift--"), "Shift+-");
+            assert_eq!(theme::format_shortcut("alt--"), "Alt+-");
+            assert_eq!(theme::format_shortcut("alt-shift--"), "Alt+Shift+-");
+            assert_eq!(theme::format_shortcut("secondary-alt-h"), "Ctrl+Alt+H");
+        }
+        assert_eq!(theme::format_shortcut("-"), "-");
+
+        // Default config adds an automatic `_` companion alias in Log context for `shift--`.
+        let default_config = Config::load(None).unwrap();
+        let default_bindings = keybindings(&default_config).unwrap();
+        let underscore = Keystroke::parse("_").unwrap();
+        assert!(default_bindings.iter().any(|b| {
+            b.keystrokes().len() == 1
+                && b.keystrokes()[0].inner() == &underscore
+                && b.action()
+                    .as_any()
+                    .downcast_ref::<Execute>()
+                    .is_some_and(|ex| ex.command == Command::DecreaseFilterHeight)
+        }));
+
+        // Explicit user binding on `_` in Log is not overwritten by the automatic alias.
+        let mut custom = default_config;
+        custom.keyboard.bindings.push(config::Binding {
+            keys: "_".into(),
+            context: config::KeyContext::Log,
+            action: Command::Reload,
+        });
+        let custom_bindings = keybindings(&custom).unwrap();
+        let matches: Vec<Command> = custom_bindings
+            .iter()
+            .filter(|b| b.keystrokes().len() == 1 && b.keystrokes()[0].inner() == &underscore)
+            .filter_map(|b| {
+                b.action()
+                    .as_any()
+                    .downcast_ref::<Execute>()
+                    .map(|e| e.command)
+            })
+            .collect();
+        assert_eq!(matches, vec![Command::Reload]);
+    }
+
+    #[gpui::test]
+    fn filter_pane_resizes_to_hide_either_pane_with_smooth_motion_and_log_context_shortcuts(
+        cx: &mut TestAppContext,
+    ) {
+        use resize::BASE_RESIZE_STEP;
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resize.log");
+        let content = (0..30)
+            .map(|i| {
+                if i % 3 == 0 {
+                    format!("ERROR line {i}\n")
+                } else {
+                    format!("INFO line {i}\n")
+                }
+            })
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let matches: Vec<usize> = (0..30).filter(|i| i % 3 == 0).collect();
+        let results = SearchResults {
+            matches: matches.clone(),
+            visible: matches,
+            limited: false,
+            widest_row: 0,
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "ERROR".into();
+            view.tabs[0].results = results;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let step_frame = |cx: &mut VisualTestContext, ms: u64| {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(ms));
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.run_until_parked();
+        };
+        let settle = |cx: &mut VisualTestContext| {
+            for _ in 0..45 {
+                step_frame(cx, 16);
+            }
+        };
+
+        // Check shortcut tooltip strings (`-` and `⇧-` / `Shift+-`) and initial bounds (`0..max_h`).
+        let expected_shrink = if cfg!(target_os = "macos") {
+            "⇧-"
+        } else {
+            "Shift+-"
+        };
+        let (min_h, max_h) = view.update_in(cx, |view, window, _| {
+            assert_eq!(view.results_height, 250.0);
+            assert_eq!(
+                view.theme
+                    .shortcut(Command::IncreaseFilterHeight)
+                    .as_deref(),
+                Some("-")
+            );
+            assert_eq!(
+                view.theme
+                    .shortcut(Command::DecreaseFilterHeight)
+                    .as_deref(),
+                Some(expected_shrink)
+            );
+            view.results_height_bounds(window)
+        });
+        assert_eq!(min_h, 0.0);
+        assert!(max_h > 400.0);
+        assert!(cx.debug_bounds("source-pane").is_some());
+        assert!(cx.debug_bounds("results-body").is_some());
+
+        // Dragging all the way to the top hides the main log pane and hands focus to the filter pane.
+        let sash = cx
+            .debug_bounds("results-resize-sash")
+            .expect("resize sash should render")
+            .center();
+        let drag_top = point(sash.x, px(0.0));
+        cx.simulate_mouse_down(sash, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(drag_top, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(drag_top, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, _| {
+            assert_eq!(view.results_height, max_h);
+            assert!(
+                view.results_focus.is_focused(window),
+                "hiding main pane should transfer focus to filter pane so Log shortcuts stay active"
+            );
+        });
+        assert!(
+            cx.debug_bounds("source-pane").is_none(),
+            "main source pane should be hidden at max height"
+        );
+        assert!(cx.debug_bounds("results-body").is_some());
+
+        // Pressing `shift--` while main is hidden smoothly restores the main pane.
+        let key_shift_minus = Keystroke::parse("shift--").unwrap();
+        cx.simulate_keystrokes("shift--");
+        cx.simulate_event(KeyUpEvent {
+            keystroke: key_shift_minus.clone(),
+        });
+        step_frame(cx, 16);
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.results_height < max_h && view.results_height > max_h - BASE_RESIZE_STEP,
+                "single press should interpolate smoothly rather than snapping immediately"
+            );
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.results_height, max_h - BASE_RESIZE_STEP);
+        });
+        assert!(cx.debug_bounds("source-pane").is_some());
+
+        // Dragging all the way to the bottom hides the filter pane and transfers focus to main pane.
+        let sash_mid = cx
+            .debug_bounds("results-resize-sash")
+            .expect("resize sash")
+            .center();
+        let drag_bottom = point(sash_mid.x, px(2000.0));
+        cx.simulate_mouse_down(sash_mid, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(drag_bottom, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(drag_bottom, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, _| {
+            assert_eq!(view.results_height, 0.0);
+            assert!(
+                view.focus.is_focused(window),
+                "hiding filter pane should transfer focus to main pane so Log shortcuts stay active"
+            );
+        });
+        assert!(
+            cx.debug_bounds("results-body").is_none(),
+            "filter body should be hidden at 0 height"
+        );
+        assert!(cx.debug_bounds("source-pane").is_some());
+
+        // When the filter pane is hidden, opening saved patterns flips the dropdown upward.
+        view.update_in(cx, |view, window, cx| view.toggle_presets(window, cx));
+        cx.run_until_parked();
+        let trigger = cx
+            .debug_bounds("presets-trigger")
+            .expect("presets trigger when hidden");
+        let menu = cx
+            .debug_bounds("presets-menu")
+            .expect("presets menu when hidden");
+        assert!(
+            menu.bottom() <= trigger.origin.y,
+            "presets menu ({menu:?}) should open upward above trigger ({trigger:?}) when filter pane is hidden"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // Double-clicking the split sash smoothly glides back to the configured default (250px).
+        let sash_bottom = cx
+            .debug_bounds("results-resize-sash")
+            .expect("sash when filter hidden")
+            .center();
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: sash_bottom,
+            modifiers: Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(sash_bottom, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        step_frame(cx, 16);
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.results_height > 0.0 && view.results_height < 250.0,
+                "double-click reset should transition smoothly across frames"
+            );
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.results_height, 250.0);
+            assert!(!view.resize_motion.is_animating());
+        });
+
+        // Header step buttons step cleanly without stealing focus.
+        let grow_btn = cx
+            .debug_bounds("results-grow")
+            .expect("grow button")
+            .center();
+        cx.simulate_click(grow_btn, Modifiers::none());
+        cx.run_until_parked();
+        settle(cx);
+        view.update_in(cx, |view, window, _| {
+            assert_eq!(view.results_height, 250.0 + BASE_RESIZE_STEP);
+            assert!(view.focus.is_focused(window));
+        });
+        let shrink_btn = cx
+            .debug_bounds("results-shrink")
+            .expect("shrink button")
+            .center();
+        cx.simulate_click(shrink_btn, Modifiers::none());
+        cx.run_until_parked();
+        settle(cx);
+        view.read_with(cx, |view, _| assert_eq!(view.results_height, 250.0));
+
+        // In Search and GoTo inputs, `-` and `_` type normally and NEVER resize the filter pane.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("err-code_42");
+        cx.run_until_parked();
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "err-code_42");
+            assert_eq!(view.results_height, 250.0);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // In Log context, `-` grows and native macOS `_` (Shift+-) shrinks cleanly.
+        let key_minus = Keystroke::parse("-").unwrap();
+        let key_macos_underscore = Keystroke {
+            modifiers: Modifiers::none(),
+            key: "_".into(),
+            key_char: Some("_".into()),
+        };
+        cx.simulate_keystrokes("-");
+        cx.simulate_event(KeyUpEvent {
+            keystroke: key_minus.clone(),
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.results_height, 250.0 + BASE_RESIZE_STEP);
+        });
+        cx.simulate_event(KeyDownEvent {
+            keystroke: key_macos_underscore.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent {
+            keystroke: key_macos_underscore,
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.results_height, 250.0);
+        });
+
+        // Sustained long press of `-` engages continuous smooth velocity-gradient glide.
+        cx.simulate_event(KeyDownEvent {
+            keystroke: key_minus.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        for _ in 0..15 {
+            step_frame(cx, 16);
+        }
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.resize_motion.is_long_pressing(),
+                "holding `-` past LONG_PRESS_DELAY should engage smooth long-press glide"
+            );
+        });
+        let h_early = view.read_with(cx, |view, _| view.results_height);
+        step_frame(cx, 16);
+        let early_frame_delta = view.read_with(cx, |view, _| view.results_height - h_early);
+        assert!(early_frame_delta > 0.5);
+
+        // Keep holding for ~400ms with OS repeat heartbeats: per-frame glide velocity accelerates.
+        for i in 0..24 {
+            if i % 3 == 0 {
+                cx.simulate_event(KeyDownEvent {
+                    keystroke: key_minus.clone(),
+                    is_held: true,
+                    prefer_character_input: false,
+                });
+            }
+            step_frame(cx, 16);
+        }
+        let h_late = view.read_with(cx, |view, _| view.results_height);
+        step_frame(cx, 16);
+        let late_frame_delta = view.read_with(cx, |view, _| view.results_height - h_late);
+        assert!(
+            late_frame_delta > early_frame_delta * 1.3,
+            "long-press velocity gradient should accelerate smoothly (early={early_frame_delta}, late={late_frame_delta})"
+        );
+
+        // Releasing the key stops the hold immediately and settles smoothly onto target.
+        cx.simulate_event(KeyUpEvent {
+            keystroke: key_minus,
+        });
+        view.read_with(cx, |view, _| {
+            assert!(!view.resize_motion.is_long_pressing());
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert!(!view.resize_motion.is_animating());
+            assert_eq!(view.results_height, view.target_results_height);
+        });
     }
 }

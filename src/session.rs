@@ -26,6 +26,8 @@ pub struct Session {
     pub active: usize,
     pub tabs: Vec<SavedTab>,
     pub recent: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results_height: Option<f32>,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -34,6 +36,7 @@ impl Default for Session {
             active: 0,
             tabs: Vec::new(),
             recent: Vec::new(),
+            results_height: None,
         }
     }
 }
@@ -49,6 +52,12 @@ impl Session {
             "Unsupported session version {}",
             state.version
         );
+        if let Some(height) = state.results_height {
+            ensure!(
+                height.is_finite() && (0.0..=4320.0).contains(&height),
+                "Invalid session results_height {height}"
+            );
+        }
         for tab in &state.tabs {
             let mut config = config.clone();
             config.search = tab.options.clone();

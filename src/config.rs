@@ -161,6 +161,8 @@ pub enum Command {
     SwapSelectionAnchor,
     TogglePresets,
     ApplyPreset,
+    IncreaseFilterHeight,
+    DecreaseFilterHeight,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 pub enum KeyContext {
