@@ -42,7 +42,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Log | - / shift-- | Make filter pane taller / shorter (smooth glide on long press) |
 | Selection | alt-o | Toggle selection anchor between top and bottom |
 | TextSelected | secondary-c | Copy selected text |
-| TextSelected | f | Insert selected text into search box (regex-escaped in Regex mode) and select it |
+| TextSelected | f | Insert selected text into search box (regex-escaped in Regex mode) and focus end |
 | TextSelected && RegexMode | a | Append regex-escaped selected text to search pattern with `\|` (or copy if empty) and focus end |
 | TextSelected | escape | Clear text selection |
 | Search | Enter / Escape | Apply search / focus log |

@@ -1422,7 +1422,7 @@ impl Workspace {
         self.show_presets = false;
         self.input.update(cx, |input, cx| {
             input.emplace(&text, cx);
-            input.select_document(cx);
+            input.move_to(text.len(), cx);
         });
         self.input.read(cx).focus_handle(cx).focus(window, cx);
     }
@@ -7405,7 +7405,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn f_in_text_selected_inserts_into_search_focuses_and_selects_all(cx: &mut TestAppContext) {
+    fn f_in_text_selected_inserts_into_search_focuses_and_places_caret_at_end(
+        cx: &mut TestAppContext,
+    ) {
         let mut config = Config::load(None).unwrap();
         config.files.save_session = false;
         config.files.restore_session = false;
@@ -7443,7 +7445,7 @@ mod tests {
             assert_eq!(view.input.read(cx).as_str(), "old");
         });
 
-        // Select "Hello" in main pane and press `f`: inserts into search box, focuses it, selects all.
+        // Select "Hello" in main pane and press `f`: inserts into search box, focuses it, places caret at end.
         view.update(cx, |view, cx| {
             view.tabs[0].main_text_selection = Some(TextSelection::new(
                 TextPosition::new(0, 5),
@@ -7461,18 +7463,20 @@ mod tests {
             );
             assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
             assert_eq!(view.input.read(cx).as_str(), "Hello");
+            let end = "Hello".encode_utf16().count();
             let sel = view
                 .input
                 .update(cx, |input, cx| input.selected_text_range(false, window, cx))
                 .expect("selection range");
-            assert_eq!(sel.range, 0.."Hello".encode_utf16().count());
+            assert_eq!(sel.range, end..end);
         });
 
-        // Typing immediately replaces the entire selected text in the search box.
+        // Typing immediately appends at the end (proving cursor is at end with no selection,
+        // and `f` in Search context types literal `f`).
         cx.simulate_input("f");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.input.read(cx).as_str(), "f");
+            assert_eq!(view.input.read(cx).as_str(), "Hellof");
         });
 
         // Works from Filter/Results pane too (select "Delta").
@@ -7490,11 +7494,12 @@ mod tests {
         view.update_in(cx, |view, window, cx| {
             assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
             assert_eq!(view.input.read(cx).as_str(), "Delta");
+            let end = "Delta".encode_utf16().count();
             let sel = view
                 .input
                 .update(cx, |input, cx| input.selected_text_range(false, window, cx))
                 .expect("selection range");
-            assert_eq!(sel.range, 0.."Delta".encode_utf16().count());
+            assert_eq!(sel.range, end..end);
         });
     }
 
@@ -7723,19 +7728,20 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // In Literal mode, `f` inserts the raw selected text without escaping.
+        // In Literal mode, `f` inserts the raw selected text without escaping and places the caret at the end.
         cx.simulate_keystrokes("f");
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.input.read(cx).as_str(), line);
+            let end = line.encode_utf16().count();
             let sel = view
                 .input
                 .update(cx, |input, cx| input.selected_text_range(false, window, cx))
                 .expect("selection range");
-            assert_eq!(sel.range, 0..line.encode_utf16().count());
+            assert_eq!(sel.range, end..end);
         });
 
-        // In Regex mode, `f` escapes regex metacharacters and selects the full escaped text.
+        // In Regex mode, `f` escapes regex metacharacters and places the caret at the end.
         let escaped = regex::escape(line);
         view.update_in(cx, |view, window, cx| {
             view.focus_pane(Pane::Main, window, cx);
@@ -7747,11 +7753,12 @@ mod tests {
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.input.read(cx).as_str(), escaped);
+            let end = escaped.encode_utf16().count();
             let sel = view
                 .input
                 .update(cx, |input, cx| input.selected_text_range(false, window, cx))
                 .expect("selection range");
-            assert_eq!(sel.range, 0..escaped.encode_utf16().count());
+            assert_eq!(sel.range, end..end);
             assert!(Regex::new(&escaped).unwrap().is_match(line));
         });
 
