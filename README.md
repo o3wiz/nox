@@ -42,6 +42,8 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Log | - / shift-- | Make filter pane taller / shorter (smooth glide on long press) |
 | Selection | alt-o | Toggle selection anchor between top and bottom |
 | TextSelected | secondary-c | Copy selected text |
+| TextSelected | f | Insert selected text into search box (regex-escaped in Regex mode) and select it |
+| TextSelected && RegexMode | a | Append regex-escaped selected text to search pattern with `\|` (or copy if empty) and focus end |
 | TextSelected | escape | Clear text selection |
 | Search | Enter / Escape | Apply search / focus log |
 | Search | secondary-alt-r | Toggle regular expression |
@@ -80,7 +82,7 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | `search.json` | Default search mode, case/word/inversion/match highlighting, context lines, match limit, named presets (pattern, mode, `highlight_match`) |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |
 | `files.json` | Startup paths, favorites, session restore/save, session path, recent-file limit |
-| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Selection`, `TextSelected`, `Search`, `GoTo`, or `Presets` contexts |
+| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Selection`, `TextSelected`, `TextSelected && RegexMode`, `RegexMode`, `Search`, `GoTo`, or `Presets` contexts |
 
 Each JSON file has a `$schema` link for editor completion and validation. Schemas are generated from the same Rust types used to deserialize configuration. Top-level properties are optional because files are overlays; objects inside replacement arrays require their fields. Additional semantic checks (for example regex syntax and shortcut conflicts) run in the application.
 

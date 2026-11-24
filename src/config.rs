@@ -148,6 +148,8 @@ pub enum Command {
     PreviousMatch,
     CopyLine,
     CopySelectedText,
+    SearchSelectedText,
+    AppendSelectedTextToSearch,
     Reload,
     GoToLine,
     ExportResults,
@@ -183,6 +185,9 @@ pub enum KeyContext {
     Log,
     Selection,
     TextSelected,
+    #[serde(rename = "TextSelected && RegexMode")]
+    TextSelectedRegexMode,
+    RegexMode,
     Search,
     GoTo,
     Presets,
@@ -194,9 +199,28 @@ impl KeyContext {
             Self::Log => "Log",
             Self::Selection => "Selection",
             Self::TextSelected => "TextSelected",
+            Self::TextSelectedRegexMode => "TextSelected && RegexMode",
+            Self::RegexMode => "RegexMode",
             Self::Search => "Search",
             Self::GoTo => "GoTo",
             Self::Presets => "Presets",
+        }
+    }
+
+    pub fn predicate(self) -> &'static str {
+        match self {
+            Self::TextSelectedRegexMode => "RegexMode > TextSelected",
+            other => other.as_str(),
+        }
+    }
+
+    pub fn specificity(self) -> u8 {
+        match self {
+            Self::Workspace => 0,
+            Self::RegexMode => 1,
+            Self::Log | Self::Search | Self::GoTo | Self::Presets => 0,
+            Self::Selection | Self::TextSelected => 1,
+            Self::TextSelectedRegexMode => 2,
         }
     }
 }

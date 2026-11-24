@@ -222,6 +222,16 @@
       "context": "TextSelected"
     },
     {
+      "keys": "f",
+      "action": "search_selected_text",
+      "context": "TextSelected"
+    },
+    {
+      "keys": "a",
+      "action": "append_selected_text_to_search",
+      "context": "TextSelected && RegexMode"
+    },
+    {
       "keys": "escape",
       "action": "clear_text_selection",
       "context": "TextSelected"

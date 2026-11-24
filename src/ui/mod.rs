@@ -63,7 +63,7 @@ pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
             Box::new(Execute {
                 command: binding.action,
             }),
-            Some(KeyBindingContextPredicate::parse(binding.context.as_str())?.into()),
+            Some(KeyBindingContextPredicate::parse(binding.context.predicate())?.into()),
             false,
             None,
             &DummyKeyboardMapper,
@@ -74,6 +74,10 @@ pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
         }
         parsed.push((binding, loaded));
     }
+
+    // Preserve user order within equal specificity while ensuring compound/mode contexts
+    // (such as `TextSelected && RegexMode` over `TextSelected`) always take precedence.
+    parsed.sort_by_key(|(binding, _)| binding.context.specificity());
 
     let mut out = Vec::with_capacity(parsed.len() + 2);
     for (binding, loaded) in parsed {
@@ -97,7 +101,9 @@ pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
                         Box::new(Execute {
                             command: binding.action,
                         }),
-                        Some(KeyBindingContextPredicate::parse(binding.context.as_str())?.into()),
+                        Some(
+                            KeyBindingContextPredicate::parse(binding.context.predicate())?.into(),
+                        ),
                         false,
                         None,
                         &DummyKeyboardMapper,
@@ -117,6 +123,20 @@ pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
         }
     }
     Ok(out)
+}
+
+fn sanitize_single_line_search_text(text: &str) -> String {
+    text.replace(['\r', '\n'], "")
+}
+
+fn append_regex_alternative(existing: &str, selected: &str) -> String {
+    if existing.is_empty() {
+        selected.to_owned()
+    } else if existing.ends_with('|') {
+        format!("{existing}{selected}")
+    } else {
+        format!("{existing}|{selected}")
+    }
 }
 
 const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
@@ -1305,20 +1325,14 @@ impl Workspace {
         }
     }
 
-    fn copy_selected_text(&mut self, pane: Pane, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active) else {
-            return;
-        };
-        let Some(log) = &tab.log else {
-            return;
-        };
-        let Some(selection) = tab.text_selection(pane) else {
-            return;
-        };
+    fn extract_selected_text(&self, pane: Pane) -> Option<Result<(String, usize), StatusMessage>> {
+        let tab = self.tabs.get(self.active)?;
+        let log = tab.log.as_ref()?;
+        let selection = tab.text_selection(pane)?;
         let (start, end) = selection.ordered();
         let max_display_chars = self.config.viewer.max_display_chars;
         let tab_width = self.config.viewer.tab_width;
-        let mut copied = String::new();
+        let mut extracted = String::new();
         let mut line_count = 0usize;
         for row in start.row..=end.row {
             let Some(line) = (match pane {
@@ -1328,7 +1342,7 @@ impl Workspace {
                 break;
             };
             if line_count > 0 {
-                copied.push('\n');
+                extracted.push('\n');
             }
             let (display_text, selectable_len, _) = format_display_line(
                 log,
@@ -1340,16 +1354,29 @@ impl Workspace {
             );
             let selectable = &display_text[..selectable_len];
             if let Some(range) = selection.byte_range_for_row(row, selectable) {
-                copied.push_str(&selectable[range]);
+                extracted.push_str(&selectable[range]);
             }
             line_count += 1;
-            if copied.len() as u64 > MAX_COPY_BYTES {
-                self.status = Some(StatusMessage::warning(
+            if extracted.len() as u64 > MAX_COPY_BYTES {
+                return Some(Err(StatusMessage::warning(
                     "Selection too large to copy (limit 64 MB)",
-                ));
-                return;
+                )));
             }
         }
+        Some(Ok((extracted, line_count)))
+    }
+
+    fn copy_selected_text(&mut self, pane: Pane, cx: &mut Context<Self>) {
+        let Some(result) = self.extract_selected_text(pane) else {
+            return;
+        };
+        let (copied, line_count) = match result {
+            Ok(extracted) => extracted,
+            Err(warning) => {
+                self.status = Some(warning);
+                return;
+            }
+        };
         let char_count = copied.chars().count();
         cx.write_to_clipboard(ClipboardItem::new_string(copied));
         self.status = Some(StatusMessage::success(if line_count > 1 {
@@ -1366,6 +1393,74 @@ impl Workspace {
                 if char_count == 1 { "char" } else { "chars" }
             )
         }));
+    }
+
+    fn search_selected_text(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(result) = self.extract_selected_text(pane) else {
+            return;
+        };
+        let selected = match result {
+            Ok((text, _)) => sanitize_single_line_search_text(&text),
+            Err(warning) => {
+                self.status = Some(warning);
+                return;
+            }
+        };
+        if selected.is_empty() {
+            return;
+        }
+        let regex_mode = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.options.mode == SearchMode::Regex);
+        let text = if regex_mode {
+            regex::escape(&selected)
+        } else {
+            selected
+        };
+        self.show_goto = false;
+        self.show_presets = false;
+        self.input.update(cx, |input, cx| {
+            input.emplace(&text, cx);
+            input.select_document(cx);
+        });
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    fn append_selected_text_to_search(
+        &mut self,
+        pane: Pane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.options.mode != SearchMode::Regex {
+            return;
+        }
+        let Some(result) = self.extract_selected_text(pane) else {
+            return;
+        };
+        let selected = match result {
+            Ok((text, _)) => sanitize_single_line_search_text(&text),
+            Err(warning) => {
+                self.status = Some(warning);
+                return;
+            }
+        };
+        if selected.is_empty() {
+            return;
+        }
+        let escaped = regex::escape(&selected);
+        let next = append_regex_alternative(self.input.read(cx).as_str(), &escaped);
+        self.show_goto = false;
+        self.show_presets = false;
+        self.input.update(cx, |input, cx| {
+            input.emplace(&next, cx);
+            input.move_to(next.len(), cx);
+        });
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
     }
 
     fn selected_text_label(&self, tab: &Tab, pane: Pane) -> Option<String> {
@@ -1884,6 +1979,16 @@ impl Workspace {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
                 self.copy_selected_text(pane, cx);
+            }
+            Command::SearchSelectedText => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                self.search_selected_text(pane, window, cx);
+            }
+            Command::AppendSelectedTextToSearch => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                self.append_selected_text_to_search(pane, window, cx);
             }
             Command::CopyLine => {
                 let pane = self.active_pane_for(window);
@@ -4272,6 +4377,7 @@ impl Render for Workspace {
             tab.is_some_and(|tab| tab.result_selection.has_multi_selection());
         let main_text_selected = tab.is_some_and(|tab| tab.has_text_selection(Pane::Main));
         let results_text_selected = tab.is_some_and(|tab| tab.has_text_selection(Pane::Results));
+        let regex_mode = tab.is_some_and(|tab| tab.options.mode == SearchMode::Regex);
         let (min_results_h, max_results_h) = self.results_height_bounds(window);
         let effective_results_h = self.results_height.clamp(min_results_h, max_results_h);
         let main_hidden = is_main_hidden(effective_results_h, max_results_h);
@@ -4772,7 +4878,11 @@ impl Render for Workspace {
             }))
             .flex()
             .flex_col()
-            .key_context("Workspace")
+            .key_context(if regex_mode {
+                "Workspace RegexMode"
+            } else {
+                "Workspace"
+            })
             .bg(t.background)
             .text_color(t.foreground)
             .font(t.ui_font_spec())
@@ -7282,6 +7392,411 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
+        });
+    }
+
+    #[gpui::test]
+    fn f_in_text_selected_inserts_into_search_focuses_and_selects_all(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("f-shortcut.log");
+        std::fs::write(&path, "INFO Hello World\nERROR Gamma Delta\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let results = SearchResults {
+            matches: vec![1],
+            visible: vec![1],
+            limited: false,
+            widest_row: 0,
+        };
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].results = results;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            view.input.update(cx, |input, cx| input.emplace("old", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Without text selection, `f` still toggles follow in Log context.
+        cx.simulate_keystrokes("f");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].follow);
+            assert_eq!(view.input.read(cx).as_str(), "old");
+        });
+
+        // Select "Hello" in main pane and press `f`: inserts into search box, focuses it, selects all.
+        view.update(cx, |view, cx| {
+            view.tabs[0].main_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 5),
+                TextPosition::new(0, 10),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("f");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.tabs[0].follow,
+                "TextSelected `f` must not toggle follow"
+            );
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "Hello");
+            let sel = view
+                .input
+                .update(cx, |input, cx| input.selected_text_range(false, window, cx))
+                .expect("selection range");
+            assert_eq!(sel.range, 0.."Hello".encode_utf16().count());
+        });
+
+        // Typing immediately replaces the entire selected text in the search box.
+        cx.simulate_input("f");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "f");
+        });
+
+        // Works from Filter/Results pane too (select "Delta").
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+            view.tabs[0].result_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 12),
+                TextPosition::new(0, 17),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("f");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "Delta");
+            let sel = view
+                .input
+                .update(cx, |input, cx| input.selected_text_range(false, window, cx))
+                .expect("selection range");
+            assert_eq!(sel.range, 0.."Delta".encode_utf16().count());
+        });
+    }
+
+    #[gpui::test]
+    fn a_in_text_selected_and_regex_mode_appends_or_copies_and_places_caret_at_end(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("a-shortcut.log");
+        std::fs::write(&path, "INFO Hello World\nERROR Gamma Delta\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let results = SearchResults {
+            matches: vec![1],
+            visible: vec![1],
+            limited: false,
+            widest_row: 0,
+        };
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].results = results;
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            view.tabs[0].main_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 11),
+                TextPosition::new(0, 16),
+            ));
+            view.input
+                .update(cx, |input, cx| input.emplace("Hello", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // In Literal mode, `a` does nothing even when text is selected.
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "Hello");
+        });
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.input.read(cx).focus_handle(cx).is_focused(window));
+        });
+
+        // In RegexMode with NO text selected, `a` does nothing.
+        view.update(cx, |view, cx| {
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.tabs[0].main_text_selection = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "Hello");
+            assert!(!view.input.read(cx).focus_handle(cx).is_focused(window));
+        });
+
+        // In RegexMode with "Hello" in search bar and "World" selected: becomes "Hello|World^".
+        view.update(cx, |view, cx| {
+            view.tabs[0].main_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 11),
+                TextPosition::new(0, 16),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "Hello|World");
+            let end = "Hello|World".encode_utf16().count();
+            let sel = view
+                .input
+                .update(cx, |input, cx| input.selected_text_range(false, window, cx))
+                .expect("selection range");
+            assert_eq!(sel.range, end..end);
+        });
+
+        // Typing immediately appends at the end (proving cursor is at end with no selection,
+        // and `a` in Search context types literal `a`).
+        cx.simulate_input("a");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "Hello|Worlda");
+        });
+
+        // When search bar is empty in RegexMode, `a` copies the selected text without leading `|`.
+        view.update_in(cx, |view, window, cx| {
+            view.input.update(cx, |input, cx| input.emplace("", cx));
+            view.focus_pane(Pane::Results, window, cx);
+            view.tabs[0].result_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 6),
+                TextPosition::new(0, 11),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "Gamma");
+            let end = "Gamma".encode_utf16().count();
+            let sel = view
+                .input
+                .update(cx, |input, cx| input.selected_text_range(false, window, cx))
+                .expect("selection range");
+            assert_eq!(sel.range, end..end);
+        });
+
+        // Trailing `|` does not produce `||`.
+        view.update_in(cx, |view, window, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("Gamma|", cx));
+            view.focus_pane(Pane::Results, window, cx);
+            view.tabs[0].result_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 12),
+                TextPosition::new(0, 17),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "Gamma|Delta");
+        });
+    }
+
+    #[gpui::test]
+    fn text_selected_regex_mode_context_precedence_is_independent_of_binding_order(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Intentionally register `TextSelected && RegexMode` BEFORE `TextSelected` for the same key.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "z".into(),
+            context: config::KeyContext::TextSelectedRegexMode,
+            action: Command::AppendSelectedTextToSearch,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "z".into(),
+            context: config::KeyContext::TextSelected,
+            action: Command::SearchSelectedText,
+        });
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("precedence.log");
+        std::fs::write(&path, "INFO World\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.tabs[0].main_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 5),
+                TextPosition::new(0, 10),
+            ));
+            view.input
+                .update(cx, |input, cx| input.emplace("Hello", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // In RegexMode, `TextSelected && RegexMode` wins over `TextSelected`.
+        cx.simulate_keystrokes("z");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "Hello|World");
+        });
+
+        // In Literal mode, `TextSelected` wins.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Main, window, cx);
+            view.tabs[0].options.mode = SearchMode::Literal;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("z");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "World");
+        });
+    }
+
+    #[gpui::test]
+    fn f_and_a_escape_regex_metacharacters_in_regex_mode_only(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("regex-escape.log");
+        let line = "[ERR] req(1.2)+$a|b";
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.tabs[0].main_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 0),
+                TextPosition::new(0, line.len()),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // In Literal mode, `f` inserts the raw selected text without escaping.
+        cx.simulate_keystrokes("f");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), line);
+            let sel = view
+                .input
+                .update(cx, |input, cx| input.selected_text_range(false, window, cx))
+                .expect("selection range");
+            assert_eq!(sel.range, 0..line.encode_utf16().count());
+        });
+
+        // In Regex mode, `f` escapes regex metacharacters and selects the full escaped text.
+        let escaped = regex::escape(line);
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Main, window, cx);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("f");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), escaped);
+            let sel = view
+                .input
+                .update(cx, |input, cx| input.selected_text_range(false, window, cx))
+                .expect("selection range");
+            assert_eq!(sel.range, 0..escaped.encode_utf16().count());
+            assert!(Regex::new(&escaped).unwrap().is_match(line));
+        });
+
+        // In Regex mode, `a` escapes when copying into an empty search box.
+        let part_a = "[ERR]";
+        let part_b = "req(1.2)+$a|b";
+        let escaped_a = regex::escape(part_a);
+        let escaped_b = regex::escape(part_b);
+        view.update_in(cx, |view, window, cx| {
+            view.input.update(cx, |input, cx| input.emplace("", cx));
+            view.focus_pane(Pane::Main, window, cx);
+            view.tabs[0].main_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 0),
+                TextPosition::new(0, part_a.len()),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), escaped_a);
+            let end = escaped_a.encode_utf16().count();
+            let sel = view
+                .input
+                .update(cx, |input, cx| input.selected_text_range(false, window, cx))
+                .expect("selection range");
+            assert_eq!(sel.range, end..end);
+        });
+
+        // In Regex mode, `a` escapes when appending after `|` and places the caret at the end.
+        let expected_combined = format!("{escaped_a}|{escaped_b}");
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Main, window, cx);
+            view.tabs[0].main_text_selection = Some(TextSelection::new(
+                TextPosition::new(0, 6),
+                TextPosition::new(0, line.len()),
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), expected_combined);
+            let end = expected_combined.encode_utf16().count();
+            let sel = view
+                .input
+                .update(cx, |input, cx| input.selected_text_range(false, window, cx))
+                .expect("selection range");
+            assert_eq!(sel.range, end..end);
+            let re = Regex::new(&expected_combined).unwrap();
+            assert!(re.is_match(part_a));
+            assert!(re.is_match(part_b));
         });
     }
 }
