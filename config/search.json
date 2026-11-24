@@ -4,6 +4,7 @@
   "case_sensitive": false,
   "whole_word": false,
   "invert": false,
+  "highlight_matches": true,
   "context_lines": 0,
   "max_results": 100000,
   "presets": [

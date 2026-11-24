@@ -102,6 +102,7 @@ struct Tab {
     revision: usize,
     query: String,
     options: SearchConfig,
+    highlight_regex: Option<Regex>,
     results: SearchResults,
     bookmarks: BTreeSet<usize>,
     selected: usize,
@@ -111,6 +112,16 @@ struct Tab {
     scroll: UniformListScrollHandle,
     result_scroll: UniformListScrollHandle,
     error: Option<String>,
+}
+
+impl Tab {
+    fn sync_highlight_regex(&mut self) {
+        self.highlight_regex = if self.query.is_empty() || self.options.invert {
+            None
+        } else {
+            search::compile(&self.query, &self.options).ok()
+        };
+    }
 }
 
 impl Drop for Tab {
@@ -318,6 +329,7 @@ impl Workspace {
             for (tab, saved) in this.tabs.iter_mut().zip(saved.tabs) {
                 tab.query = saved.query;
                 tab.options = saved.options;
+                tab.sync_highlight_regex();
                 tab.bookmarks = saved.bookmarks;
                 tab.selected = saved.selected;
                 tab.main_selection = LineSelection::single(saved.selected);
@@ -397,6 +409,7 @@ impl Workspace {
             revision: 0,
             query: String::new(),
             options: self.config.search.clone(),
+            highlight_regex: None,
             results: SearchResults::default(),
             bookmarks: BTreeSet::new(),
             selected: 0,
@@ -507,6 +520,7 @@ impl Workspace {
         if index == self.active {
             tab.query = self.input.read(cx).as_str().to_string();
         }
+        tab.sync_highlight_regex();
         tab.search_cancel.store(true, Ordering::Relaxed);
         tab.search_cancel = Arc::new(AtomicBool::new(false));
         tab.revision += 1;
@@ -590,6 +604,7 @@ impl Workspace {
         tab.searching_visible = false;
         match result {
             Ok(mut results) => {
+                tab.sync_highlight_regex();
                 if include_bookmarks && let Some(log) = &tab.log {
                     let (visible, widest_row) = search::visible_rows(
                         log,
@@ -613,6 +628,7 @@ impl Workspace {
             }
             Err(error) => {
                 tab.error = Some(error);
+                tab.highlight_regex = None;
                 tab.results = SearchResults::default();
                 tab.result_selection = LineSelection::empty();
             }
@@ -1317,6 +1333,11 @@ impl Workspace {
                     self.start_search(self.active, cx);
                 }
             }
+            Command::ToggleHighlightMatches => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.options.highlight_matches = !tab.options.highlight_matches;
+                }
+            }
             Command::CloseTab => {
                 let index = self.active;
                 self.close_tab_at(index, cx);
@@ -1850,6 +1871,14 @@ impl Workspace {
         let pane = if results { Pane::Results } else { Pane::Main };
         let pane_focused = self.active_pane_for(window) == pane;
         let t = self.theme.clone();
+        let highlight_regex = if tab.options.highlight_matches && !tab.options.invert {
+            tab.highlight_regex.as_ref()
+        } else {
+            None
+        };
+        let search_mode = tab.options.mode;
+        let max_display_chars = self.config.viewer.max_display_chars;
+        let tab_width = self.config.viewer.tab_width;
         range
             .filter_map(|row| {
                 let line = if results {
@@ -1857,24 +1886,52 @@ impl Workspace {
                 } else {
                     row
                 };
-                let text = log
-                    .line(line, self.config.viewer.max_display_chars.saturating_mul(4))
-                    .unwrap_or_else(|e| format!("Read error: {e}"));
-                let mut chars = text.chars();
-                let mut text: String = chars
-                    .by_ref()
-                    .take(self.config.viewer.max_display_chars)
-                    .collect();
-                if chars.next().is_some() {
-                    text.push_str(" … [truncated]");
-                }
-                let text = text.replace('\t', &" ".repeat(self.config.viewer.tab_width));
+                let (text, highlight_ranges) =
+                    match log.line(line, max_display_chars.saturating_mul(4)) {
+                        Ok(raw) => {
+                            let mut chars = raw.chars();
+                            let display_source: String =
+                                chars.by_ref().take(max_display_chars).collect();
+                            let truncated = chars.next().is_some();
+                            let raw_ranges = highlight_regex
+                                .map(|regex| {
+                                    search::highlight_ranges(&display_source, regex, search_mode)
+                                })
+                                .unwrap_or_default();
+                            let (mut text, mapped_ranges) = search::expand_tabs_with_highlights(
+                                &display_source,
+                                &raw_ranges,
+                                tab_width,
+                            );
+                            if truncated {
+                                text.push_str(" … [truncated]");
+                            }
+                            (text, mapped_ranges)
+                        }
+                        Err(e) => (format!("Read error: {e}"), Vec::new()),
+                    };
                 let text_color: Hsla = self
                     .highlights
                     .iter()
                     .find(|(pattern, _)| pattern.is_match(&text))
                     .map(|(_, color)| rgb_to_hsla(rgb(*color)))
                     .unwrap_or(t.foreground);
+                let line_content: AnyElement = if highlight_ranges.is_empty() {
+                    text.into_any_element()
+                } else {
+                    let match_style = HighlightStyle {
+                        background_color: Some(t.match_highlight_bg),
+                        color: Some(t.match_highlight_fg),
+                        ..Default::default()
+                    };
+                    StyledText::new(text)
+                        .with_highlights(
+                            highlight_ranges
+                                .into_iter()
+                                .map(|range| (range, match_style)),
+                        )
+                        .into_any_element()
+                };
                 let selection = if results {
                     &tab.result_selection
                 } else {
@@ -1970,7 +2027,7 @@ impl Workspace {
                                     .child(format!("{}", line + 1)),
                             )
                         })
-                        .child(div().pr_4().child(text))
+                        .child(div().pr_4().child(line_content))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -3086,6 +3143,19 @@ impl Workspace {
                     })),
                 );
 
+        let highlight_tooltip = if options.highlight_matches && options.invert {
+            "Highlight matches (paused while excluding)"
+        } else if options.highlight_matches {
+            "Highlighting matches"
+        } else {
+            "Highlight matches"
+        };
+        let highlight_tone = if options.highlight_matches && !options.invert {
+            ButtonTone::Active
+        } else {
+            ButtonTone::Ghost
+        };
+
         let mut bar = div()
             .h(px(48.))
             .flex_shrink_0()
@@ -3096,6 +3166,17 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_2()
+            .child(
+                self.cmd_icon(
+                    "highlight-matches",
+                    Icon::Highlighter,
+                    highlight_tooltip,
+                    Command::ToggleHighlightMatches,
+                    highlight_tone,
+                    cx,
+                )
+                .debug_selector(|| "highlight-matches".into()),
+            )
             .child(search_box)
             .child(self.cmd_icon(
                 "prev-match",
@@ -5178,5 +5259,206 @@ mod tests {
                 "expected results pane vertical scroll, got {offset_y}"
             );
         });
+    }
+
+    #[gpui::test]
+    fn match_highlighting_toggle_sits_on_left_and_renders_regex_groups_and_literals(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.max_display_chars = 64;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("highlights.log");
+        std::fs::write(
+            &path,
+            "INFO\tuser=alice\tlatency=124ms\nERROR\t(job #7842)\tשלום\t世界\nWARN\tlong line truncated suffix check 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let highlight_key = if cfg!(target_os = "macos") {
+            "cmd-alt-h"
+        } else {
+            "ctrl-alt-h"
+        };
+        let expected_shortcut = if cfg!(target_os = "macos") {
+            "⌘⌥H"
+        } else {
+            "Ctrl+Alt+H"
+        };
+
+        // Highlighting starts enabled, registers its shortcut, and sits to the left of the search input.
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].options.highlight_matches);
+            assert!(view.tabs[0].highlight_regex.is_none());
+            assert_eq!(
+                view.theme
+                    .shortcut(Command::ToggleHighlightMatches)
+                    .as_deref(),
+                Some(expected_shortcut)
+            );
+        });
+        let toggle_bounds = cx
+            .debug_bounds("highlight-matches")
+            .expect("highlight toggle should be rendered");
+        let search_bounds = cx
+            .debug_bounds("search-input")
+            .expect("search input should be rendered");
+        assert!(
+            toggle_bounds.right() <= search_bounds.origin.x,
+            "highlight toggle ({toggle_bounds:?}) should sit on the left side of the search bar before search input ({search_bounds:?})"
+        );
+
+        // Run a regex search with capturing groups: regex compiles and renders both panes cleanly.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.simulate_input(r"user=(\w+)\tlatency=(\d+ms)");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            let regex = view.tabs[0]
+                .highlight_regex
+                .as_ref()
+                .expect("compiled regex should be cached");
+            assert_eq!(regex.captures_len(), 3);
+        });
+        cx.refresh().unwrap();
+
+        // Clicking the left-side toggle disables highlighting without re-running search or altering unsubmitted text.
+        cx.simulate_input(" unsubmitted");
+        cx.simulate_click(toggle_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.tabs[0].options.highlight_matches);
+            assert!(!view.tabs[0].searching);
+            assert_eq!(
+                view.input.read(cx).as_str(),
+                r"user=(\w+)\tlatency=(\d+ms) unsubmitted"
+            );
+            assert_eq!(view.tabs[0].query, r"user=(\w+)\tlatency=(\d+ms)");
+        });
+        let toggle_after = cx
+            .debug_bounds("highlight-matches")
+            .expect("highlight toggle should remain rendered");
+        assert_eq!(toggle_after.size, toggle_bounds.size);
+        assert_eq!(toggle_after.origin, toggle_bounds.origin);
+
+        // Keyboard shortcut toggles highlighting back on from both Search and Log focus.
+        cx.simulate_keystrokes(highlight_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes(highlight_key);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, _| {
+            assert!(view.focus.is_focused(window));
+            assert!(!view.tabs[0].options.highlight_matches);
+        });
+        cx.simulate_keystrokes(highlight_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+
+        // Literal mode with regex metacharacters highlights the literal substring cleanly.
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.input
+                .update(cx, |input, cx| input.emplace("(job #7842)", cx));
+            view.start_search(0, cx);
+            let _ = window;
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+            assert!(view.tabs[0].highlight_regex.is_some());
+        });
+
+        // Nested capture groups and invalid regexes never panic.
+        view.update_in(cx, |view, _window, cx| {
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.input
+                .update(cx, |input, cx| input.emplace(r"(user=(\w+))", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert!(view.tabs[0].highlight_regex.is_some());
+        });
+
+        // Exclude matches pauses highlighting (clears active highlight regex) while preserving user preference.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleInvert, window, cx);
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].options.invert);
+            assert!(view.tabs[0].options.highlight_matches);
+            assert!(view.tabs[0].highlight_regex.is_none());
+        });
+
+        // Turning Exclude matches off restores highlighting automatically.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleInvert, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].options.invert);
+            assert!(view.tabs[0].highlight_regex.is_some());
+        });
+
+        // Invalid regex clears highlight regex without panicking.
+        view.update_in(cx, |view, _window, cx| {
+            view.input.update(cx, |input, cx| input.emplace("[", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].error.is_some());
+            assert!(view.tabs[0].highlight_regex.is_none());
+        });
+    }
+
+    #[test]
+    fn theme_derives_accessible_match_highlight_tokens_for_dark_and_light_backgrounds() {
+        let dark_config = Config::load(None).unwrap();
+        let dark_theme = Theme::from_config_with_fonts(&dark_config, &[]);
+        assert_ne!(dark_theme.match_highlight_bg, dark_theme.match_highlight_fg);
+        assert_ne!(dark_theme.match_highlight_bg, dark_theme.background);
+        assert_ne!(dark_theme.match_highlight_bg, dark_theme.selection);
+
+        let mut light_config = dark_config;
+        light_config.appearance.background = "#FFFFFF".into();
+        let light_theme = Theme::from_config_with_fonts(&light_config, &[]);
+        assert_ne!(
+            light_theme.match_highlight_bg,
+            light_theme.match_highlight_fg
+        );
+        assert_ne!(
+            light_theme.match_highlight_bg,
+            dark_theme.match_highlight_bg
+        );
     }
 }

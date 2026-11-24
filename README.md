@@ -13,7 +13,7 @@ Requires a Rust toolchain supporting edition 2024 and the native build prerequis
 
 ## Using the viewer
 
-Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar. Open saved patterns from the **Patterns** dropdown (or **⌘P** / **Ctrl+P**), navigate with **↑**/**↓** (**Home**/**End**), and press **Enter** or click an item to apply it immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
+Open files with the folder icon (**⌘O** / **Ctrl+O**), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar, and toggle search match background highlighting from the highlighter icon on the left side of the search bar (or **⌘⌥H** / **Ctrl+Alt+H**). In regex mode, highlighting emphasizes only capturing groups when present (or the full match if there are none); in literal mode, it highlights the matched literal text across both panes. Open saved patterns from the **Patterns** dropdown (or **⌘P** / **Ctrl+P**), navigate with **↑**/**↓** (**Home**/**End**), and press **Enter** or click an item to apply it immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
 
 Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Alt+O** / **⌥O** flips the selection anchor between the top and bottom ends, and **Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
@@ -27,6 +27,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Workspace | ctrl-tab | Next tab |
 | Workspace | secondary-f / secondary-l | Focus search / go to line |
 | Workspace | secondary-p | Toggle saved patterns dropdown |
+| Workspace | secondary-alt-h | Toggle search match highlighting |
 | Workspace | secondary-r / secondary-e | Reload / export results |
 | Workspace | F3 / shift-F3 | Next / previous match |
 | Workspace | secondary-q | Quit |
@@ -73,7 +74,7 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | `window.json` | Title, initial dimensions/maximized state, results-pane height, status bar |
 | `appearance.json` | UI sans-serif & monospace font families/sizes and semantic colors (`#RRGGBB`) |
 | `viewer.json` | Line numbers/height, match overview visibility/width, tab expansion, display character limit, following, bookmark inclusion, polling interval |
-| `search.json` | Default search mode, case/word/inversion, context lines, match limit, named presets |
+| `search.json` | Default search mode, case/word/inversion/match highlighting, context lines, match limit, named presets |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |
 | `files.json` | Startup paths, favorites, session restore/save, session path, recent-file limit |
 | `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Selection`, `Search`, `GoTo`, or `Presets` contexts |

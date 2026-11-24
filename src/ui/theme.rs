@@ -70,6 +70,8 @@ pub struct Theme {
     pub danger: Hsla,
     pub danger_subtle: Hsla,
     pub warning: Hsla,
+    pub match_highlight_bg: Hsla,
+    pub match_highlight_fg: Hsla,
 
     pub shortcuts: HashMap<Command, SharedString>,
 }
@@ -111,6 +113,13 @@ impl Theme {
         let danger = rgb_to_hsla(rgb(danger_hex));
         let danger_subtle = mix_hex(panel_hex, danger_hex, 0.14);
         let warning = rgb_to_hsla(rgb(warning_hex));
+        let match_highlight_hex = if relative_luminance(bg_hex) > 0.45 {
+            0xF5C542
+        } else {
+            0xE0AF4B
+        };
+        let match_highlight_bg = rgb_to_hsla(rgb(match_highlight_hex));
+        let match_highlight_fg = contrast_ink(match_highlight_hex);
 
         let ui_font = resolve_font(&a.ui_font_family, UI_FONT_PREFERENCES, installed_fonts);
         let mono_font = resolve_font(&a.font_family, MONO_FONT_PREFERENCES, installed_fonts);
@@ -150,6 +159,8 @@ impl Theme {
             danger,
             danger_subtle,
             warning,
+            match_highlight_bg,
+            match_highlight_fg,
             shortcuts,
         }
     }
@@ -240,13 +251,25 @@ fn mix_hex(base: u32, over: u32, alpha: f32) -> Hsla {
     rgb_to_hsla(rgb((r << 16) | (g << 8) | b))
 }
 
+/// Computes WCAG 2.1 sRGB relative luminance in `0.0..=1.0`.
+fn relative_luminance(hex: u32) -> f32 {
+    let linear = |channel: u32| {
+        let s = channel as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let r = linear((hex >> 16) & 0xFF);
+    let g = linear((hex >> 8) & 0xFF);
+    let b = linear(hex & 0xFF);
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
 /// Picks dark or light ink with strong WCAG contrast on top of an accent fill.
 fn contrast_ink(hex: u32) -> Hsla {
-    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
-    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
-    let b = (hex & 0xFF) as f32 / 255.0;
-    let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    if luminance > 0.45 {
+    if relative_luminance(hex) > 0.35 {
         rgb_to_hsla(rgb(0x0B1016))
     } else {
         rgb_to_hsla(rgb(0xF8FAFC))

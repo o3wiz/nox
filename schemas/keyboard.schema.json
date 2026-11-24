@@ -57,6 +57,7 @@
         "toggle_case_sensitive",
         "toggle_whole_word",
         "toggle_invert",
+        "toggle_highlight_matches",
         "focus_search",
         "focus_log",
         "toggle_follow",

@@ -27,6 +27,11 @@
       "context": "Workspace"
     },
     {
+      "keys": "secondary-alt-h",
+      "action": "toggle_highlight_matches",
+      "context": "Workspace"
+    },
+    {
       "keys": "secondary-l",
       "action": "go_to_line",
       "context": "Workspace"

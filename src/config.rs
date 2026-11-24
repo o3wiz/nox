@@ -73,6 +73,10 @@ pub struct Preset {
     pub pattern: String,
     pub mode: SearchMode,
 }
+fn default_highlight_matches() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
@@ -80,6 +84,8 @@ pub struct SearchConfig {
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub invert: bool,
+    #[serde(default = "default_highlight_matches")]
+    pub highlight_matches: bool,
     #[schemars(range(min = 0, max = 100))]
     pub context_lines: usize,
     #[schemars(range(min = 1, max = 10000000))]
@@ -122,6 +128,7 @@ pub enum Command {
     ToggleCaseSensitive,
     ToggleWholeWord,
     ToggleInvert,
+    ToggleHighlightMatches,
     FocusSearch,
     FocusLog,
     ToggleFollow,

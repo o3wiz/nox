@@ -22,6 +22,7 @@ pub enum Icon {
     CaseSensitive,
     WholeWord,
     InvertMatch,
+    Highlighter,
     ChevronUp,
     ChevronDown,
     ArrowRight,
@@ -53,6 +54,7 @@ impl Icon {
         Icon::CaseSensitive,
         Icon::WholeWord,
         Icon::InvertMatch,
+        Icon::Highlighter,
         Icon::ChevronUp,
         Icon::ChevronDown,
         Icon::ArrowRight,
@@ -99,6 +101,8 @@ impl Icon {
             Icon::WholeWord => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16v2.5h16V16"/><path d="M5.5 13 8 6.5l2.5 6.5"/><line x1="6.4" y1="10.8" x2="9.6" y2="10.8"/><path d="M13.5 6.5V13"/><path d="M13.5 10.2a2.4 2.4 0 1 1 0 2.8"/></svg>"##,
 
             Icon::InvertMatch => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><line x1="6.2" y1="17.8" x2="17.8" y2="6.2"/></svg>"##,
+
+            Icon::Highlighter => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3.5 20.5 9 12 17.5 6.5 12 15 3.5Z"/><path d="M6.5 12 4 17.5 6.5 20 12 17.5"/><line x1="6.5" y1="20" x2="20" y2="20"/></svg>"##,
 
             Icon::ChevronUp => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6.5 14.5 12 9 17.5 14.5"/></svg>"##,
 

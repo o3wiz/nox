@@ -233,6 +233,73 @@ fn session_saves_atomically_restores_and_rejects_unknown_versions() {
 }
 
 #[test]
+fn legacy_session_without_highlight_matches_defaults_to_enabled() {
+    use nox::session::{SavedTab, Session};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state/legacy-session.json");
+    let config = Config::load(None).unwrap();
+    let session = Session {
+        version: 1,
+        active: 0,
+        recent: Vec::new(),
+        tabs: vec![SavedTab {
+            path: "app.log".into(),
+            query: "ERROR".into(),
+            options: config.search.clone(),
+            bookmarks: BTreeSet::new(),
+            selected: 0,
+            follow: false,
+        }],
+    };
+    let mut legacy = serde_json::to_value(&session).unwrap();
+    legacy["tabs"][0]["options"]
+        .as_object_mut()
+        .unwrap()
+        .remove("highlight_matches");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+    let restored = Session::load(&path, &config).unwrap();
+    assert!(restored.tabs[0].options.highlight_matches);
+}
+
+#[test]
+fn search_highlight_ranges_cover_regex_groups_full_patterns_and_literals() {
+    let mut options = Config::load(None).unwrap().search;
+    options.mode = SearchMode::Regex;
+    let grouped = search::compile(r"job #(\d+).*in (\d+ms)", &options).unwrap();
+    let line = "INFO worker Completed job #7842 in 908ms";
+    let ranges = search::highlight_ranges(line, &grouped, options.mode);
+    assert_eq!(
+        ranges.iter().map(|r| &line[r.clone()]).collect::<Vec<_>>(),
+        vec!["7842", "908ms"]
+    );
+
+    let ungrouped = search::compile(r"ERROR|WARN", &options).unwrap();
+    let line2 = "2026 ERROR and WARN";
+    let ranges2 = search::highlight_ranges(line2, &ungrouped, options.mode);
+    assert_eq!(
+        ranges2
+            .iter()
+            .map(|r| &line2[r.clone()])
+            .collect::<Vec<_>>(),
+        vec!["ERROR", "WARN"]
+    );
+
+    options.mode = SearchMode::Literal;
+    let literal = search::compile("(attempt 2/3)", &options).unwrap();
+    let line3 = "Retrying job #7842 (attempt 2/3)";
+    let ranges3 = search::highlight_ranges(line3, &literal, options.mode);
+    assert_eq!(
+        ranges3
+            .iter()
+            .map(|r| &line3[r.clone()])
+            .collect::<Vec<_>>(),
+        vec!["(attempt 2/3)"]
+    );
+}
+
+#[test]
 fn rotation_to_a_larger_file_is_recognized_as_replacement() {
     let (dir, old) = indexed(b"small\n");
     let path = dir.path().join("test.log");

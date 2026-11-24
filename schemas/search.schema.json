@@ -15,6 +15,10 @@
     "invert": {
       "type": "boolean"
     },
+    "highlight_matches": {
+      "type": "boolean",
+      "default": true
+    },
     "context_lines": {
       "type": "integer",
       "format": "uint",
