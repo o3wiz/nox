@@ -1,5 +1,6 @@
 mod components;
 mod icons;
+mod scrollbar;
 mod theme;
 
 use components::{
@@ -21,6 +22,10 @@ use nox::{
     session::{self, SavedTab, Session},
 };
 use regex::Regex;
+use scrollbar::{
+    DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, ScrollAxis, ScrollbarTrackState,
+    resolve_track_press, scroll_offset_for_drag, scrollbar_canvas, set_uniform_list_axis_offset,
+};
 use serde::Deserialize;
 use std::{
     cell::Cell,
@@ -70,6 +75,18 @@ const SEARCH_INDICATOR_DELAY: Duration = Duration::from_millis(150);
 enum Pane {
     Main,
     Results,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollbarId {
+    pane: Pane,
+    axis: ScrollAxis,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarDrag {
+    id: ScrollbarId,
+    grab_offset: f32,
 }
 
 struct Tab {
@@ -171,6 +188,11 @@ pub struct Workspace {
     results_focus: FocusHandle,
     active_pane: Pane,
     drag_selecting: Option<Pane>,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    main_vscroll_state: ScrollbarTrackState,
+    main_hscroll_state: ScrollbarTrackState,
+    results_vscroll_state: ScrollbarTrackState,
+    results_hscroll_state: ScrollbarTrackState,
     sender: Sender<Message>,
     receiver: Receiver<Message>,
     last_poll: Instant,
@@ -270,6 +292,11 @@ impl Workspace {
             results_focus,
             active_pane: Pane::Main,
             drag_selecting: None,
+            scrollbar_drag: None,
+            main_vscroll_state: ScrollbarTrackState::new(),
+            main_hscroll_state: ScrollbarTrackState::new(),
+            results_vscroll_state: ScrollbarTrackState::new(),
+            results_hscroll_state: ScrollbarTrackState::new(),
             sender,
             receiver,
             last_poll: Instant::now(),
@@ -391,6 +418,8 @@ impl Workspace {
         }
         self.active = index;
         self.drag_selecting = None;
+        self.scrollbar_drag = None;
+        self.clear_scrollbar_states();
         self.show_presets = false;
         let query = self
             .tabs
@@ -411,6 +440,8 @@ impl Workspace {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.drag_selecting = None;
+        self.scrollbar_drag = None;
+        self.clear_scrollbar_states();
         self.show_presets = false;
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -1559,16 +1590,110 @@ impl Workspace {
         .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
     }
 
-    fn overview(&self, cx: &Context<Self>) -> Div {
+    fn scrollbar_state(&self, id: ScrollbarId) -> &ScrollbarTrackState {
+        match (id.pane, id.axis) {
+            (Pane::Main, ScrollAxis::Vertical) => &self.main_vscroll_state,
+            (Pane::Main, ScrollAxis::Horizontal) => &self.main_hscroll_state,
+            (Pane::Results, ScrollAxis::Vertical) => &self.results_vscroll_state,
+            (Pane::Results, ScrollAxis::Horizontal) => &self.results_hscroll_state,
+        }
+    }
+
+    fn clear_scrollbar_states(&self) {
+        self.main_vscroll_state.clear();
+        self.main_hscroll_state.clear();
+        self.results_vscroll_state.clear();
+        self.results_hscroll_state.clear();
+    }
+
+    fn overview_lane_width(&self) -> f32 {
+        (self.config.viewer.overview_width * 0.5).clamp(6.0, 24.0)
+    }
+
+    fn main_rail_width(&self) -> f32 {
+        if self.config.viewer.show_overview {
+            self.overview_lane_width() + DEFAULT_SCROLLBAR_WIDTH
+        } else {
+            DEFAULT_SCROLLBAR_WIDTH
+        }
+    }
+
+    fn handle_scrollbar_press(
+        &mut self,
+        id: ScrollbarId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(layout) = self.scrollbar_state(id).layout() else {
+            return;
+        };
+        self.active_pane = id.pane;
+        self.show_goto = false;
+        self.show_presets = false;
+        match id.pane {
+            Pane::Main => self.focus.focus(window, cx),
+            Pane::Results => self.results_focus.focus(window, cx),
+        }
+        let press = resolve_track_press(layout, id.axis, position);
+        self.drag_selecting = None;
+        self.scrollbar_drag = Some(ScrollbarDrag {
+            id,
+            grab_offset: press.grab_offset,
+        });
+        if let Some(offset) = press.jump_to
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            let handle = match id.pane {
+                Pane::Main => &tab.scroll,
+                Pane::Results => &tab.result_scroll,
+            };
+            set_uniform_list_axis_offset(handle, id.axis, offset);
+            if id.pane == Pane::Main && id.axis == ScrollAxis::Vertical {
+                tab.follow = false;
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_scrollbar_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.scrollbar_drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.scrollbar_drag = None;
+            cx.notify();
+            return;
+        }
+        let Some(layout) = self.scrollbar_state(drag.id).layout() else {
+            return;
+        };
+        let offset = scroll_offset_for_drag(layout, drag.id.axis, event.position, drag.grab_offset);
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            let handle = match drag.id.pane {
+                Pane::Main => &tab.scroll,
+                Pane::Results => &tab.result_scroll,
+            };
+            set_uniform_list_axis_offset(handle, drag.id.axis, offset);
+            if drag.id.pane == Pane::Main && drag.id.axis == ScrollAxis::Vertical {
+                tab.follow = false;
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_overview_lane(&self, cx: &Context<Self>) -> Div {
         let t = &self.theme;
-        let mut overview = div()
+        let mut lane = div()
+            .debug_selector(|| "main-overview".into())
             .relative()
             .h_full()
-            .w(px(self.config.viewer.overview_width))
+            .w(px(self.overview_lane_width()))
             .flex_shrink_0()
             .bg(t.panel)
             .border_l_1()
             .border_color(t.border);
+
         if let Some(tab) = self.tabs.get(self.active)
             && let Some(log) = &tab.log
         {
@@ -1586,17 +1711,24 @@ impl Workspace {
                 );
             }
             for (bucket, (line, color)) in markers {
-                overview = overview.child(
+                let tick_color = color.opacity(0.65);
+                let group_name = SharedString::from(format!("overview-tick-{bucket}"));
+                lane = lane.child(
                     div()
                         .id(("overview", bucket))
+                        .group(group_name.clone())
+                        .debug_selector(move || format!("overview-marker-{line}"))
                         .absolute()
                         .top(relative(bucket as f32 / 256.))
-                        .left(px(2.))
-                        .right(px(2.))
-                        .h(px(3.))
-                        .rounded_sm()
-                        .bg(color)
+                        .left_0()
+                        .right_0()
+                        .h(px(6.))
+                        .mt(px(-2.))
+                        .px(px(1.5))
+                        .flex()
+                        .items_center()
                         .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if let Some(tab) = this.tabs.get_mut(this.active) {
                                 tab.selected = line;
@@ -1609,11 +1741,97 @@ impl Workspace {
                             this.show_presets = false;
                             this.focus.focus(window, cx);
                             cx.notify();
-                        })),
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(2.))
+                                .rounded_full()
+                                .bg(tick_color)
+                                .group_hover(group_name, move |s| s.bg(color)),
+                        ),
                 );
             }
         }
-        overview
+        lane
+    }
+
+    fn render_vertical_scrollbar(
+        &self,
+        pane: Pane,
+        scroll: UniformListScrollHandle,
+        with_left_border: bool,
+        width: f32,
+        debug_name: &'static str,
+        cx: &Context<Self>,
+    ) -> Div {
+        let t = &self.theme;
+        let id = ScrollbarId {
+            pane,
+            axis: ScrollAxis::Vertical,
+        };
+        let track_state = self.scrollbar_state(id).clone();
+        let dragging = self.scrollbar_drag.is_some_and(|drag| drag.id == id);
+        let view = cx.entity().downgrade();
+
+        div()
+            .debug_selector(move || debug_name.into())
+            .relative()
+            .h_full()
+            .w(px(width))
+            .flex_shrink_0()
+            .bg(t.panel)
+            .when(with_left_border, |rail| {
+                rail.border_l_1().border_color(t.border)
+            })
+            .child(scrollbar_canvas(
+                scroll,
+                ScrollAxis::Vertical,
+                track_state,
+                dragging,
+                t.clone(),
+                move |pos, window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.handle_scrollbar_press(id, pos, window, cx);
+                    });
+                },
+            ))
+    }
+
+    fn render_horizontal_scrollbar(
+        &self,
+        pane: Pane,
+        scroll: UniformListScrollHandle,
+        debug_name: &'static str,
+        cx: &Context<Self>,
+    ) -> Div {
+        let id = ScrollbarId {
+            pane,
+            axis: ScrollAxis::Horizontal,
+        };
+        let track_state = self.scrollbar_state(id).clone();
+        let dragging = self.scrollbar_drag.is_some_and(|drag| drag.id == id);
+        let view = cx.entity().downgrade();
+
+        div()
+            .debug_selector(move || debug_name.into())
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(px(HORIZONTAL_BAR_HEIGHT))
+            .child(scrollbar_canvas(
+                scroll,
+                ScrollAxis::Horizontal,
+                track_state,
+                dragging,
+                self.theme.clone(),
+                move |pos, window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.handle_scrollbar_press(id, pos, window, cx);
+                    });
+                },
+            ))
     }
 
     fn rows(
@@ -2152,8 +2370,8 @@ impl Workspace {
 
     fn render_goto_popover(&self, line_count: usize, cx: &Context<Self>) -> Stateful<Div> {
         let t = &self.theme;
-        let right_inset = if self.config.viewer.show_overview && line_count > 0 {
-            self.config.viewer.overview_width + 12.
+        let right_inset = if line_count > 0 {
+            self.main_rail_width() + 12.
         } else {
             12.
         };
@@ -3082,6 +3300,14 @@ impl Render for Workspace {
         let main_multi_selected = tab.is_some_and(|tab| tab.main_selection.has_multi_selection());
         let results_multi_selected =
             tab.is_some_and(|tab| tab.result_selection.has_multi_selection());
+        if line_count == 0 {
+            self.main_vscroll_state.clear();
+            self.main_hscroll_state.clear();
+        }
+        if result_count == 0 {
+            self.results_vscroll_state.clear();
+            self.results_hscroll_state.clear();
+        }
 
         let main_area = if self.tabs.is_empty() {
             self.render_welcome(cx)
@@ -3128,25 +3354,44 @@ impl Render for Workspace {
                     })
                     .when(line_count > 0, |area| {
                         area.child(
-                            uniform_list(
-                                "source",
-                                line_count,
-                                cx.processor(|this, range, window, cx| {
-                                    this.rows(range, false, window, cx)
-                                }),
-                            )
-                            .with_horizontal_sizing_behavior(
-                                ListHorizontalSizingBehavior::Unconstrained,
-                            )
-                            .with_width_from_item(Some(widest_line))
-                            .track_scroll(&scroll)
-                            .flex_1()
-                            .min_w_0()
-                            .h_full(),
+                            div()
+                                .relative()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(
+                                    uniform_list(
+                                        "source",
+                                        line_count,
+                                        cx.processor(|this, range, window, cx| {
+                                            this.rows(range, false, window, cx)
+                                        }),
+                                    )
+                                    .with_horizontal_sizing_behavior(
+                                        ListHorizontalSizingBehavior::Unconstrained,
+                                    )
+                                    .with_width_from_item(Some(widest_line))
+                                    .track_scroll(&scroll)
+                                    .size_full(),
+                                )
+                                .child(self.render_horizontal_scrollbar(
+                                    Pane::Main,
+                                    scroll.clone(),
+                                    "main-hscroll",
+                                    cx,
+                                )),
                         )
-                        .when(self.config.viewer.show_overview, |row| {
-                            row.child(self.overview(cx))
+                        .when(self.config.viewer.show_overview, |area| {
+                            area.child(self.render_overview_lane(cx))
                         })
+                        .child(self.render_vertical_scrollbar(
+                            Pane::Main,
+                            scroll.clone(),
+                            !self.config.viewer.show_overview,
+                            DEFAULT_SCROLLBAR_WIDTH,
+                            "main-vscroll",
+                            cx,
+                        ))
                     }),
             );
 
@@ -3359,21 +3604,47 @@ impl Render for Workspace {
                         })
                         .when(result_count > 0, |col| {
                             col.child(
-                                uniform_list(
-                                    "results",
-                                    result_count,
-                                    cx.processor(|this, range, window, cx| {
-                                        this.rows(range, true, window, cx)
-                                    }),
-                                )
-                                .with_horizontal_sizing_behavior(
-                                    ListHorizontalSizingBehavior::Unconstrained,
-                                )
-                                .with_width_from_item(Some(widest_result))
-                                .track_scroll(&result_scroll)
-                                .flex_1()
-                                .w_full()
-                                .min_h_0(),
+                                div()
+                                    .flex_1()
+                                    .w_full()
+                                    .min_h_0()
+                                    .flex()
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .h_full()
+                                            .child(
+                                                uniform_list(
+                                                    "results",
+                                                    result_count,
+                                                    cx.processor(|this, range, window, cx| {
+                                                        this.rows(range, true, window, cx)
+                                                    }),
+                                                )
+                                                .with_horizontal_sizing_behavior(
+                                                    ListHorizontalSizingBehavior::Unconstrained,
+                                                )
+                                                .with_width_from_item(Some(widest_result))
+                                                .track_scroll(&result_scroll)
+                                                .size_full(),
+                                            )
+                                            .child(self.render_horizontal_scrollbar(
+                                                Pane::Results,
+                                                result_scroll.clone(),
+                                                "results-hscroll",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(self.render_vertical_scrollbar(
+                                        Pane::Results,
+                                        result_scroll.clone(),
+                                        true,
+                                        DEFAULT_SCROLLBAR_WIDTH,
+                                        "results-vscroll",
+                                        cx,
+                                    )),
                             )
                         }),
                 );
@@ -3391,16 +3662,32 @@ impl Render for Workspace {
 
         div()
             .size_full()
+            .on_mouse_move_all({
+                let view = cx.entity().downgrade();
+                move |event: &MouseMoveEvent, phase, _hitbox, _window, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        let _ = view.update(cx, |this, cx| {
+                            this.handle_scrollbar_drag_move(event, cx);
+                        });
+                    }
+                }
+            })
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| {
+                cx.listener(|this, _, _, cx| {
                     this.drag_selecting = None;
+                    if this.scrollbar_drag.take().is_some() {
+                        cx.notify();
+                    }
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| {
+                cx.listener(|this, _, _, cx| {
                     this.drag_selecting = None;
+                    if this.scrollbar_drag.take().is_some() {
+                        cx.notify();
+                    }
                 }),
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
@@ -4597,6 +4884,290 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.tabs[0].bookmarks.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn vertical_scrollbar_indicates_scroll_position_and_supports_click_and_drag(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scroll.log");
+        let content = (0..200)
+            .map(|i| format!("INFO line {i}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let initial = view.read_with(cx, |view, _| {
+            view.main_vscroll_state
+                .layout()
+                .expect("vertical scrollbar layout for 200-line log")
+        });
+        assert!(initial.thumb.start.abs() < 0.5);
+        assert!(initial.thumb.length < f32::from(initial.track_bounds.size.height));
+
+        // Jumping to the last line updates the thumb to the bottom on the same draw cycle.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::LastLine, window, cx);
+        });
+        cx.run_until_parked();
+        let at_bottom = view.read_with(cx, |view, _| {
+            view.main_vscroll_state
+                .layout()
+                .expect("vertical scrollbar layout at bottom")
+        });
+        let track_h = f32::from(at_bottom.track_bounds.size.height);
+        assert!((at_bottom.thumb.start + at_bottom.thumb.length - track_h).abs() < 1.0);
+
+        // Return to top, turn on follow, then click near the middle of the track.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FirstLine, window, cx);
+            view.tabs[0].follow = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let track_bounds = cx
+            .debug_bounds("main-vscroll")
+            .expect("main vertical scrollbar bounds");
+        let mid_point = point(track_bounds.center().x, track_bounds.center().y);
+        cx.simulate_click(mid_point, Modifiers::none());
+        cx.run_until_parked();
+
+        let after_click = view.read_with(cx, |view, _| {
+            assert!(
+                !view.tabs[0].follow,
+                "clicking scrollbar should disable follow"
+            );
+            assert!(view.scrollbar_drag.is_none());
+            let offset_y = f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(offset_y < -100.0, "expected scroll down, got {offset_y}");
+            view.main_vscroll_state
+                .layout()
+                .expect("layout after track click")
+        });
+        assert!(after_click.thumb.start > 10.0);
+
+        // Grab the thumb and drag it down to the bottom of the track.
+        let thumb_grab = point(
+            after_click.track_bounds.center().x,
+            after_click.track_bounds.origin.y
+                + px(after_click.thumb.start + after_click.thumb.length * 0.5),
+        );
+        let drag_target = point(
+            after_click.track_bounds.center().x,
+            after_click.track_bounds.bottom(),
+        );
+        cx.simulate_mouse_down(thumb_grab, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.scrollbar_drag.is_some()));
+
+        cx.simulate_mouse_move(drag_target, Some(MouseButton::Left), Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_up(drag_target, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.scrollbar_drag.is_none());
+            let layout = view.main_vscroll_state.layout().expect("layout after drag");
+            let end_gap = f32::from(layout.track_bounds.size.height)
+                - (layout.thumb.start + layout.thumb.length);
+            assert!(
+                end_gap.abs() < 1.5,
+                "expected thumb near bottom after drag, end_gap={end_gap}"
+            );
+        });
+
+        // Short file that fits inside the viewport should not show a vertical thumb.
+        let short_path = directory.path().join("short.log");
+        std::fs::write(&short_path, "one\ntwo\nthree\n").unwrap();
+        let short_log = Arc::new(LogFile::open(&short_path, &AtomicBool::new(false)).unwrap());
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(short_log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.main_vscroll_state.layout().is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn overview_marker_click_selects_line_without_starting_scrollbar_drag(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("markers.log");
+        let content = (0..200)
+            .map(|i| format!("INFO line {i}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].bookmarks.insert(150);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let overview_bounds = cx
+            .debug_bounds("main-overview")
+            .expect("overview lane bounds");
+        let vscroll_bounds = cx
+            .debug_bounds("main-vscroll")
+            .expect("vertical scrollbar bounds");
+        assert!(
+            overview_bounds.right() <= vscroll_bounds.left(),
+            "overview marker lane must sit to the left of the vertical scrollbar: overview={overview_bounds:?}, vscroll={vscroll_bounds:?}"
+        );
+
+        let marker_center = cx
+            .debug_bounds("overview-marker-150")
+            .expect("bookmark overview marker")
+            .center();
+        cx.simulate_click(marker_center, Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 150);
+            assert!(view.scrollbar_drag.is_none());
+            let layout = view
+                .main_vscroll_state
+                .layout()
+                .expect("vertical scrollbar layout");
+            assert!(layout.thumb.start > 0.0);
+        });
+    }
+
+    #[gpui::test]
+    fn horizontal_and_results_scrollbars_work_and_vertical_shows_without_overview(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.show_overview = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wide.log");
+        let long_payload = "x".repeat(320);
+        let content = (0..120)
+            .map(|i| format!("MATCH line {i} {long_payload}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let visible: Vec<usize> = (0..120).collect();
+        let results = SearchResults {
+            matches: visible.clone(),
+            visible,
+            limited: false,
+            widest_row: 0,
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "MATCH".into();
+            view.tabs[0].results = results;
+            view.tabs[0].selected = 0;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.main_vscroll_state.layout().is_some(),
+                "main vertical scrollbar should appear even when show_overview is false"
+            );
+            assert!(
+                view.main_hscroll_state.layout().is_some(),
+                "main horizontal scrollbar should appear for wide lines"
+            );
+            assert!(
+                view.results_vscroll_state.layout().is_some(),
+                "results vertical scrollbar should appear when results overflow"
+            );
+            assert!(
+                view.results_hscroll_state.layout().is_some(),
+                "results horizontal scrollbar should appear for wide results"
+            );
+        });
+
+        // Clicking the main horizontal scrollbar scrolls horizontally without changing selected line.
+        let hbounds = cx
+            .debug_bounds("main-hscroll")
+            .expect("main horizontal scrollbar bounds");
+        let right_click = point(
+            hbounds.origin.x + hbounds.size.width * 0.85,
+            hbounds.center().y,
+        );
+        cx.simulate_click(right_click, Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let offset_x = f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x);
+            assert!(
+                offset_x < -50.0,
+                "expected horizontal scroll, got {offset_x}"
+            );
+            assert_eq!(
+                view.tabs[0].selected, 0,
+                "clicking horizontal scrollbar must not select the row beneath it"
+            );
+            let hlayout = view
+                .main_hscroll_state
+                .layout()
+                .expect("main horizontal scrollbar layout after click");
+            assert!(hlayout.thumb.start > 10.0);
+        });
+
+        // Clicking the results vertical scrollbar scrolls the results pane.
+        let rvbounds = cx
+            .debug_bounds("results-vscroll")
+            .expect("results vertical scrollbar bounds");
+        let results_click = point(
+            rvbounds.center().x,
+            rvbounds.origin.y + rvbounds.size.height * 0.75,
+        );
+        cx.simulate_click(results_click, Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let offset_y = f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                offset_y < -50.0,
+                "expected results pane vertical scroll, got {offset_y}"
+            );
         });
     }
 }
