@@ -1978,10 +1978,6 @@ impl Workspace {
                 self.complete_file_path(window, cx);
                 return;
             }
-            Command::PreviousFilePathCompletion => {
-                self.navigate_path_completions(false, cx);
-                return;
-            }
             Command::FocusLog => {
                 if self.show_presets {
                     self.close_presets(window, cx);

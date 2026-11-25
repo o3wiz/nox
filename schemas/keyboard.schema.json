@@ -68,7 +68,6 @@
         "replace_log_path",
         "open_path_in_new_tab",
         "complete_file_path",
-        "previous_file_path_completion",
         "toggle_follow",
         "toggle_bookmark",
         "next_match",

@@ -146,7 +146,6 @@ pub enum Command {
     ReplaceLogPath,
     OpenPathInNewTab,
     CompleteFilePath,
-    PreviousFilePathCompletion,
     ToggleFollow,
     ToggleBookmark,
     NextMatch,

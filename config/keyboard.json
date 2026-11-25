@@ -293,7 +293,7 @@
     },
     {
       "keys": "shift-tab",
-      "action": "previous_file_path_completion",
+      "action": "previous_line",
       "context": "FilePath"
     },
     {
