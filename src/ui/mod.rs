@@ -33,8 +33,8 @@ use nox::{
 };
 use regex::Regex;
 use resize::{
-    RESIZE_SASH_HEIGHT, ResizeDirection, ResizeMotion, ResultsResizeDrag, height_for_drag,
-    is_main_hidden, is_results_hidden, results_height_bounds,
+    FILE_PATH_BAR_HEIGHT, RESIZE_SASH_HEIGHT, ResizeDirection, ResizeMotion, ResultsResizeDrag,
+    height_for_drag, is_main_hidden, is_results_hidden, results_height_bounds,
 };
 use scrollbar::{
     DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, ScrollAxis, ScrollbarTrackState,
@@ -1173,6 +1173,19 @@ impl Workspace {
         cx.notify();
     }
 
+    fn focus_visible_pane(&mut self, preferred: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        let (min_h, max_h) = self.results_height_bounds(window);
+        let eff = self.results_height.clamp(min_h, max_h);
+        let main_hidden = is_main_hidden(eff, max_h);
+        let results_hidden = is_results_hidden(eff);
+        let pane = match preferred {
+            Pane::Main if main_hidden && !results_hidden => Pane::Results,
+            Pane::Results if results_hidden && !main_hidden => Pane::Main,
+            _ => preferred,
+        };
+        self.focus_pane(pane, window, cx);
+    }
+
     fn selection_count(tab: &Tab, pane: Pane) -> usize {
         match pane {
             Pane::Main => {
@@ -2016,13 +2029,7 @@ impl Workspace {
                     if self.path_input_focused(window, cx) {
                         self.sync_path_input(cx);
                     }
-                    let (min_h, max_h) = self.results_height_bounds(window);
-                    let eff = self.results_height.clamp(min_h, max_h);
-                    if is_main_hidden(eff, max_h) && !is_results_hidden(eff) {
-                        self.focus_pane(Pane::Results, window, cx);
-                    } else {
-                        self.focus_pane(Pane::Main, window, cx);
-                    }
+                    self.focus_visible_pane(Pane::Main, window, cx);
                 }
                 return;
             }
@@ -2437,19 +2444,6 @@ impl Workspace {
         if self.tabs.is_empty() {
             return;
         }
-        let (min_h, max_h) = self.results_height_bounds(window);
-        let eff = self.results_height.clamp(min_h, max_h);
-        if is_main_hidden(eff, max_h) {
-            let restored = self
-                .config
-                .window
-                .results_height
-                .min((max_h - 140.0).max(0.0))
-                .clamp(min_h, max_h);
-            self.resize_motion.cancel();
-            self.results_height = restored;
-            self.target_results_height = restored;
-        }
         self.show_goto = false;
         self.show_presets = false;
         self.sync_path_input(cx);
@@ -2588,7 +2582,7 @@ impl Workspace {
         } else {
             self.replace_active_tab(path, cx);
         }
-        self.focus_pane(Pane::Main, window, cx);
+        self.focus_visible_pane(Pane::Main, window, cx);
     }
 
     fn submit_file_path(
@@ -2698,7 +2692,7 @@ impl Workspace {
 
     fn close_presets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_presets = false;
-        self.focus_pane(self.active_pane, window, cx);
+        self.focus_visible_pane(self.active_pane, window, cx);
     }
 
     fn apply_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2714,7 +2708,7 @@ impl Workspace {
         self.show_presets = false;
         self.preset_index = index;
         self.start_search(self.active, cx);
-        self.focus_pane(self.active_pane, window, cx);
+        self.focus_visible_pane(self.active_pane, window, cx);
     }
 
     fn navigate_presets(&mut self, command: Command, cx: &mut Context<Self>) {
@@ -4295,6 +4289,7 @@ impl Workspace {
     fn render_file_path_bar(
         &self,
         main_focused: bool,
+        main_hidden: bool,
         loading: bool,
         line_count: usize,
         window: &Window,
@@ -4408,7 +4403,7 @@ impl Workspace {
 
         div()
             .debug_selector(|| "file-path-bar".into())
-            .h(px(28.))
+            .h(px(FILE_PATH_BAR_HEIGHT))
             .px_3()
             .flex_shrink_0()
             .flex()
@@ -4416,7 +4411,7 @@ impl Workspace {
             .justify_between()
             .gap_3()
             .bg(t.background)
-            .border_b_1()
+            .when(!main_hidden || path_focused, |el| el.border_b_1())
             .border_color(if path_focused {
                 t.accent_border
             } else {
@@ -4424,7 +4419,7 @@ impl Workspace {
             })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.focus_pane(Pane::Main, window, cx)),
+                cx.listener(|this, _, window, cx| this.focus_visible_pane(Pane::Main, window, cx)),
             )
             .child(
                 div()
@@ -5594,24 +5589,16 @@ impl Render for Workspace {
 
             let source_pane = div()
                 .debug_selector(|| "source-pane".into())
+                .relative()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
                 .flex()
                 .flex_col()
-                .child(self.render_file_path_bar(main_focused, loading, line_count, window, cx))
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .child(source_log_area)
-                        .when(self.show_goto, |body| {
-                            body.child(self.render_goto_popover(line_count, cx))
-                        }),
-                );
+                .child(source_log_area)
+                .when(self.show_goto, |body| {
+                    body.child(self.render_goto_popover(line_count, cx))
+                });
 
             let at_max_results_h = main_hidden || effective_results_h >= max_results_h - 0.5;
             let at_min_results_h = results_hidden || effective_results_h <= min_results_h + 0.5;
@@ -5843,6 +5830,14 @@ impl Render for Workspace {
                 .min_h_0()
                 .flex()
                 .flex_col()
+                .child(self.render_file_path_bar(
+                    main_focused && !main_hidden,
+                    main_hidden,
+                    loading,
+                    line_count,
+                    window,
+                    cx,
+                ))
                 .when(!main_hidden, |area| area.child(source_pane))
                 .child(self.render_results_resize_sash(main_hidden, results_hidden, cx))
                 .child(self.render_search_bar(&options, window, cx))
@@ -7845,8 +7840,12 @@ mod tests {
         assert!(max_h > 400.0);
         assert!(cx.debug_bounds("source-pane").is_some());
         assert!(cx.debug_bounds("results-body").is_some());
+        let file_path_before = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar should render");
 
-        // Dragging all the way to the top hides the main log pane and hands focus to the filter pane.
+        // Dragging all the way to the top hides the main log pane, stops below the file path bar,
+        // and hands focus to the filter pane.
         let sash = cx
             .debug_bounds("results-resize-sash")
             .expect("resize sash should render")
@@ -7866,6 +7865,22 @@ mod tests {
         assert!(
             cx.debug_bounds("source-pane").is_none(),
             "main source pane should be hidden at max height"
+        );
+        let file_path_at_max = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar should remain visible at max filter height");
+        let sash_at_max = cx
+            .debug_bounds("results-resize-sash")
+            .expect("resize sash should remain visible at max filter height");
+        assert_eq!(file_path_at_max.origin.y, file_path_before.origin.y);
+        assert_eq!(file_path_at_max.size.height, px(FILE_PATH_BAR_HEIGHT));
+        assert!(
+            sash_at_max.origin.y >= file_path_at_max.bottom(),
+            "resize sash ({sash_at_max:?}) should stop at or below file path bar ({file_path_at_max:?})"
+        );
+        assert!(
+            (sash_at_max.origin.y - file_path_at_max.bottom()).abs() <= px(0.5),
+            "resize sash ({sash_at_max:?}) should meet the bottom of the file path bar ({file_path_at_max:?})"
         );
         assert!(cx.debug_bounds("results-body").is_some());
 
@@ -8068,6 +8083,148 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(!view.resize_motion.is_animating());
             assert_eq!(view.results_height, view.target_results_height);
+        });
+    }
+
+    #[gpui::test]
+    fn filter_pane_max_height_stops_at_file_path_bar_and_keeps_path_bar_usable(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        std::fs::write(&first, "ERROR one\nINFO two\n").unwrap();
+        std::fs::write(&second, "ERROR alpha\nINFO beta\nERROR gamma\n").unwrap();
+        let second_canon = second.canonicalize().unwrap();
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![first], window, cx));
+        wait_for_tab_loaded(&view, 0, cx);
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+
+        let step_frame = |cx: &mut VisualTestContext, ms: u64| {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(ms));
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.run_until_parked();
+        };
+
+        let (_, max_h) = view.update_in(cx, |view, window, _| view.results_height_bounds(window));
+
+        // Near max height (10px shy), the file path bar must stay full height and unclipped.
+        view.update(cx, |view, cx| {
+            view.results_height = max_h - 10.0;
+            view.target_results_height = max_h - 10.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let path_near_max = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar near max");
+        let sash_near_max = cx
+            .debug_bounds("results-resize-sash")
+            .expect("sash near max");
+        let source_near_max = cx
+            .debug_bounds("source-pane")
+            .expect("source pane should still render 10px shy of max");
+        assert_eq!(path_near_max.size.height, px(FILE_PATH_BAR_HEIGHT));
+        assert!(source_near_max.origin.y >= path_near_max.bottom());
+        assert!(sash_near_max.origin.y >= source_near_max.bottom());
+
+        // Holding `-` glides to max_h and stops right below the file path bar without covering it.
+        let key_minus = Keystroke::parse("-").unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: key_minus.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        for i in 0..80 {
+            if i % 3 == 0 {
+                cx.simulate_event(KeyDownEvent {
+                    keystroke: key_minus.clone(),
+                    is_held: true,
+                    prefer_character_input: false,
+                });
+            }
+            step_frame(cx, 16);
+        }
+        cx.simulate_event(KeyUpEvent {
+            keystroke: key_minus,
+        });
+        for _ in 0..30 {
+            step_frame(cx, 16);
+        }
+
+        view.update_in(cx, |view, window, _| {
+            assert_eq!(view.results_height, max_h);
+            assert!(view.results_focus.is_focused(window));
+        });
+        let path_at_max = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar must stay visible at max height");
+        let sash_at_max = cx
+            .debug_bounds("results-resize-sash")
+            .expect("resize sash at max height");
+        assert!(cx.debug_bounds("source-pane").is_none());
+        assert_eq!(path_at_max.size.height, px(FILE_PATH_BAR_HEIGHT));
+        assert!(
+            (sash_at_max.origin.y - path_at_max.bottom()).abs() <= px(0.5),
+            "sash ({sash_at_max:?}) should stop directly beneath file path bar ({path_at_max:?})"
+        );
+
+        // Focusing and submitting the file path bar at max height keeps the filter pane maximized
+        // and returns keyboard focus to the visible filter pane.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(
+                view.results_height, max_h,
+                "focusing always-visible file path bar should not shrink maximized filter pane"
+            );
+            assert!(view.path_input_focused(window, cx));
+        });
+        cx.simulate_input(&second.display().to_string());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+        view.update_in(cx, |view, window, _| {
+            assert_eq!(view.tabs[0].path, second_canon);
+            assert_eq!(view.results_height, max_h);
+            assert!(
+                view.results_focus.is_focused(window),
+                "submitting file path while main pane is hidden should focus visible filter pane"
+            );
+        });
+
+        // Clicking the non-input portion of the file path bar while main is hidden keeps focus
+        // on the visible filter pane so Log shortcuts remain active.
+        let right_edge = point(path_at_max.right() - px(8.), path_at_max.center().y);
+        cx.simulate_mouse_down(right_edge, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(right_edge, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, _| {
+            assert!(
+                view.results_focus.is_focused(window),
+                "clicking file path bar chrome while main is hidden should keep filter pane focused"
+            );
         });
     }
 

@@ -1,6 +1,9 @@
 //! Pure filter-pane resize geometry, full-collapse bounds, and smooth frame-paced motion.
 use std::time::{Duration, Instant};
 
+/// Height of the editable file path strip pinned above the source log pane.
+pub const FILE_PATH_BAR_HEIGHT: f32 = 28.0;
+
 /// Height of the horizontal split sash between the source log and search/filter dock.
 pub const RESIZE_SASH_HEIGHT: f32 = 8.0;
 
@@ -64,14 +67,18 @@ pub struct ResultsResizeDrag {
 
 /// Computes `(0.0, max_height)` for the filter results body inside the current viewport.
 /// - `0.0` completely hides the filter results body (giving all space to the main log pane).
-/// - `max_height` completely hides the main log pane (giving all space to the filter results body).
+/// - `max_height` completely hides the main log pane while keeping the file path bar visible
+///   above the split sash (giving all remaining space to the filter results body).
 pub fn results_height_bounds(
     viewport_height: f32,
     show_status_bar: bool,
     has_error: bool,
 ) -> (f32, f32) {
-    let mut fixed_chrome =
-        HEADER_HEIGHT + RESIZE_SASH_HEIGHT + SEARCH_BAR_HEIGHT + RESULTS_HEADER_HEIGHT;
+    let mut fixed_chrome = HEADER_HEIGHT
+        + FILE_PATH_BAR_HEIGHT
+        + RESIZE_SASH_HEIGHT
+        + SEARCH_BAR_HEIGHT
+        + RESULTS_HEADER_HEIGHT;
     if show_status_bar {
         fixed_chrome += STATUS_BAR_HEIGHT;
     }
@@ -312,23 +319,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn results_height_bounds_allow_full_collapse_to_bottom_and_top() {
+    fn results_height_bounds_allow_full_collapse_to_bottom_and_stop_at_file_path_bar() {
         // Default 850px window with status bar and no error banner:
-        // fixed chrome = 46 + 8 + 44 + 30 + 26 = 154; max = 696.
-        assert_eq!(results_height_bounds(850.0, true, false), (0.0, 696.0));
+        // fixed chrome = 46 + 28 + 8 + 44 + 30 + 26 = 182; max = 668.
+        assert_eq!(results_height_bounds(850.0, true, false), (0.0, 668.0));
         // Without status bar (+26px room).
-        assert_eq!(results_height_bounds(850.0, false, false), (0.0, 722.0));
+        assert_eq!(results_height_bounds(850.0, false, false), (0.0, 694.0));
         // With error banner (-40px room).
-        assert_eq!(results_height_bounds(850.0, true, true), (0.0, 656.0));
-        // Minimum supported window height (480px): 480 - 154 = 326.
-        assert_eq!(results_height_bounds(480.0, true, false), (0.0, 326.0));
+        assert_eq!(results_height_bounds(850.0, true, true), (0.0, 628.0));
+        // Minimum supported window height (480px): 480 - 182 = 298.
+        assert_eq!(results_height_bounds(480.0, true, false), (0.0, 298.0));
         // Cramped viewport never goes negative.
         assert_eq!(results_height_bounds(100.0, true, false), (0.0, 0.0));
 
         assert!(is_results_hidden(0.0));
         assert!(!is_results_hidden(16.0));
-        assert!(is_main_hidden(696.0, 696.0));
-        assert!(!is_main_hidden(680.0, 696.0));
+        assert!(is_main_hidden(668.0, 668.0));
+        assert!(!is_main_hidden(652.0, 668.0));
         assert!(!is_main_hidden(0.0, 0.0));
     }
 
@@ -338,20 +345,20 @@ mod tests {
             start_y: 500.0,
             start_height: 250.0,
         };
-        let bounds = (0.0, 696.0);
+        let bounds = (0.0, 668.0);
         // Dragging up by 120px grows height from 250 -> 370.
         assert_eq!(height_for_drag(drag, 380.0, bounds), 370.0);
         // Dragging down by 100px shrinks height from 250 -> 150.
         assert_eq!(height_for_drag(drag, 600.0, bounds), 150.0);
-        // Dragging to top hides main pane (696), dragging to bottom hides filter pane (0).
-        assert_eq!(height_for_drag(drag, -200.0, bounds), 696.0);
+        // Dragging to top hides main pane below file path bar (668), dragging to bottom hides filter pane (0).
+        assert_eq!(height_for_drag(drag, -200.0, bounds), 668.0);
         assert_eq!(height_for_drag(drag, 950.0, bounds), 0.0);
     }
 
     #[test]
     fn single_tap_eases_smoothly_to_exact_base_step_and_stops() {
         let mut motion = ResizeMotion::default();
-        let bounds = (0.0, 696.0);
+        let bounds = (0.0, 668.0);
         let t0 = Instant::now();
         let mut current = 250.0;
         let mut target = 250.0;
@@ -391,7 +398,7 @@ mod tests {
     #[test]
     fn sustained_hold_auto_detects_long_press_with_smooth_velocity_gradient() {
         let mut motion = ResizeMotion::default();
-        let bounds = (0.0, 696.0);
+        let bounds = (0.0, 668.0);
         let t0 = Instant::now();
         let mut current = 100.0;
         let mut target = 100.0;
