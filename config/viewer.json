@@ -1,0 +1,12 @@
+{
+  "$schema": "../schemas/viewer.schema.json",
+  "line_numbers": true,
+  "line_height": 24,
+  "tab_width": 4,
+  "max_display_chars": 16000,
+  "follow": false,
+  "include_bookmarks": true,
+  "poll_interval_ms": 1000,
+  "show_overview": true,
+  "overview_width": 16
+}

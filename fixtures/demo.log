@@ -1,0 +1,18 @@
+2026-11-23 09:41:00.012 INFO  server      Starting gateway v2.8.0
+2026-11-23 09:41:00.034 DEBUG config      Loaded configuration from /etc/gateway.json
+2026-11-23 09:41:00.058 INFO  database    Connected to primary database
+2026-11-23 09:41:00.061 INFO  server      Listening on 0.0.0.0:8080
+2026-11-23 09:41:01.103 INFO  http        GET /health 200 2ms
+2026-11-23 09:41:01.285 INFO  http        GET /api/projects 200 18ms
+2026-11-23 09:41:02.042 WARN  cache       Cache miss rate above threshold: 42%
+2026-11-23 09:41:02.200 DEBUG worker      Processing job #7842
+2026-11-23 09:41:02.814 ERROR database    Connection timeout after 5000ms
+2026-11-23 09:41:02.815 WARN  worker      Retrying job #7842 (attempt 2/3)
+2026-11-23 09:41:03.012 INFO  database    Connection restored
+2026-11-23 09:41:03.108 INFO  worker      Completed job #7842 in 908ms
+2026-11-23 09:41:04.005 INFO  http        POST /api/events 201 24ms
+2026-11-23 09:41:04.301 DEBUG auth        Token refreshed for service-account
+2026-11-23 09:41:05.092 ERROR http        GET /api/reports 503 upstream unavailable
+2026-11-23 09:41:05.104 INFO  metrics     requests=1042 errors=2 p99=124ms
+2026-11-23 09:41:06.041 INFO  worker      Queue drained; waiting for new jobs
+2026-11-23 09:41:07.008 INFO  http        GET /health 200 1ms

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WindowConfig",
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string"
+    },
+    "width": {
+      "type": "number",
+      "format": "float",
+      "minimum": 640,
+      "maximum": 7680
+    },
+    "height": {
+      "type": "number",
+      "format": "float",
+      "minimum": 480,
+      "maximum": 4320
+    },
+    "maximized": {
+      "type": "boolean"
+    },
+    "results_height": {
+      "type": "number",
+      "format": "float",
+      "minimum": 100,
+      "maximum": 1200
+    },
+    "show_status_bar": {
+      "type": "boolean"
+    },
+    "$schema": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

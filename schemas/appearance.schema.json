@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppearanceConfig",
+  "type": "object",
+  "properties": {
+    "ui_font_family": {
+      "type": "string"
+    },
+    "ui_font_size": {
+      "type": "number",
+      "format": "float",
+      "minimum": 8,
+      "maximum": 32
+    },
+    "font_family": {
+      "type": "string"
+    },
+    "font_size": {
+      "type": "number",
+      "format": "float",
+      "minimum": 8,
+      "maximum": 32
+    },
+    "background": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "panel": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "foreground": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "muted": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "accent": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "selection": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "text_selection_color": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "text_selection_opacity": {
+      "type": "number",
+      "format": "float",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "border": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "match_foreground": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "match_background": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "$schema": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

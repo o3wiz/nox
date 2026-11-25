@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KeyboardConfig",
+  "type": "object",
+  "properties": {
+    "bindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Binding"
+      }
+    },
+    "$schema": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Binding": {
+      "type": "object",
+      "properties": {
+        "keys": {
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/$defs/KeyContext"
+        },
+        "action": {
+          "$ref": "#/$defs/Command"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "keys",
+        "context",
+        "action"
+      ]
+    },
+    "KeyContext": {
+      "type": "string",
+      "enum": [
+        "Workspace",
+        "Log",
+        "Selection",
+        "TextSelected",
+        "TextSelected && RegexMode",
+        "RegexMode",
+        "Search",
+        "FilePath",
+        "GoTo",
+        "Presets"
+      ]
+    },
+    "Command": {
+      "type": "string",
+      "enum": [
+        "open",
+        "close_tab",
+        "next_tab",
+        "previous_tab",
+        "search",
+        "toggle_regex",
+        "toggle_case_sensitive",
+        "toggle_whole_word",
+        "toggle_invert",
+        "toggle_highlight_matches",
+        "focus_search",
+        "focus_file_path",
+        "focus_log",
+        "replace_log_path",
+        "open_path_in_new_tab",
+        "complete_file_path",
+        "toggle_follow",
+        "toggle_bookmark",
+        "next_match",
+        "previous_match",
+        "copy_line",
+        "copy_selected_text",
+        "search_selected_text",
+        "append_selected_text_to_search",
+        "reload",
+        "go_to_line",
+        "export_results",
+        "quit",
+        "next_line",
+        "previous_line",
+        "first_line",
+        "last_line",
+        "page_up",
+        "page_down",
+        "next_bookmark",
+        "previous_bookmark",
+        "show_files",
+        "switch_pane",
+        "select_next_line",
+        "select_previous_line",
+        "select_first_line",
+        "select_last_line",
+        "select_page_up",
+        "select_page_down",
+        "select_all",
+        "clear_selection",
+        "clear_text_selection",
+        "swap_selection_anchor",
+        "toggle_presets",
+        "apply_preset",
+        "increase_filter_height",
+        "decrease_filter_height",
+        "zoom_in",
+        "zoom_out",
+        "zoom_reset"
+      ]
+    }
+  }
+}

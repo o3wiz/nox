@@ -1,0 +1,9 @@
+{
+  "$schema": "../schemas/files.schema.json",
+  "startup": [],
+  "favorites": [],
+  "restore_session": true,
+  "save_session": true,
+  "state_file": null,
+  "recent_limit": 20
+}

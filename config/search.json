@@ -1,0 +1,30 @@
+{
+  "$schema": "../schemas/search.schema.json",
+  "mode": "regex",
+  "case_sensitive": false,
+  "whole_word": false,
+  "invert": false,
+  "highlight_matches": true,
+  "context_lines": 0,
+  "max_results": 100000,
+  "presets": [
+    {
+      "name": "Errors",
+      "pattern": "error|fatal|panic",
+      "mode": "regex",
+      "highlight_match": true
+    },
+    {
+      "name": "Warnings",
+      "pattern": "warn",
+      "mode": "literal",
+      "highlight_match": true
+    },
+    {
+      "name": "Requests",
+      "pattern": "GET|POST|PUT|DELETE",
+      "mode": "regex",
+      "highlight_match": true
+    }
+  ]
+}

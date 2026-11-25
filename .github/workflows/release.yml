@@ -1,0 +1,279 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: "Create release as a draft (only applies when run on a v* tag)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  verify:
+    name: Verify Version & Formatting
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Resolve and validate release version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$CARGO_VERSION" ]; then
+            echo "::error::Unable to read package.version from Cargo.toml"
+            exit 1
+          fi
+
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            TAG_VERSION="${TAG#v}"
+            if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+              echo "::error::Tag ${TAG} does not match Cargo.toml version ${CARGO_VERSION}"
+              exit 1
+            fi
+          else
+            TAG="v${CARGO_VERSION}"
+          fi
+
+          PRERELEASE="false"
+          if [[ "$CARGO_VERSION" == *-* ]]; then
+            PRERELEASE="true"
+          fi
+
+          echo "version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version=${CARGO_VERSION} tag=${TAG} prerelease=${PRERELEASE}"
+
+  build:
+    name: Build & Package (${{ matrix.target }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+            cross: false
+          - os: macos-15
+            target: x86_64-apple-darwin
+            arch: x86_64
+            cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-randr0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-xinput-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Run Clippy and test suite
+        if: ${{ !matrix.cross }}
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test release binary (Unix)
+        if: ${{ !matrix.cross && runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="./target/${{ matrix.target }}/release/nox"
+          "$BIN" --version
+          "$BIN" --check-config
+
+      - name: Smoke test release binary (Windows)
+        if: ${{ !matrix.cross && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $bin = ".\target\${{ matrix.target }}\release\nox.exe"
+          & $bin --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $bin --check-config
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package macOS deliverables (.dmg, .app.zip, CLI .tar.gz)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts stage/Nox.app/Contents/MacOS stage/Nox.app/Contents/Resources
+
+          cp "target/${TARGET}/release/nox" "stage/Nox.app/Contents/MacOS/nox"
+          chmod +x "stage/Nox.app/Contents/MacOS/nox"
+          cp "packaging/macos/Nox.icns" "stage/Nox.app/Contents/Resources/Nox.icns"
+          sed "s/@VERSION@/${VERSION}/g" packaging/macos/Info.plist > "stage/Nox.app/Contents/Info.plist"
+          plutil -lint "stage/Nox.app/Contents/Info.plist"
+          codesign --force --deep --sign - "stage/Nox.app"
+          codesign --verify --deep --strict "stage/Nox.app"
+
+          # Drag-and-drop DMG installer
+          mkdir -p stage/dmg
+          ditto "stage/Nox.app" "stage/dmg/Nox.app"
+          ln -s /Applications "stage/dmg/Applications"
+          hdiutil create \
+            -volname "Nox ${VERSION}" \
+            -srcfolder stage/dmg \
+            -ov -format UDZO \
+            "release-artifacts/Nox-${VERSION}-${ARCH}.dmg"
+
+          # Direct .app.zip archive
+          ditto -c -k --sequesterRsrc --keepParent \
+            "stage/Nox.app" \
+            "release-artifacts/Nox-${VERSION}-${ARCH}.app.zip"
+
+          # Standalone CLI tarball
+          CLI_DIR="nox-v${VERSION}-${TARGET}"
+          mkdir -p "stage/${CLI_DIR}"
+          cp "target/${TARGET}/release/nox" "stage/${CLI_DIR}/nox"
+          cp README.md "stage/${CLI_DIR}/"
+          cp -R config schemas "stage/${CLI_DIR}/"
+          tar -C stage -czf "release-artifacts/${CLI_DIR}.tar.gz" "${CLI_DIR}"
+
+      - name: Package Linux deliverable (.tar.gz)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          PKG_DIR="nox-v${VERSION}-${TARGET}"
+          mkdir -p release-artifacts "stage/${PKG_DIR}"
+          cp "target/${TARGET}/release/nox" "stage/${PKG_DIR}/nox"
+          chmod +x "stage/${PKG_DIR}/nox"
+          cp packaging/linux/nox.desktop packaging/assets/nox.svg README.md "stage/${PKG_DIR}/"
+          cp -R config schemas "stage/${PKG_DIR}/"
+          tar -C stage -czf "release-artifacts/${PKG_DIR}.tar.gz" "${PKG_DIR}"
+
+      - name: Package Windows deliverable (.zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $pkgName = "nox-v$($env:VERSION)-$($env:TARGET)"
+          $stageDir = Join-Path "stage" $pkgName
+          New-Item -ItemType Directory -Force -Path "release-artifacts", $stageDir | Out-Null
+          Copy-Item "target\$($env:TARGET)\release\nox.exe" -Destination $stageDir
+          Copy-Item "README.md" -Destination $stageDir
+          Copy-Item "config" -Destination $stageDir -Recurse
+          Copy-Item "schemas" -Destination $stageDir -Recurse
+          Compress-Archive -Path $stageDir -DestinationPath "release-artifacts\$pkgName.zip" -Force
+
+      - name: Upload target release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  publish:
+    name: Checksums & GitHub Release
+    needs:
+      - verify
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload checksums artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-checksums
+          path: release-artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          name: "Nox ${{ needs.verify.outputs.tag }}"
+          draft: ${{ inputs.draft == true }}
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-artifacts/*

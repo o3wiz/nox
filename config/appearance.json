@@ -1,0 +1,18 @@
+{
+  "$schema": "../schemas/appearance.schema.json",
+  "ui_font_family": "SF Pro Text",
+  "ui_font_size": 13,
+  "font_family": "JetBrains Mono",
+  "font_size": 13,
+  "background": "#0E1218",
+  "panel": "#151B24",
+  "foreground": "#E2E8F0",
+  "muted": "#8B9BB4",
+  "accent": "#5EEAD4",
+  "selection": "#1F3344",
+  "text_selection_color": "#38BDF8",
+  "text_selection_opacity": 0.35,
+  "border": "#263142",
+  "match_foreground": "#0B1016",
+  "match_background": "#E0AF4B"
+}

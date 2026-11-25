@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nox
+GenericName=Log Explorer
+Comment=Native GPU-accelerated log explorer
+Exec=nox %F
+Icon=nox
+Terminal=false
+Categories=Development;Utility;
+MimeType=text/plain;text/x-log;
+StartupWMClass=nox

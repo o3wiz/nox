@@ -1,0 +1,335 @@
+{
+  "$schema": "../schemas/keyboard.schema.json",
+  "bindings": [
+    {
+      "keys": "secondary-o",
+      "action": "open",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-shift-o",
+      "action": "focus_file_path",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-w",
+      "action": "close_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-tab",
+      "action": "next_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-shift-tab",
+      "action": "previous_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-f",
+      "action": "focus_search",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-p",
+      "action": "toggle_presets",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-alt-h",
+      "action": "toggle_highlight_matches",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-l",
+      "action": "go_to_line",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-r",
+      "action": "reload",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-e",
+      "action": "export_results",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-=",
+      "action": "zoom_in",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary--",
+      "action": "zoom_out",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-0",
+      "action": "zoom_reset",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-q",
+      "action": "quit",
+      "context": "Workspace"
+    },
+    {
+      "keys": "f3",
+      "action": "next_match",
+      "context": "Workspace"
+    },
+    {
+      "keys": "shift-f3",
+      "action": "previous_match",
+      "context": "Workspace"
+    },
+    {
+      "keys": "f",
+      "action": "toggle_follow",
+      "context": "Log"
+    },
+    {
+      "keys": "m",
+      "action": "toggle_bookmark",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-c",
+      "action": "copy_line",
+      "context": "Log"
+    },
+    {
+      "keys": "enter",
+      "action": "search",
+      "context": "Search"
+    },
+    {
+      "keys": "escape",
+      "action": "focus_log",
+      "context": "Search"
+    },
+    {
+      "keys": "secondary-alt-r",
+      "action": "toggle_regex",
+      "context": "Search"
+    },
+    {
+      "keys": "secondary-alt-c",
+      "action": "toggle_case_sensitive",
+      "context": "Search"
+    },
+    {
+      "keys": "secondary-alt-w",
+      "action": "toggle_whole_word",
+      "context": "Search"
+    },
+    {
+      "keys": "secondary-alt-i",
+      "action": "toggle_invert",
+      "context": "Search"
+    },
+    {
+      "keys": "enter",
+      "action": "go_to_line",
+      "context": "GoTo"
+    },
+    {
+      "keys": "escape",
+      "action": "focus_log",
+      "context": "GoTo"
+    },
+    {
+      "keys": "down",
+      "action": "next_line",
+      "context": "Log"
+    },
+    {
+      "keys": "up",
+      "action": "previous_line",
+      "context": "Log"
+    },
+    {
+      "keys": "home",
+      "action": "first_line",
+      "context": "Log"
+    },
+    {
+      "keys": "end",
+      "action": "last_line",
+      "context": "Log"
+    },
+    {
+      "keys": "pageup",
+      "action": "page_up",
+      "context": "Log"
+    },
+    {
+      "keys": "pagedown",
+      "action": "page_down",
+      "context": "Log"
+    },
+    {
+      "keys": "b",
+      "action": "next_bookmark",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-b",
+      "action": "previous_bookmark",
+      "context": "Log"
+    },
+    {
+      "keys": "tab",
+      "action": "switch_pane",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-down",
+      "action": "select_next_line",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-up",
+      "action": "select_previous_line",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-home",
+      "action": "select_first_line",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-end",
+      "action": "select_last_line",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-pageup",
+      "action": "select_page_up",
+      "context": "Log"
+    },
+    {
+      "keys": "shift-pagedown",
+      "action": "select_page_down",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-a",
+      "action": "select_all",
+      "context": "Log"
+    },
+    {
+      "keys": "escape",
+      "action": "clear_selection",
+      "context": "Log"
+    },
+    {
+      "keys": "-",
+      "action": "increase_filter_height",
+      "context": "Log"
+    },
+    {
+      "keys": "shift--",
+      "action": "decrease_filter_height",
+      "context": "Log"
+    },
+    {
+      "keys": "alt-o",
+      "action": "swap_selection_anchor",
+      "context": "Selection"
+    },
+    {
+      "keys": "secondary-c",
+      "action": "copy_selected_text",
+      "context": "TextSelected"
+    },
+    {
+      "keys": "f",
+      "action": "search_selected_text",
+      "context": "TextSelected"
+    },
+    {
+      "keys": "a",
+      "action": "append_selected_text_to_search",
+      "context": "TextSelected && RegexMode"
+    },
+    {
+      "keys": "escape",
+      "action": "clear_text_selection",
+      "context": "TextSelected"
+    },
+    {
+      "keys": "down",
+      "action": "next_line",
+      "context": "Presets"
+    },
+    {
+      "keys": "up",
+      "action": "previous_line",
+      "context": "Presets"
+    },
+    {
+      "keys": "home",
+      "action": "first_line",
+      "context": "Presets"
+    },
+    {
+      "keys": "end",
+      "action": "last_line",
+      "context": "Presets"
+    },
+    {
+      "keys": "enter",
+      "action": "apply_preset",
+      "context": "Presets"
+    },
+    {
+      "keys": "space",
+      "action": "apply_preset",
+      "context": "Presets"
+    },
+    {
+      "keys": "escape",
+      "action": "focus_log",
+      "context": "Presets"
+    },
+    {
+      "keys": "enter",
+      "action": "replace_log_path",
+      "context": "FilePath"
+    },
+    {
+      "keys": "secondary-enter",
+      "action": "open_path_in_new_tab",
+      "context": "FilePath"
+    },
+    {
+      "keys": "tab",
+      "action": "complete_file_path",
+      "context": "FilePath"
+    },
+    {
+      "keys": "shift-tab",
+      "action": "previous_line",
+      "context": "FilePath"
+    },
+    {
+      "keys": "down",
+      "action": "next_line",
+      "context": "FilePath"
+    },
+    {
+      "keys": "up",
+      "action": "previous_line",
+      "context": "FilePath"
+    },
+    {
+      "keys": "escape",
+      "action": "focus_log",
+      "context": "FilePath"
+    }
+  ]
+}
