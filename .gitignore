@@ -1,1 +1,16 @@
+# Build and packaging outputs
 /target
+/dist
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+
+# Python cache (if any local tooling runs)
+__pycache__/
+*.py[cod]

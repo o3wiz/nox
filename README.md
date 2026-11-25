@@ -1,15 +1,49 @@
 # Nox
 
+[![CI](https://github.com/o3wiz/nox/actions/workflows/ci.yml/badge.svg)](https://github.com/o3wiz/nox/actions/workflows/ci.yml)
+[![Release](https://github.com/o3wiz/nox/actions/workflows/release.yml/badge.svg)](https://github.com/o3wiz/nox/actions/workflows/release.yml)
+
 A native Rust log explorer modeled on the core workflow of [Klogg](https://github.com/variar/klogg), built with [GPUI Community Edition](https://gpui-ce.github.io/). This is a new implementation, not a copy of Klogg's Qt/C++ code.
 
 ```sh
-cargo run -- fixtures/demo.log
-cargo run -- /var/log/app.log /var/log/worker.log
+nox fixtures/demo.log
+nox /var/log/app.log /var/log/worker.log
 ```
 
 Nox has a full-file pane and a separate filtered-results pane, multiple file tabs, regex and literal searches, case/whole-word/inverted matching, context lines, search presets, colored highlighting, bookmarks, line navigation, live following, recent/favorite files, session restore, clipboard copying, and result export. File indexing and searches run on worker threads. Both panes render only visible rows and scroll horizontally for long lines. A clickable overview marks the locations of matches and bookmarks.
 
-Requires a Rust toolchain supporting edition 2024 and the native build prerequisites for [GPUI CE](https://github.com/gpui-ce/gpui-ce/blob/main/SETUP.md). macOS builds use Metal. This repository has been built and tested on macOS; Linux and Windows have not been verified. Linux builds may need the platform crate's `x11` or `wayland` feature and the corresponding system libraries.
+## Installation
+
+### Pre-built releases
+
+Download the latest release package for your platform from [GitHub Releases](https://github.com/o3wiz/nox/releases) and verify integrity against `SHA256SUMS.txt`:
+
+- **macOS (Apple Silicon / Intel)**: Open `Nox-<version>-<arch>.dmg` and drag **Nox.app** into **Applications** (or extract `Nox-<version>-<arch>.app.zip`), or use the standalone CLI archive `nox-v<version>-<target>.tar.gz`.
+  - Release app bundles are ad-hoc signed. If macOS Gatekeeper warns on first launch, run `xattr -cr /Applications/Nox.app` or right-click **Nox.app** and choose **Open**.
+- **Linux (`x86_64`)**: Extract `nox-v<version>-x86_64-unknown-linux-gnu.tar.gz`, copy `nox` onto your `PATH` (e.g. `~/.local/bin/nox`), and optionally install `nox.desktop` into `~/.local/share/applications/` and `nox.svg` into `~/.local/share/icons/hicolor/scalable/apps/`.
+- **Windows (`x86_64`)**: Extract `nox-v<version>-x86_64-pc-windows-msvc.zip` and run `nox.exe` (or add its folder to `PATH`).
+
+### Build from source
+
+Requires Rust `1.95+` (edition 2024) and the native build prerequisites for [GPUI CE](https://github.com/gpui-ce/gpui-ce/blob/main/SETUP.md):
+
+- **macOS**: Xcode Command Line Tools (`xcode-select --install`, renders with Metal).
+- **Linux (Ubuntu/Debian)**:
+  ```sh
+  sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev \
+    libwayland-dev libx11-dev libx11-xcb-dev libxcb-randr0-dev \
+    libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xinput-dev \
+    libxkbcommon-dev libxkbcommon-x11-dev
+  ```
+- **Windows**: Visual Studio C++ Build Tools and Windows 10/11 SDK (MSVC toolchain).
+
+```sh
+# Install CLI binary directly with Cargo
+cargo install --git https://github.com/o3wiz/nox --locked
+
+# Or build and run from a local clone
+cargo run -- fixtures/demo.log
+```
 
 ## Using the viewer
 
@@ -64,6 +98,8 @@ Text editing uses GPUI CE's native editable-text element, including clipboard op
 Configuration is grouped by responsibility. The checked-in files in `config/` are also embedded as portable defaults; no config files are needed to start the binary.
 
 ```sh
+# Print version information.
+cargo run -- --version
 # Create editable defaults and local JSON schemas in a NEW directory.
 cargo run -- --init-config ./my-config
 # Use that configuration.
@@ -138,13 +174,45 @@ Files are treated as UTF-8 with replacement characters for invalid sequences. Li
 
 This version covers Klogg's core local-file workflow, not complete feature parity. Remaining differences include encoding detection/selection, archives and URL loading, boolean expression parsing, scratchpads, in-app settings editors, configurable highlighter sets, and Klogg's SIMD search optimizations.
 
-## Development
+## Development, packaging, and releases
+
+Run the full local quality gate (formatting, Clippy, tests, docs, and config validation):
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release
+make check
 ```
 
-Core tests cover indexing, CRLF/UTF-8 handling, file replacement/truncation, search modes/context/limits/cancellation, safe export, configuration overlays/validation, and session persistence. UI regression tests exercise keyboard focus and binding validation.
+Or run individual Cargo commands directly:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
+```
+
+Core tests cover indexing, CRLF/UTF-8 handling, file replacement/truncation, search modes/context/limits/cancellation, safe export, configuration overlays/validation, and session persistence. UI regression tests exercise keyboard focus, text/line selection, zooming, path completion, and binding validation. CLI integration tests verify `--help`, `--version`, `--init-config`, `--write-schemas`, and `--check-config`.
+
+### Building local deliverables
+
+```sh
+# macOS: build Nox.app, drag-to-Applications .dmg, .app.zip, CLI .tar.gz, and SHA256SUMS.txt in dist/
+make package-macos
+
+# macOS: build and install directly to /Applications/Nox.app
+make install-macos
+
+# Linux: build release .tar.gz with desktop entry, icon, and SHA256SUMS.txt in dist/
+make package-linux
+```
+
+### Publishing a GitHub Release (CI/CD)
+
+1. Bump `version` in `Cargo.toml` and ensure `Cargo.lock` and `make check` are clean.
+2. Push your changes to `master` (or `main`) and wait for the **CI** workflow (`macos-15`, `ubuntu-latest`, `windows-latest`) to pass.
+3. Push a matching semantic version tag:
+   ```sh
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+4. The **Release** workflow automatically verifies the tag matches `Cargo.toml`, runs formatting/lint/tests, builds optimized binaries and installers for macOS (Apple Silicon + Intel), Linux (`x86_64`), and Windows (`x86_64`), generates `SHA256SUMS.txt`, and publishes a GitHub Release with release notes. You can also trigger dry-run builds manually from **Actions → Release → Run workflow**.

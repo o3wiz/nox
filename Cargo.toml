@@ -2,6 +2,13 @@
 name = "nox"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
+description = "Native GPU-accelerated log explorer built with Rust and GPUI"
+readme = "README.md"
+repository = "https://github.com/o3wiz/nox"
+keywords = ["log", "viewer", "explorer", "klogg", "gpui"]
+categories = ["command-line-utilities", "development-tools", "gui"]
+default-run = "nox"
 
 [dependencies]
 anyhow = "1"
@@ -16,3 +23,8 @@ tempfile = "3"
 
 [dev-dependencies]
 gpui = { package = "gpui-ce", version = "0.3", features = ["test-support"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
