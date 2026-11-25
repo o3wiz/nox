@@ -287,11 +287,6 @@
       "context": "Presets"
     },
     {
-      "keys": "space",
-      "action": "apply_preset",
-      "context": "Presets"
-    },
-    {
       "keys": "escape",
       "action": "focus_log",
       "context": "Presets"

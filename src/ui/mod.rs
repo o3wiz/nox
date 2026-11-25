@@ -18,6 +18,7 @@ use gpui_ce_elements::editable_text::{
 use icons::Icon;
 use nox::{
     config::{self, Command, Config, SearchConfig, SearchMode},
+    fuzzy::{self, PresetMatch},
     logfile::{LogFile, Stamp},
     path_complete::{
         CompletionResult, PathCompletion, complete_path, ensure_trailing_separator, home_dir,
@@ -318,6 +319,9 @@ pub struct Workspace {
     show_goto: bool,
     show_presets: bool,
     preset_index: usize,
+    presets_search: Entity<EditableTextState>,
+    last_handled_presets_search_version: u16,
+    filtered_presets: Vec<PresetMatch>,
     presets_focus: FocusHandle,
     presets_scroll: ScrollHandle,
     presets_trigger_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -431,6 +435,9 @@ impl Workspace {
         let path_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let path_focus = path_input.read(cx).focus_handle(cx);
         let last_handled_path_version = path_input.read(cx).version();
+        let presets_search = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let last_handled_presets_search_version = presets_search.read(cx).version();
+        let filtered_presets = fuzzy::filter_presets(&config.search.presets, "");
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
                 this.save_session(cx);
@@ -444,9 +451,16 @@ impl Workspace {
                     this.on_path_input_changed(window, cx);
                 },
             ),
+            cx.subscribe_in(
+                &presets_search,
+                window,
+                |this, _, _: &TextChanged, window, cx| {
+                    this.on_presets_search_changed(window, cx);
+                },
+            ),
             cx.on_focus(&path_focus, window, |this, _window, cx| {
                 this.show_goto = false;
-                this.show_presets = false;
+                this.dismiss_presets(cx);
                 cx.notify();
             }),
             cx.on_blur(&path_focus, window, |this, _window, cx| {
@@ -489,6 +503,9 @@ impl Workspace {
             show_goto: false,
             show_presets: false,
             preset_index: 0,
+            presets_search,
+            last_handled_presets_search_version,
+            filtered_presets,
             presets_focus,
             presets_scroll: ScrollHandle::new(),
             presets_trigger_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -650,7 +667,7 @@ impl Workspace {
         self.results_height = self.target_results_height;
         self.clear_scrollbar_states();
         self.clear_row_layouts();
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.close_path_completions();
         let query = self
             .tabs
@@ -680,7 +697,7 @@ impl Workspace {
         self.results_height = self.target_results_height;
         self.clear_scrollbar_states();
         self.clear_row_layouts();
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.close_path_completions();
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -715,7 +732,7 @@ impl Workspace {
         self.recent.insert(0, path.clone());
         self.recent.truncate(self.config.files.recent_limit);
         self.show_files = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.show_goto = false;
         self.close_path_completions();
 
@@ -1149,7 +1166,7 @@ impl Workspace {
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         self.active_pane = pane;
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.dismiss_path_editing(cx);
         match pane {
             Pane::Main => self.focus.focus(window, cx),
@@ -1254,7 +1271,7 @@ impl Workspace {
     ) {
         self.active_pane = pane;
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.dismiss_path_editing(cx);
         self.text_drag = None;
         match pane {
@@ -1321,7 +1338,7 @@ impl Workspace {
             };
             self.active_pane = pane;
             self.show_goto = false;
-            self.show_presets = false;
+            self.dismiss_presets(cx);
             self.dismiss_path_editing(cx);
             self.drag_selecting = None;
             self.scrollbar_drag = None;
@@ -1347,7 +1364,7 @@ impl Workspace {
 
         self.active_pane = pane;
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.dismiss_path_editing(cx);
         self.drag_selecting = None;
         self.scrollbar_drag = None;
@@ -1570,7 +1587,7 @@ impl Workspace {
             selected
         };
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.input.update(cx, |input, cx| {
             input.emplace(&text, cx);
             input.move_to(text.len(), cx);
@@ -1606,7 +1623,7 @@ impl Workspace {
         let escaped = regex::escape(&selected);
         let next = append_regex_alternative(self.input.read(cx).as_str(), &escaped);
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.input.update(cx, |input, cx| {
             input.emplace(&next, cx);
             input.move_to(next.len(), cx);
@@ -1789,7 +1806,7 @@ impl Workspace {
     fn command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
             Command::ShowFiles => {
-                self.show_presets = false;
+                self.dismiss_presets(cx);
                 self.show_files = !self.show_files;
             }
             Command::TogglePresets => {
@@ -1797,9 +1814,7 @@ impl Workspace {
                 return;
             }
             Command::ApplyPreset => {
-                if self.show_presets {
-                    self.apply_preset(self.preset_index, window, cx);
-                }
+                self.apply_selected_preset(window, cx);
                 return;
             }
             Command::NextLine
@@ -1815,7 +1830,7 @@ impl Workspace {
                     return;
                 }
                 if self.show_presets
-                    && self.presets_focus.is_focused(window)
+                    && self.presets_focused(window, cx)
                     && matches!(
                         command,
                         Command::NextLine
@@ -1999,7 +2014,7 @@ impl Workspace {
             Command::Quit => cx.quit(),
             Command::FocusSearch => {
                 self.show_goto = false;
-                self.show_presets = false;
+                self.dismiss_presets(cx);
                 self.dismiss_path_editing(cx);
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
             }
@@ -2237,7 +2252,7 @@ impl Workspace {
                 }
             }
             Command::GoToLine => {
-                self.show_presets = false;
+                self.dismiss_presets(cx);
                 if self.tabs.is_empty() {
                     self.show_goto = false;
                 } else if self.show_goto {
@@ -2445,7 +2460,7 @@ impl Workspace {
             return;
         }
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.sync_path_input(cx);
         self.path_input.update(cx, |input, cx| {
             input.select_document(cx);
@@ -2672,9 +2687,79 @@ impl Workspace {
         self.matching_preset_index(current_input, options)
     }
 
+    fn presets_search_focused(&self, window: &Window, cx: &App) -> bool {
+        self.presets_search
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
+    fn presets_focused(&self, window: &Window, cx: &App) -> bool {
+        self.presets_search_focused(window, cx) || self.presets_focus.is_focused(window)
+    }
+
+    fn set_presets_search_silently(&mut self, text: &str, cx: &mut Context<Self>) {
+        let version = self.presets_search.update(cx, |input, cx| {
+            if input.as_str() != text {
+                input.emplace(text, cx);
+            }
+            input.version()
+        });
+        self.last_handled_presets_search_version = version;
+    }
+
+    fn refresh_filtered_presets(&mut self, select_active_when_empty: bool, cx: &mut Context<Self>) {
+        let query = self.presets_search.read(cx).as_str().to_owned();
+        self.filtered_presets = fuzzy::filter_presets(&self.config.search.presets, &query);
+        if self.filtered_presets.is_empty() {
+            self.preset_index = 0;
+        } else if select_active_when_empty && query.trim().is_empty() {
+            let active = self.active_preset_index(cx);
+            self.preset_index = active
+                .and_then(|idx| self.filtered_presets.iter().position(|m| m.index == idx))
+                .unwrap_or(0);
+            self.presets_scroll.scroll_to_item(self.preset_index);
+        } else {
+            self.preset_index = 0;
+            self.presets_scroll.scroll_to_item(0);
+        }
+    }
+
+    fn on_presets_search_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let version = self.presets_search.read(cx).version();
+        if version == self.last_handled_presets_search_version {
+            return;
+        }
+        self.last_handled_presets_search_version = version;
+        if !self.show_presets {
+            return;
+        }
+        self.refresh_filtered_presets(false, cx);
+        cx.notify();
+    }
+
+    fn dismiss_presets(&mut self, cx: &mut Context<Self>) {
+        if !self.show_presets && self.presets_search.read(cx).as_str().is_empty() {
+            return;
+        }
+        self.show_presets = false;
+        self.set_presets_search_silently("", cx);
+        self.filtered_presets = fuzzy::filter_presets(&self.config.search.presets, "");
+    }
+
+    fn clear_presets_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_presets_search_silently("", cx);
+        self.refresh_filtered_presets(false, cx);
+        self.presets_search
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
     fn toggle_presets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() || self.config.search.presets.is_empty() {
-            self.show_presets = false;
+            self.dismiss_presets(cx);
             return;
         }
         if self.show_presets {
@@ -2683,16 +2768,28 @@ impl Workspace {
             self.show_goto = false;
             self.dismiss_path_editing(cx);
             self.show_presets = true;
-            self.preset_index = self.active_preset_index(cx).unwrap_or(0);
-            self.presets_scroll.scroll_to_item(self.preset_index);
-            self.presets_focus.focus(window, cx);
+            self.set_presets_search_silently("", cx);
+            self.refresh_filtered_presets(true, cx);
+            self.presets_search
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
             cx.notify();
         }
     }
 
     fn close_presets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.focus_visible_pane(self.active_pane, window, cx);
+    }
+
+    fn apply_selected_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_presets {
+            return;
+        }
+        if let Some(matched) = self.filtered_presets.get(self.preset_index) {
+            self.apply_preset(matched.index, window, cx);
+        }
     }
 
     fn apply_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2705,23 +2802,25 @@ impl Workspace {
             tab.options.mode = preset.mode;
             tab.options.highlight_matches = preset.highlight_match;
         }
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.preset_index = index;
         self.start_search(self.active, cx);
         self.focus_visible_pane(self.active_pane, window, cx);
     }
 
     fn navigate_presets(&mut self, command: Command, cx: &mut Context<Self>) {
-        let len = self.config.search.presets.len();
+        let len = self.filtered_presets.len();
         if len == 0 {
+            self.preset_index = 0;
             return;
         }
+        let current = self.preset_index.min(len - 1);
         self.preset_index = match command {
-            Command::NextLine => (self.preset_index + 1) % len,
-            Command::PreviousLine => (self.preset_index + len - 1) % len,
+            Command::NextLine => (current + 1) % len,
+            Command::PreviousLine => (current + len - 1) % len,
             Command::FirstLine => 0,
             Command::LastLine => len - 1,
-            _ => self.preset_index,
+            _ => current,
         };
         self.presets_scroll.scroll_to_item(self.preset_index);
         cx.notify();
@@ -2963,7 +3062,7 @@ impl Workspace {
         self.drag_selecting = None;
         self.text_drag = None;
         self.scrollbar_drag = None;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         if event.click_count >= 2 {
             self.reset_filter_height(window, cx);
             return;
@@ -3142,7 +3241,7 @@ impl Workspace {
         };
         self.active_pane = id.pane;
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.dismiss_path_editing(cx);
         match id.pane {
             Pane::Main => self.focus.focus(window, cx),
@@ -3253,7 +3352,7 @@ impl Workspace {
                             }
                             this.active_pane = Pane::Main;
                             this.show_goto = false;
-                            this.show_presets = false;
+                            this.dismiss_presets(cx);
                             this.dismiss_path_editing(cx);
                             this.focus.focus(window, cx);
                             cx.notify();
@@ -4883,109 +4982,228 @@ impl Workspace {
             } else {
                 0.0
             };
-            let open_upward = results_h + 30.0 + status_h < 180.0;
+            let open_upward = results_h + 30.0 + status_h < 220.0;
             let highlighted = self
                 .preset_index
-                .min(self.config.search.presets.len().saturating_sub(1));
+                .min(self.filtered_presets.len().saturating_sub(1));
+            let filter_query = self.presets_search.read(cx).as_str().to_owned();
+            let has_filter = !filter_query.is_empty();
+            let is_filtering = !filter_query.trim().is_empty();
+            let search_focused = self.presets_search_focused(window, cx);
+            let total_count = self.config.search.presets.len();
+            let count_badge = if is_filtering {
+                format!(
+                    "{}/{}",
+                    format_count(self.filtered_presets.len()),
+                    format_count(total_count)
+                )
+            } else {
+                format_count(total_count)
+            };
+
+            let search_field = div()
+                .h(px(28.))
+                .px_2()
+                .rounded_md()
+                .bg(t.background)
+                .border_1()
+                .border_color(if search_focused {
+                    t.accent_border
+                } else {
+                    t.border
+                })
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.presets_search
+                            .read(cx)
+                            .focus_handle(cx)
+                            .focus(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    Icon::Search.element(ICON_XS, if search_focused { t.accent } else { t.muted }),
+                )
+                .child(
+                    div().flex_1().min_w_0().overflow_hidden().child(
+                        text_input("presets-search")
+                            .debug_selector(|| "presets-search-input".into())
+                            .key_context(format!("{DEFAULT_INPUT_CONTEXT} Presets").as_str())
+                            .state(self.presets_search.downgrade())
+                            .placeholder("Filter patterns…")
+                            .caret_color(t.accent)
+                            .placeholder_color(t.muted)
+                            .font(t.ui_font_spec())
+                            .text_size(t.small_size)
+                            .line_height(relative(1.35))
+                            .min_w_0()
+                            .w_full()
+                            .whitespace_nowrap()
+                            .overflow_x_scroll(),
+                    ),
+                )
+                .when(has_filter, |el| {
+                    el.child(
+                        icon_button(
+                            "clear-presets-search",
+                            Icon::Close,
+                            "Clear pattern filter",
+                            None,
+                            ButtonTone::Ghost,
+                            t,
+                        )
+                        .debug_selector(|| "clear-presets-search".into())
+                        .size(px(22.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.clear_presets_search(window, cx)
+                            }),
+                        ),
+                    )
+                });
 
             let mut list = div()
                 .id("presets-list")
-                .max_h(px(260.))
+                .max_h(px(220.))
                 .overflow_y_scroll()
                 .track_scroll(&self.presets_scroll)
                 .flex()
                 .flex_col()
                 .gap_0p5();
 
-            for (index, preset) in self.config.search.presets.iter().enumerate() {
-                let item_active = active_index == Some(index);
-                let item_highlighted = highlighted == index;
-                let hover = t.hover;
-                let mode_label = match preset.mode {
-                    SearchMode::Regex => "Regex",
-                    SearchMode::Literal => "Literal",
-                };
-
+            if self.filtered_presets.is_empty() {
                 list = list.child(
                     div()
-                        .id(("preset-item", index))
-                        .debug_selector(move || format!("preset-item-{index}"))
+                        .debug_selector(|| "presets-empty".into())
                         .px_2p5()
-                        .py_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if item_highlighted {
-                            t.accent_border
-                        } else {
-                            gpui::transparent_black()
-                        })
-                        .bg(if item_highlighted {
-                            t.selection
-                        } else if item_active {
-                            t.accent_subtle.opacity(0.5)
-                        } else {
-                            gpui::transparent_black()
-                        })
-                        .cursor_pointer()
-                        .hover(move |s| if item_highlighted { s } else { s.bg(hover) })
+                        .py_4()
                         .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                            if this.preset_index != index {
-                                this.preset_index = index;
-                                cx.notify();
-                            }
-                        }))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.apply_preset(index, window, cx);
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_size(t.small_size)
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(if item_active {
-                                            t.accent
-                                        } else {
-                                            t.foreground
-                                        })
-                                        .child(preset.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .px_1p5()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .bg(t.background)
-                                        .border_1()
-                                        .border_color(t.border)
-                                        .font(t.mono_font_spec())
-                                        .text_size(px(10.))
-                                        .text_color(t.muted)
-                                        .child(mode_label),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .font(t.mono_font_spec())
-                                .text_size(t.xs_size)
-                                .text_color(t.muted)
-                                .child(preset.pattern.clone()),
-                        ),
+                        .items_center()
+                        .justify_center()
+                        .text_size(t.small_size)
+                        .text_color(t.muted)
+                        .child("No matching patterns"),
                 );
+            } else {
+                for (row_index, matched) in self.filtered_presets.iter().enumerate() {
+                    let preset_index = matched.index;
+                    let Some(preset) = self.config.search.presets.get(preset_index) else {
+                        continue;
+                    };
+                    let item_active = active_index == Some(preset_index);
+                    let item_highlighted = highlighted == row_index;
+                    let hover = t.hover;
+                    let mode_label = match preset.mode {
+                        SearchMode::Regex => "Regex",
+                        SearchMode::Literal => "Literal",
+                    };
+                    let name_element: AnyElement = if matched.ranges.is_empty() {
+                        preset.name.clone().into_any_element()
+                    } else {
+                        let highlight_style = HighlightStyle {
+                            color: Some(t.accent),
+                            font_weight: Some(FontWeight::BOLD),
+                            background_color: item_active.then_some(t.accent_subtle),
+                            ..Default::default()
+                        };
+                        let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = matched
+                            .ranges
+                            .iter()
+                            .cloned()
+                            .map(|range| (range, highlight_style))
+                            .collect();
+                        StyledText::new(preset.name.clone())
+                            .with_highlights(highlights)
+                            .into_any_element()
+                    };
+
+                    list = list.child(
+                        div()
+                            .id(("preset-item", preset_index))
+                            .debug_selector(move || format!("preset-item-{preset_index}"))
+                            .px_2p5()
+                            .py_1p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if item_highlighted {
+                                t.accent_border
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .bg(if item_highlighted {
+                                t.selection
+                            } else if item_active {
+                                t.accent_subtle.opacity(0.5)
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .cursor_pointer()
+                            .hover(move |s| if item_highlighted { s } else { s.bg(hover) })
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                if this.preset_index != row_index {
+                                    this.preset_index = row_index;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.apply_preset(preset_index, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_size(t.small_size)
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(if item_active {
+                                                t.accent
+                                            } else {
+                                                t.foreground
+                                            })
+                                            .child(name_element),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .bg(t.background)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .font(t.mono_font_spec())
+                                            .text_size(px(10.))
+                                            .text_color(t.muted)
+                                            .child(mode_label),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .font(t.mono_font_spec())
+                                    .text_size(t.xs_size)
+                                    .text_color(t.muted)
+                                    .child(preset.pattern.clone()),
+                            ),
+                    );
+                }
             }
 
             let out_trigger_bounds = self.presets_trigger_bounds.clone();
@@ -4994,6 +5212,9 @@ impl Workspace {
                 .debug_selector(|| "presets-menu".into())
                 .key_context("Presets")
                 .track_focus(&self.presets_focus)
+                .on_action(cx.listener(|this, _: &input_actions::Enter, window, cx| {
+                    this.apply_selected_preset(window, cx);
+                }))
                 .occlude()
                 .absolute()
                 .right_0()
@@ -5007,9 +5228,10 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .gap_1()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                     if !out_trigger_bounds.get().contains(&event.position) {
-                        this.show_presets = false;
+                        this.dismiss_presets(cx);
                         cx.notify();
                     }
                 }))
@@ -5042,7 +5264,7 @@ impl Workspace {
                                         .font(t.mono_font_spec())
                                         .text_size(px(10.))
                                         .text_color(t.muted)
-                                        .child(format_count(self.config.search.presets.len())),
+                                        .child(count_badge),
                                 ),
                         )
                         .child(
@@ -5053,6 +5275,7 @@ impl Workspace {
                                 .child("↑↓ ↵"),
                         ),
                 )
+                .child(search_field)
                 .child(list);
 
             menu = if open_upward {
@@ -6680,12 +6903,12 @@ mod tests {
             .expect("presets trigger should be rendered");
         assert!(cx.debug_bounds("presets-menu").is_none());
 
-        // Keyboard shortcut opens dropdown, focuses it, and positions it cleanly below trigger.
+        // Keyboard shortcut opens dropdown, auto-focuses its search box, and positions it cleanly below trigger.
         cx.simulate_keystrokes(presets_key);
         cx.run_until_parked();
-        view.update_in(cx, |view, window, _| {
+        view.update_in(cx, |view, window, cx| {
             assert!(view.show_presets);
-            assert!(view.presets_focus.is_focused(window));
+            assert!(view.presets_search_focused(window, cx));
             assert_eq!(view.preset_index, 0);
         });
         let menu_bounds = cx
@@ -6876,6 +7099,249 @@ mod tests {
             assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
             assert!(view.tabs[0].options.highlight_matches);
             assert_eq!(view.active_preset_index(cx), Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn saved_patterns_fuzzy_search_live_filters_and_picks_on_enter(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "Errors".into(),
+                pattern: "error|fatal|panic".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+            },
+            config::Preset {
+                name: "Warnings".into(),
+                pattern: "warn".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+            },
+            config::Preset {
+                name: "Requests".into(),
+                pattern: "GET|POST|PUT|DELETE".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+            },
+            config::Preset {
+                name: "HTTP 5xx Errors".into(),
+                pattern: "HTTP 5\\d\\d".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+            },
+            config::Preset {
+                name: "Auth Errors".into(),
+                pattern: "401|403|unauthorized".into(),
+                mode: SearchMode::Regex,
+                highlight_match: false,
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fuzzy-presets.log");
+        std::fs::write(
+            &path,
+            "info boot\nWARN slow query\nERROR panic\nHTTP 502 bad gateway\n401 unauthorized\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let presets_key = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+
+        // Opening saved patterns focuses the fuzzy search input and keeps it single-line.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.show_presets);
+            assert!(view.presets_search_focused(window, cx));
+            assert_eq!(view.filtered_presets.len(), 5);
+            assert_eq!(view.preset_index, 0);
+        });
+        let input_bounds = cx
+            .debug_bounds("presets-search-input")
+            .expect("presets search input should render");
+        assert!(
+            input_bounds.size.height <= px(28.),
+            "presets search input should stay single-line, got {:?}",
+            input_bounds.size.height
+        );
+        for _ in 0..3 {
+            cx.refresh().unwrap();
+            let redrawn = cx
+                .debug_bounds("presets-search-input")
+                .expect("presets search input after redraw");
+            assert_eq!(redrawn.size.height, input_bounds.size.height);
+        }
+
+        // Typing a fuzzy query immediately filters by name, highlights top match, and Enter picks it.
+        cx.simulate_input("wrn");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.presets_search.read(cx).as_str(), "wrn");
+            assert_eq!(
+                view.filtered_presets
+                    .iter()
+                    .map(|m| m.index)
+                    .collect::<Vec<_>>(),
+                vec![1]
+            );
+            assert_eq!(view.preset_index, 0);
+        });
+        assert!(cx.debug_bounds("preset-item-1").is_some());
+        assert!(cx.debug_bounds("preset-item-0").is_none());
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
+            assert_eq!(view.tabs[0].query, "warn");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+        });
+
+        // Reopening starts with an empty filter and highlights the active preset ("Warnings" = 1).
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.show_presets);
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
+            assert_eq!(view.filtered_presets.len(), 5);
+            assert_eq!(view.preset_index, 1);
+        });
+
+        // Multi-word fuzzy query with space keystroke must insert space (not apply preset) and match "HTTP 5xx Errors".
+        cx.simulate_input("http");
+        cx.simulate_keystrokes("space");
+        cx.simulate_input("err");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.show_presets);
+            assert_eq!(view.presets_search.read(cx).as_str(), "http err");
+            assert_eq!(
+                view.filtered_presets
+                    .iter()
+                    .map(|m| m.index)
+                    .collect::<Vec<_>>(),
+                vec![3]
+            );
+            assert_eq!(view.preset_index, 0);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_presets);
+            assert_eq!(view.tabs[0].query, "HTTP 5\\d\\d");
+        });
+
+        // Typing "err" matches multiple presets ranked best-first; arrows pick the second match.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_input("err");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let ranked: Vec<usize> = view.filtered_presets.iter().map(|m| m.index).collect();
+            assert_eq!(ranked[0], 0, "exact prefix 'Errors' should rank first");
+            assert_eq!(ranked.len(), 3);
+            assert_eq!(view.preset_index, 0);
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        let expected_second_index = view.read_with(cx, |view, _| {
+            assert_eq!(view.preset_index, 1);
+            view.filtered_presets[1].index
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_presets);
+            assert_eq!(
+                view.tabs[0].query,
+                view.config.search.presets[expected_second_index].pattern
+            );
+        });
+
+        // Pattern body text ("panic") is NOT matched when searching by pattern name.
+        let query_before_no_match = view.read_with(cx, |view, _| view.tabs[0].query.clone());
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_input("panic");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_presets);
+            assert!(view.filtered_presets.is_empty());
+        });
+        assert!(cx.debug_bounds("presets-empty").is_some());
+
+        // Enter and navigation on empty results are safe no-ops and keep the dropdown open.
+        cx.simulate_keystrokes("down up home end enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_presets);
+            assert!(view.filtered_presets.is_empty());
+            assert_eq!(view.tabs[0].query, query_before_no_match);
+        });
+
+        // Clicking the inline clear button restores all matches and keeps focus in the search input.
+        let clear_center = cx
+            .debug_bounds("clear-presets-search")
+            .expect("clear presets search button should render")
+            .center();
+        cx.simulate_click(clear_center, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.show_presets);
+            assert!(view.presets_search_focused(window, cx));
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
+            assert_eq!(view.filtered_presets.len(), 5);
+            assert_eq!(view.preset_index, 0);
+        });
+
+        // Filtering and clicking a filtered item directly applies it and clears the filter.
+        cx.simulate_input("au");
+        cx.run_until_parked();
+        let auth_center = cx
+            .debug_bounds("preset-item-4")
+            .expect("Auth Errors item should render")
+            .center();
+        cx.simulate_click(auth_center, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
+            assert_eq!(view.tabs[0].query, "401|403|unauthorized");
+            assert!(!view.tabs[0].options.highlight_matches);
+        });
+
+        // Escape dismisses and clears any typed filter query.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_input("req");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
         });
     }
 

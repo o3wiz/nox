@@ -1,4 +1,5 @@
 pub mod config;
+pub mod fuzzy;
 pub mod logfile;
 pub mod path_complete;
 pub mod search;
