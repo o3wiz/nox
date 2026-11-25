@@ -326,6 +326,8 @@ pub fn format_shortcut(keys: &str) -> String {
                     "tab" => "⇥".to_owned(),
                     "up" => "↑".to_owned(),
                     "down" => "↓".to_owned(),
+                    "left" => "←".to_owned(),
+                    "right" => "→".to_owned(),
                     "pageup" => "PgUp".to_owned(),
                     "pagedown" => "PgDn".to_owned(),
                     other => other.to_ascii_uppercase(),

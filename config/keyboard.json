@@ -172,6 +172,16 @@
       "context": "Log"
     },
     {
+      "keys": "left",
+      "action": "scroll_left",
+      "context": "Log"
+    },
+    {
+      "keys": "right",
+      "action": "scroll_right",
+      "context": "Log"
+    },
+    {
       "keys": "b",
       "action": "next_bookmark",
       "context": "Log"

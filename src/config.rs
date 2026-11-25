@@ -165,6 +165,8 @@ pub enum Command {
     LastLine,
     PageUp,
     PageDown,
+    ScrollLeft,
+    ScrollRight,
     NextBookmark,
     PreviousBookmark,
     ShowFiles,

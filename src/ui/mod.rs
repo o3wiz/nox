@@ -39,7 +39,8 @@ use resize::{
 };
 use scrollbar::{
     DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, ScrollAxis, ScrollbarTrackState,
-    resolve_track_press, scroll_offset_for_drag, scrollbar_canvas, set_uniform_list_axis_offset,
+    horizontal_scroll_step, resolve_track_press, scroll_offset_for_drag, scrollbar_canvas,
+    set_uniform_list_axis_offset, step_uniform_list_axis_offset,
 };
 use selectable_text::{RowLayoutCache, SelectableRowText, TextPressEvent};
 use serde::Deserialize;
@@ -1803,6 +1804,47 @@ impl Workspace {
         cx.notify();
     }
 
+    fn scroll_horizontal(
+        &mut self,
+        scroll_right: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self.active_pane_for(window);
+        self.active_pane = pane;
+        let (min_h, max_h) = self.results_height_bounds(window);
+        let eff = self.results_height.clamp(min_h, max_h);
+        if (pane == Pane::Main && is_main_hidden(eff, max_h))
+            || (pane == Pane::Results && is_results_hidden(eff))
+        {
+            return;
+        }
+        let zoom_scale = self.zoom_metrics().scale;
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let handle = match pane {
+            Pane::Main => {
+                if tab.log.as_ref().is_none_or(|log| log.is_empty()) {
+                    return;
+                }
+                &tab.scroll
+            }
+            Pane::Results => {
+                if tab.results.visible.is_empty() {
+                    return;
+                }
+                &tab.result_scroll
+            }
+        };
+        let sign = if scroll_right { 1.0 } else { -1.0 };
+        if step_uniform_list_axis_offset(handle, ScrollAxis::Horizontal, |viewport| {
+            sign * horizontal_scroll_step(viewport, zoom_scale)
+        }) {
+            cx.notify();
+        }
+    }
+
     fn command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
             Command::ShowFiles => {
@@ -1852,6 +1894,10 @@ impl Workspace {
             | Command::SelectPageUp
             | Command::SelectPageDown => {
                 self.navigate(command, true, window, cx);
+                return;
+            }
+            Command::ScrollLeft | Command::ScrollRight => {
+                self.scroll_horizontal(command == Command::ScrollRight, window, cx);
                 return;
             }
             Command::SelectAll => {
@@ -10830,6 +10876,287 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.zoom_percent, MIN_ZOOM_PERCENT);
             assert_eq!(view.header_zoom_count, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn left_and_right_arrows_scroll_active_pane_horizontally_without_affecting_inputs(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wide-keys.log");
+        let long_payload = "x".repeat(320);
+        let content = (0..120)
+            .map(|i| format!("MATCH line {i} {long_payload}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let visible: Vec<usize> = (0..120).collect();
+        let results = SearchResults {
+            matches: visible.clone(),
+            visible,
+            limited: false,
+            widest_row: 0,
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "MATCH".into();
+            view.tabs[0].results = results;
+            view.tabs[0].selected = 0;
+            view.tabs[0].follow = true;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.theme.shortcut(Command::ScrollLeft).as_deref(),
+                Some("←")
+            );
+            assert_eq!(
+                view.theme.shortcut(Command::ScrollRight).as_deref(),
+                Some("→")
+            );
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+            assert_eq!(
+                f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Pressing left at x=0 is a clean no-op.
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Scroll vertically first to verify horizontal scrolling preserves vertical position,
+        // selected line, and follow mode.
+        view.update(cx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Vertical, 120.0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let main_step_100 = view.read_with(cx, |view, _| {
+            let item = view.tabs[0]
+                .scroll
+                .0
+                .borrow()
+                .last_item_size
+                .expect("main list laid out");
+            horizontal_scroll_step(f32::from(item.item.width), 1.0)
+        });
+
+        // Pressing right in main pane scrolls only main pane horizontally and moves its scrollbar thumb.
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let offset = view.tabs[0].scroll.0.borrow().base_handle.offset();
+            assert!((f32::from(offset.x) + main_step_100).abs() < 0.5);
+            assert!((f32::from(offset.y) + 120.0).abs() < 0.5);
+            assert_eq!(view.tabs[0].selected, 0);
+            assert!(view.tabs[0].follow);
+            assert_eq!(
+                f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().x),
+                0.0,
+                "scrolling main pane must not move filter pane"
+            );
+            let hlayout = view
+                .main_hscroll_state
+                .layout()
+                .expect("main horizontal scrollbar layout");
+            assert!(hlayout.thumb.start > 0.0);
+        });
+
+        // Pressing left returns smoothly back to x=0.
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Repeated right presses clamp cleanly at max_offset without overshooting.
+        let max_main_offset = view.read_with(cx, |view, _| {
+            view.main_hscroll_state
+                .layout()
+                .expect("main horizontal scrollbar layout")
+                .max_offset
+        });
+        let presses = (max_main_offset / main_step_100).ceil() as usize + 4;
+        for _ in 0..presses {
+            cx.simulate_keystrokes("right");
+        }
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let offset_x = f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x);
+            assert!(
+                (offset_x + max_main_offset).abs() < 0.5,
+                "expected clamp at -{max_main_offset}, got {offset_x}"
+            );
+        });
+
+        // Switch to filter (results) pane with Tab: right/left scroll only the results pane.
+        let main_offset_before_results = view.read_with(cx, |view, _| {
+            f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x)
+        });
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let results_x = f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().x);
+            assert!(
+                results_x < -10.0,
+                "expected results pane to scroll right, got {results_x}"
+            );
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                main_offset_before_results,
+                "scrolling results pane must not move main pane"
+            );
+            let hlayout = view
+                .results_hscroll_state
+                .layout()
+                .expect("results horizontal scrollbar layout");
+            assert!(hlayout.thumb.start > 0.0);
+        });
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Switch back to main pane, reset x=0, and verify horizontal step scales with zoom.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 0.0);
+            view.set_zoom_percent(200, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        let zoomed_offset_x = view.read_with(cx, |view, _| {
+            -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x)
+        });
+        assert!(
+            zoomed_offset_x > main_step_100 * 1.5,
+            "expected 200% zoom step ({zoomed_offset_x}) to exceed 100% step ({main_step_100})"
+        );
+
+        // Inside Search, FilePath, and GoTo inputs, left/right edit the text cursor and never scroll logs.
+        view.update_in(cx, |view, window, cx| {
+            view.set_zoom_percent(DEFAULT_ZOOM_PERCENT, cx);
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 0.0);
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("ab");
+        cx.simulate_keystrokes("left");
+        cx.simulate_input("X");
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "aXb");
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("right");
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("12");
+        cx.simulate_keystrokes("left");
+        cx.simulate_input("9");
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.goto.read(cx).as_str(), "192");
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn left_and_right_arrows_are_noops_when_lines_fit_without_horizontal_overflow(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("short.log");
+        std::fs::write(&path, "short line 0\nshort line 1\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("right");
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.main_hscroll_state.layout().is_none());
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
         });
     }
 }

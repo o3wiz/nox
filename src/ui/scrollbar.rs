@@ -8,6 +8,7 @@ use std::{cell::Cell, rc::Rc};
 
 pub const DEFAULT_SCROLLBAR_WIDTH: f32 = 10.0;
 pub const HORIZONTAL_BAR_HEIGHT: f32 = 8.0;
+pub const HORIZONTAL_SCROLL_STEP: f32 = 48.0;
 pub const MIN_VERTICAL_THUMB: f32 = 24.0;
 pub const MIN_HORIZONTAL_THUMB: f32 = 28.0;
 pub const TRACK_END_PADDING: f32 = 2.0;
@@ -242,6 +243,78 @@ pub fn scroll_offset_for_drag(
         track_len,
         layout.max_offset,
     )
+}
+
+/// Computes the horizontal keyboard scroll distance in pixels for the current zoom scale and viewport.
+pub fn horizontal_scroll_step(viewport: f32, zoom_scale: f32) -> f32 {
+    let scaled = (HORIZONTAL_SCROLL_STEP * zoom_scale).max(16.0);
+    if viewport > 0.0 {
+        scaled.min((viewport * 0.5).max(16.0))
+    } else {
+        scaled
+    }
+}
+
+/// Computes the next clamped positive scroll offset when stepping by `delta` (`< 0` left/up, `> 0` right/down).
+/// Returns `Some(next_offset)` only when the offset changes meaningfully.
+pub fn stepped_scroll_offset(
+    raw_offset: f32,
+    viewport: f32,
+    content: f32,
+    delta: f32,
+) -> Option<f32> {
+    if viewport <= 0.0 || content <= 0.0 {
+        return None;
+    }
+    let max_offset = (content - viewport).max(0.0);
+    let next = if max_offset <= 0.5 {
+        0.0
+    } else {
+        (raw_offset.clamp(0.0, max_offset) + delta).clamp(0.0, max_offset)
+    };
+    if (next - raw_offset).abs() <= 0.01 {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+/// Steps the scroll offset of a `UniformListScrollHandle` along `axis` by the delta returned by
+/// `delta_for_viewport` (`< 0` toward the start, `> 0` toward the end), clamped to `[0.0, max_offset]`.
+/// Preserves the orthogonal axis offset and returns `true` if the offset changed.
+pub fn step_uniform_list_axis_offset(
+    handle: &UniformListScrollHandle,
+    axis: ScrollAxis,
+    delta_for_viewport: impl FnOnce(f32) -> f32,
+) -> bool {
+    let state = handle.0.borrow();
+    let Some(item_size) = state.last_item_size else {
+        return false;
+    };
+    let mut current = state.base_handle.offset();
+    let (viewport, content, raw_offset) = match axis {
+        ScrollAxis::Vertical => (
+            f32::from(item_size.item.height),
+            f32::from(item_size.contents.height),
+            -f32::from(current.y),
+        ),
+        ScrollAxis::Horizontal => (
+            f32::from(item_size.item.width),
+            f32::from(item_size.contents.width),
+            -f32::from(current.x),
+        ),
+    };
+    let delta = delta_for_viewport(viewport);
+    let Some(next) = stepped_scroll_offset(raw_offset, viewport, content, delta) else {
+        return false;
+    };
+    let clamped = if next <= 0.0 { 0.0 } else { -next };
+    match axis {
+        ScrollAxis::Vertical => current.y = px(clamped),
+        ScrollAxis::Horizontal => current.x = px(clamped),
+    }
+    state.base_handle.set_offset(current);
+    true
 }
 
 /// Applies a positive scroll offset along `axis` to `handle`, preserving the orthogonal axis.
@@ -543,5 +616,39 @@ mod tests {
             ),
             1000.0
         );
+    }
+
+    #[test]
+    fn horizontal_scroll_step_scales_with_zoom_and_caps_to_half_viewport() {
+        assert_eq!(horizontal_scroll_step(800.0, 1.0), HORIZONTAL_SCROLL_STEP);
+        assert_eq!(
+            horizontal_scroll_step(800.0, 2.0),
+            HORIZONTAL_SCROLL_STEP * 2.0
+        );
+        assert_eq!(
+            horizontal_scroll_step(800.0, 0.5),
+            HORIZONTAL_SCROLL_STEP * 0.5
+        );
+        assert_eq!(horizontal_scroll_step(60.0, 2.0), 30.0);
+        assert_eq!(horizontal_scroll_step(10.0, 1.0), 16.0);
+    }
+
+    #[test]
+    fn stepped_scroll_offset_clamps_to_bounds_and_skips_noops() {
+        // Content fits within viewport -> no horizontal scrolling, stale offset resets to 0.
+        assert_eq!(stepped_scroll_offset(0.0, 400.0, 300.0, 48.0), None);
+        assert_eq!(stepped_scroll_offset(0.0, 400.0, 300.0, -48.0), None);
+        assert_eq!(stepped_scroll_offset(50.0, 400.0, 300.0, -48.0), Some(0.0));
+        assert_eq!(stepped_scroll_offset(0.0, 0.0, 300.0, 48.0), None);
+
+        // Overflowing content (max_offset = 600.0).
+        assert_eq!(stepped_scroll_offset(0.0, 400.0, 1000.0, -48.0), None);
+        assert_eq!(stepped_scroll_offset(0.0, 400.0, 1000.0, 48.0), Some(48.0));
+        assert_eq!(stepped_scroll_offset(30.0, 400.0, 1000.0, -48.0), Some(0.0));
+        assert_eq!(
+            stepped_scroll_offset(580.0, 400.0, 1000.0, 48.0),
+            Some(600.0)
+        );
+        assert_eq!(stepped_scroll_offset(600.0, 400.0, 1000.0, 48.0), None);
     }
 }

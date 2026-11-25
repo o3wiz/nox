@@ -87,6 +87,8 @@
         "last_line",
         "page_up",
         "page_down",
+        "scroll_left",
+        "scroll_right",
         "next_bookmark",
         "previous_bookmark",
         "show_files",
