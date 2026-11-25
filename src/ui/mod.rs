@@ -341,6 +341,9 @@ pub struct Workspace {
     state_path: Option<PathBuf>,
     recent: Vec<PathBuf>,
     show_files: bool,
+    header_click_armed: bool,
+    #[cfg(test)]
+    header_zoom_count: usize,
 }
 
 impl Workspace {
@@ -435,6 +438,7 @@ impl Workspace {
             }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
+                    this.header_click_armed = false;
                     this.resize_motion.release_hold();
                     let mut changed = false;
                     if this.results_resize_drag.take().is_some() {
@@ -503,6 +507,9 @@ impl Workspace {
             },
             recent: saved.recent,
             show_files: false,
+            header_click_armed: false,
+            #[cfg(test)]
+            header_zoom_count: 0,
         };
         for path in paths {
             this.open(path, cx);
@@ -616,6 +623,7 @@ impl Workspace {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.active = index;
+        self.header_click_armed = false;
         self.drag_selecting = None;
         self.text_drag = None;
         self.scrollbar_drag = None;
@@ -645,6 +653,7 @@ impl Workspace {
         {
             tab.query = self.input.read(cx).as_str().to_string();
         }
+        self.header_click_armed = false;
         self.drag_selecting = None;
         self.text_drag = None;
         self.scrollbar_drag = None;
@@ -3469,6 +3478,37 @@ impl Workspace {
             .collect()
     }
 
+    fn toggle_window_maximize(&mut self, window: &mut Window) {
+        if window.is_fullscreen() {
+            return;
+        }
+        #[cfg(not(test))]
+        window.zoom_window();
+        #[cfg(test)]
+        {
+            self.header_zoom_count += 1;
+        }
+    }
+
+    fn handle_header_click(&mut self, event: &ClickEvent, window: &mut Window) {
+        if !event.standard_click() || event.is_keyboard() {
+            self.header_click_armed = false;
+            return;
+        }
+        match event.click_count() {
+            1 => {
+                self.header_click_armed = true;
+            }
+            2 if self.header_click_armed => {
+                self.header_click_armed = false;
+                self.toggle_window_maximize(window);
+            }
+            _ => {
+                self.header_click_armed = false;
+            }
+        }
+    }
+
     fn render_header(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let t = &self.theme;
         let pane = self.active_pane_for(window);
@@ -3573,7 +3613,13 @@ impl Workspace {
                                     cx,
                                 )
                             })
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.header_click_armed = false;
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_tab_at(index, cx);
                             })),
@@ -3582,6 +3628,13 @@ impl Workspace {
                     .tooltip(move |_window, cx| {
                         Tooltip::view(full_path.clone(), None, tip_theme.clone(), cx)
                     })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.header_click_armed = false;
+                            cx.stop_propagation();
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.switch(index, cx)))
                     .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         if event.is_middle_click() {
@@ -3600,10 +3653,17 @@ impl Workspace {
 
         div()
             .id("header")
+            .debug_selector(|| "header".into())
             .h(px(46.))
             .pl(header_left_padding)
             .pr_3()
             .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                this.header_click_armed = false;
+            }))
+            .on_click(cx.listener(|this, event: &ClickEvent, window, _cx| {
+                this.handle_header_click(event, window);
+            }))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -3613,6 +3673,7 @@ impl Workspace {
             .border_color(t.border)
             .child(
                 div()
+                    .debug_selector(|| "header-brand".into())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -3630,6 +3691,14 @@ impl Workspace {
             .child(tab_strip)
             .child(
                 div()
+                    .debug_selector(|| "header-actions".into())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.header_click_armed = false;
+                            cx.stop_propagation();
+                        }),
+                    )
                     .flex()
                     .items_center()
                     .gap_1()
@@ -3646,18 +3715,21 @@ impl Workspace {
                         },
                         cx,
                     ))
-                    .child(self.cmd_icon(
-                        "library",
-                        Icon::ClockHistory,
-                        "Recent & favorites",
-                        Command::ShowFiles,
-                        if self.show_files {
-                            ButtonTone::Active
-                        } else {
-                            ButtonTone::Ghost
-                        },
-                        cx,
-                    ))
+                    .child(
+                        self.cmd_icon(
+                            "library",
+                            Icon::ClockHistory,
+                            "Recent & favorites",
+                            Command::ShowFiles,
+                            if self.show_files {
+                                ButtonTone::Active
+                            } else {
+                                ButtonTone::Ghost
+                            },
+                            cx,
+                        )
+                        .debug_selector(|| "header-library".into()),
+                    )
                     .when(has_tabs, |actions| {
                         actions
                             .child(toolbar_divider(t))
@@ -3669,22 +3741,25 @@ impl Workspace {
                                 ButtonTone::Ghost,
                                 cx,
                             ))
-                            .child(self.cmd_icon(
-                                "follow",
-                                Icon::FollowTail,
-                                if follow {
-                                    "Following new lines"
-                                } else {
-                                    "Follow new lines"
-                                },
-                                Command::ToggleFollow,
-                                if follow {
-                                    ButtonTone::Active
-                                } else {
-                                    ButtonTone::Ghost
-                                },
-                                cx,
-                            ))
+                            .child(
+                                self.cmd_icon(
+                                    "follow",
+                                    Icon::FollowTail,
+                                    if follow {
+                                        "Following new lines"
+                                    } else {
+                                        "Follow new lines"
+                                    },
+                                    Command::ToggleFollow,
+                                    if follow {
+                                        ButtonTone::Active
+                                    } else {
+                                        ButtonTone::Ghost
+                                    },
+                                    cx,
+                                )
+                                .debug_selector(|| "header-follow".into()),
+                            )
                             .child(self.cmd_icon(
                                 "mark",
                                 if is_bookmarked {
@@ -9341,5 +9416,178 @@ mod tests {
             assert_eq!(view.active, 0);
             assert_eq!(view.input.read(cx).as_str(), "");
         });
+    }
+
+    #[gpui::test]
+    fn double_clicking_top_ribbon_maximizes_window_without_triggering_on_controls(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        std::fs::write(&first, "alpha\n").unwrap();
+        std::fs::write(&second, "beta\n").unwrap();
+        let log_first = Arc::new(LogFile::open(&first, &AtomicBool::new(false)).unwrap());
+        let log_second = Arc::new(LogFile::open(&second, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, Vec::new(), window, cx));
+        cx.run_until_parked();
+
+        let simulate_counted_click = |cx: &mut VisualTestContext,
+                                      position: Point<Pixels>,
+                                      button: MouseButton,
+                                      count: usize| {
+            cx.simulate_event(MouseDownEvent {
+                button,
+                position,
+                modifiers: Modifiers::none(),
+                click_count: count,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                button,
+                position,
+                modifiers: Modifiers::none(),
+                click_count: count,
+            });
+            cx.run_until_parked();
+        };
+
+        let simulate_double_click = |cx: &mut VisualTestContext, position: Point<Pixels>| {
+            simulate_counted_click(cx, position, MouseButton::Left, 1);
+            simulate_counted_click(cx, position, MouseButton::Left, 2);
+        };
+
+        // Empty workspace (welcome screen): single click on the top ribbon does not maximize.
+        let empty_strip = cx
+            .debug_bounds("tab-strip")
+            .expect("empty tab strip bounds")
+            .center();
+        simulate_counted_click(cx, empty_strip, MouseButton::Left, 1);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 0));
+
+        // Double-clicking empty space on the top ribbon toggles maximize.
+        simulate_double_click(cx, empty_strip);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 1));
+
+        // Double-clicking on the brand title area also toggles maximize.
+        let brand_pt = cx
+            .debug_bounds("header-brand")
+            .expect("header brand bounds")
+            .center();
+        simulate_double_click(cx, brand_pt);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 2));
+
+        // Triple-clicking only triggers maximize once on the second click.
+        simulate_counted_click(cx, empty_strip, MouseButton::Left, 1);
+        simulate_counted_click(cx, empty_strip, MouseButton::Left, 2);
+        simulate_counted_click(cx, empty_strip, MouseButton::Left, 3);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 3));
+
+        // Right-clicking and middle-clicking twice on the top ribbon do not maximize.
+        simulate_counted_click(cx, empty_strip, MouseButton::Right, 1);
+        simulate_counted_click(cx, empty_strip, MouseButton::Right, 2);
+        simulate_counted_click(cx, empty_strip, MouseButton::Middle, 1);
+        simulate_counted_click(cx, empty_strip, MouseButton::Middle, 2);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 3));
+
+        // Double-clicking the library toolbar button toggles the drawer without maximizing.
+        let library_btn = cx
+            .debug_bounds("header-library")
+            .expect("library button bounds")
+            .center();
+        simulate_double_click(cx, library_btn);
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_files);
+            assert_eq!(view.header_zoom_count, 3);
+        });
+
+        // Open two tabs and test empty strip, tab, follow button, and tab close interactions.
+        view.update(cx, |view, cx| {
+            view.open(first.clone(), cx);
+            view.open(second.clone(), cx);
+            view.tabs[0].log = Some(log_first);
+            view.tabs[0].loading = false;
+            view.tabs[1].log = Some(log_second);
+            view.tabs[1].loading = false;
+            view.active = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let strip_bounds = cx.debug_bounds("tab-strip").expect("tab strip bounds");
+        let tab1_bounds = cx.debug_bounds("tab-1").expect("tab 1 bounds");
+        assert!(
+            strip_bounds.right() > tab1_bounds.right() + px(8.),
+            "expected empty drag area to the right of open tabs"
+        );
+        let ribbon_open_pt = point(strip_bounds.right() - px(4.), strip_bounds.center().y);
+        simulate_double_click(cx, ribbon_open_pt);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 4));
+
+        // Double-clicking a tab switches to it and does not maximize.
+        let tab1_body = point(tab1_bounds.left() + px(12.), tab1_bounds.center().y);
+        simulate_double_click(cx, tab1_body);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.header_zoom_count, 4);
+        });
+
+        // Double-clicking an inline header action button toggles it without maximizing.
+        let follow_btn = cx
+            .debug_bounds("header-follow")
+            .expect("follow button bounds")
+            .center();
+        let initial_follow = view.read_with(cx, |view, _| view.tabs[view.active].follow);
+        simulate_double_click(cx, follow_btn);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[view.active].follow, initial_follow);
+            assert_eq!(view.header_zoom_count, 4);
+        });
+
+        // Clicking outside the header disarms a prior single header click.
+        let header_bounds = cx.debug_bounds("header").expect("header bounds");
+        let outside_pt = point(header_bounds.center().x, header_bounds.bottom() + px(40.));
+        simulate_counted_click(cx, ribbon_open_pt, MouseButton::Left, 1);
+        simulate_counted_click(cx, outside_pt, MouseButton::Left, 1);
+        simulate_counted_click(cx, ribbon_open_pt, MouseButton::Left, 2);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 4));
+
+        // Pressing on the header and releasing outside does not arm or maximize.
+        cx.simulate_mouse_down(ribbon_open_pt, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(outside_pt, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(outside_pt, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        simulate_counted_click(cx, ribbon_open_pt, MouseButton::Left, 2);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 4));
+
+        // Rapidly closing the last tab via its close button does not maximize on the second click
+        // even though the second click lands on the newly exposed empty ribbon space.
+        view.update(cx, |view, cx| view.close_tab_at(1, cx));
+        cx.run_until_parked();
+        let last_close = cx
+            .debug_bounds("tab-close-0")
+            .expect("last tab close button bounds")
+            .center();
+        simulate_double_click(cx, last_close);
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs.is_empty());
+            assert_eq!(view.header_zoom_count, 4);
+        });
+
+        // Double-clicking the top ribbon while in fullscreen is ignored.
+        view.update_in(cx, |_view, window, _cx| window.toggle_fullscreen());
+        cx.run_until_parked();
+        let fullscreen_strip = cx
+            .debug_bounds("tab-strip")
+            .expect("fullscreen tab strip bounds")
+            .center();
+        simulate_double_click(cx, fullscreen_strip);
+        view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 4));
     }
 }
