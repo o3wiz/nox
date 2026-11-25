@@ -6,6 +6,7 @@ use gpui::{Hsla, Pixels, Styled, Svg, svg};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Icon {
     NoxMark,
+    Folder,
     FolderOpen,
     ClockHistory,
     StarFilled,
@@ -40,6 +41,7 @@ impl Icon {
     #[cfg(test)]
     pub const ALL: &'static [Icon] = &[
         Icon::NoxMark,
+        Icon::Folder,
         Icon::FolderOpen,
         Icon::ClockHistory,
         Icon::StarFilled,
@@ -73,6 +75,8 @@ impl Icon {
     pub fn svg_bytes(self) -> &'static [u8] {
         match self {
             Icon::NoxMark => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M20.354 15.354A9 9 0 0 1 8.646 3.646 9.003 9.003 0 0 0 12 21a9.003 9.003 0 0 0 8.354-5.646Z" fill="#ffffff"/><circle cx="17.5" cy="6.5" r="1.5" fill="#ffffff"/></svg>"##,
+
+            Icon::Folder => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.6.8l1.2 1.6a2 2 0 0 0 1.6.8H19a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>"##,
 
             Icon::FolderOpen => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.6.8l1.2 1.6a2 2 0 0 0 1.6.8H19a2 2 0 0 1 2 2v1"/><path d="M3 10.5V17a2 2 0 0 0 2 2h12.6a2 2 0 0 0 1.94-1.52l1.2-4.8A1.5 1.5 0 0 0 19.28 11H6.1a1.5 1.5 0 0 0-1.45 1.13L3 18.5"/></svg>"##,
 

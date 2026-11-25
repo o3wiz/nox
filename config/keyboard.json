@@ -7,6 +7,11 @@
       "context": "Workspace"
     },
     {
+      "keys": "secondary-shift-o",
+      "action": "focus_file_path",
+      "context": "Workspace"
+    },
+    {
       "keys": "secondary-w",
       "action": "close_tab",
       "context": "Workspace"
@@ -270,6 +275,41 @@
       "keys": "escape",
       "action": "focus_log",
       "context": "Presets"
+    },
+    {
+      "keys": "enter",
+      "action": "replace_log_path",
+      "context": "FilePath"
+    },
+    {
+      "keys": "secondary-enter",
+      "action": "open_path_in_new_tab",
+      "context": "FilePath"
+    },
+    {
+      "keys": "tab",
+      "action": "complete_file_path",
+      "context": "FilePath"
+    },
+    {
+      "keys": "shift-tab",
+      "action": "previous_file_path_completion",
+      "context": "FilePath"
+    },
+    {
+      "keys": "down",
+      "action": "next_line",
+      "context": "FilePath"
+    },
+    {
+      "keys": "up",
+      "action": "previous_line",
+      "context": "FilePath"
+    },
+    {
+      "keys": "escape",
+      "action": "focus_log",
+      "context": "FilePath"
     }
   ]
 }

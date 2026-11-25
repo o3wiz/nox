@@ -141,7 +141,12 @@ pub enum Command {
     ToggleInvert,
     ToggleHighlightMatches,
     FocusSearch,
+    FocusFilePath,
     FocusLog,
+    ReplaceLogPath,
+    OpenPathInNewTab,
+    CompleteFilePath,
+    PreviousFilePathCompletion,
     ToggleFollow,
     ToggleBookmark,
     NextMatch,
@@ -189,6 +194,7 @@ pub enum KeyContext {
     TextSelectedRegexMode,
     RegexMode,
     Search,
+    FilePath,
     GoTo,
     Presets,
 }
@@ -202,6 +208,7 @@ impl KeyContext {
             Self::TextSelectedRegexMode => "TextSelected && RegexMode",
             Self::RegexMode => "RegexMode",
             Self::Search => "Search",
+            Self::FilePath => "FilePath",
             Self::GoTo => "GoTo",
             Self::Presets => "Presets",
         }
@@ -218,7 +225,7 @@ impl KeyContext {
         match self {
             Self::Workspace => 0,
             Self::RegexMode => 1,
-            Self::Log | Self::Search | Self::GoTo | Self::Presets => 0,
+            Self::Log | Self::Search | Self::FilePath | Self::GoTo | Self::Presets => 0,
             Self::Selection | Self::TextSelected => 1,
             Self::TextSelectedRegexMode => 2,
         }

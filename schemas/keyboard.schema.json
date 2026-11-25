@@ -45,6 +45,7 @@
         "TextSelected && RegexMode",
         "RegexMode",
         "Search",
+        "FilePath",
         "GoTo",
         "Presets"
       ]
@@ -62,7 +63,12 @@
         "toggle_invert",
         "toggle_highlight_matches",
         "focus_search",
+        "focus_file_path",
         "focus_log",
+        "replace_log_path",
+        "open_path_in_new_tab",
+        "complete_file_path",
+        "previous_file_path_completion",
         "toggle_follow",
         "toggle_bookmark",
         "next_match",

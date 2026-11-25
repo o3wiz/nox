@@ -11,14 +11,18 @@ use components::{
 };
 use gpui::{prelude::*, *};
 use gpui_ce_elements::editable_text::{
-    EditableTextState, StringStorage,
-    actions::{DEFAULT_INPUT_CONTEXT, default_bindings},
+    EditableTextState, StringStorage, TextChanged,
+    actions::{self as input_actions, DEFAULT_INPUT_CONTEXT, default_bindings},
     text_input,
 };
 use icons::Icon;
 use nox::{
     config::{self, Command, Config, SearchConfig, SearchMode},
     logfile::{LogFile, Stamp},
+    path_complete::{
+        CompletionResult, PathCompletion, complete_path, ensure_trailing_separator, home_dir,
+        resolve_input_path,
+    },
     search::{self, SearchResults},
     selection::{LineSelection, TextPosition, TextSelection, word_range_at},
     session::{self, SavedTab, Session},
@@ -296,6 +300,13 @@ pub struct Workspace {
     active: usize,
     next_id: usize,
     input: Entity<EditableTextState>,
+    path_input: Entity<EditableTextState>,
+    last_handled_path_version: u16,
+    path_completions: CompletionResult,
+    path_completion_index: Option<usize>,
+    show_path_completions: bool,
+    path_completions_scroll: ScrollHandle,
+    path_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
     goto: Entity<EditableTextState>,
     show_goto: bool,
     show_presets: bool,
@@ -398,12 +409,30 @@ impl Workspace {
         } else {
             config.window.results_height
         };
+        let path_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let path_focus = path_input.read(cx).focus_handle(cx);
+        let last_handled_path_version = path_input.read(cx).version();
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
                 this.save_session(cx);
                 async {}
             }),
             cx.on_release(|this, cx| this.save_session(cx)),
+            cx.subscribe_in(
+                &path_input,
+                window,
+                |this, _, _: &TextChanged, window, cx| {
+                    this.on_path_input_changed(window, cx);
+                },
+            ),
+            cx.on_focus(&path_focus, window, |this, _window, cx| {
+                this.show_goto = false;
+                this.show_presets = false;
+                cx.notify();
+            }),
+            cx.on_blur(&path_focus, window, |this, _window, cx| {
+                this.on_path_input_blur(cx);
+            }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.resize_motion.release_hold();
@@ -429,6 +458,13 @@ impl Workspace {
             active: 0,
             next_id: 0,
             input: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
+            path_input,
+            last_handled_path_version,
+            path_completions: CompletionResult::default(),
+            path_completion_index: None,
+            show_path_completions: false,
+            path_completions_scroll: ScrollHandle::new(),
+            path_bar_bounds: Rc::new(Cell::new(Bounds::default())),
             goto: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
             show_goto: false,
             show_presets: false,
@@ -489,6 +525,7 @@ impl Workspace {
                 .unwrap_or_default();
             this.input.update(cx, |input, cx| input.emplace(&query, cx));
         }
+        this.sync_path_input(cx);
         if let Some(error) = session_error {
             this.status = Some(StatusMessage::error(format!(
                 "{error} · session saving disabled"
@@ -588,12 +625,14 @@ impl Workspace {
         self.clear_scrollbar_states();
         self.clear_row_layouts();
         self.show_presets = false;
+        self.close_path_completions();
         let query = self
             .tabs
             .get(index)
             .map(|tab| tab.query.clone())
             .unwrap_or_default();
         self.input.update(cx, |input, cx| input.emplace(&query, cx));
+        self.sync_path_input(cx);
         cx.notify();
     }
 
@@ -615,6 +654,7 @@ impl Workspace {
         self.clear_scrollbar_states();
         self.clear_row_layouts();
         self.show_presets = false;
+        self.close_path_completions();
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -634,6 +674,73 @@ impl Workspace {
                 .unwrap_or_default();
             self.input.update(cx, |input, cx| input.emplace(&query, cx));
         }
+        self.sync_path_input(cx);
+        cx.notify();
+    }
+
+    fn replace_active_tab(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            self.open(path, cx);
+            return;
+        }
+        let path = path.canonicalize().unwrap_or(path);
+        self.recent.retain(|recent| recent != &path);
+        self.recent.insert(0, path.clone());
+        self.recent.truncate(self.config.files.recent_limit);
+        self.show_files = false;
+        self.show_presets = false;
+        self.show_goto = false;
+        self.close_path_completions();
+
+        let active = self.active;
+        if self.tabs[active].path == path {
+            self.sync_path_input(cx);
+            self.load(active);
+            cx.notify();
+            return;
+        }
+
+        let current_query = self.input.read(cx).as_str().to_string();
+        self.next_id += 1;
+        let new_id = self.next_id;
+
+        self.drag_selecting = None;
+        self.text_drag = None;
+        self.scrollbar_drag = None;
+        self.results_resize_drag = None;
+        self.resize_motion.cancel();
+        self.results_height = self.target_results_height;
+        self.clear_scrollbar_states();
+        self.clear_row_layouts();
+
+        let tab = &mut self.tabs[active];
+        tab.load_cancel.store(true, Ordering::Relaxed);
+        tab.search_cancel.store(true, Ordering::Relaxed);
+        tab.id = new_id;
+        tab.path = path;
+        tab.log = None;
+        tab.loading = false;
+        tab.searching = false;
+        tab.searching_since = None;
+        tab.searching_visible = false;
+        tab.load_cancel = Arc::new(AtomicBool::new(false));
+        tab.search_cancel = Arc::new(AtomicBool::new(false));
+        tab.revision += 1;
+        tab.query = current_query;
+        tab.sync_highlight_regex();
+        tab.results = SearchResults::default();
+        tab.bookmarks.clear();
+        tab.selected = 0;
+        tab.main_selection = LineSelection::single(0);
+        tab.result_selection = LineSelection::empty();
+        tab.main_text_selection = None;
+        tab.result_text_selection = None;
+        tab.scroll = UniformListScrollHandle::new();
+        tab.result_scroll = UniformListScrollHandle::new();
+        tab.error = None;
+
+        self.sync_path_input(cx);
+        self.load(active);
         cx.notify();
     }
 
@@ -1016,6 +1123,7 @@ impl Workspace {
         self.active_pane = pane;
         self.show_goto = false;
         self.show_presets = false;
+        self.dismiss_path_editing(cx);
         match pane {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => {
@@ -1107,6 +1215,7 @@ impl Workspace {
         self.active_pane = pane;
         self.show_goto = false;
         self.show_presets = false;
+        self.dismiss_path_editing(cx);
         self.text_drag = None;
         match pane {
             Pane::Main => self.focus.focus(window, cx),
@@ -1173,6 +1282,7 @@ impl Workspace {
             self.active_pane = pane;
             self.show_goto = false;
             self.show_presets = false;
+            self.dismiss_path_editing(cx);
             self.drag_selecting = None;
             self.scrollbar_drag = None;
             match pane {
@@ -1198,6 +1308,7 @@ impl Workspace {
         self.active_pane = pane;
         self.show_goto = false;
         self.show_presets = false;
+        self.dismiss_path_editing(cx);
         self.drag_selecting = None;
         self.scrollbar_drag = None;
         match pane {
@@ -1656,6 +1767,12 @@ impl Workspace {
             | Command::LastLine
             | Command::PageUp
             | Command::PageDown => {
+                if self.path_input_focused(window, cx)
+                    && matches!(command, Command::NextLine | Command::PreviousLine)
+                {
+                    self.navigate_path_completions(command == Command::NextLine, cx);
+                    return;
+                }
                 if self.show_presets
                     && self.presets_focus.is_focused(window)
                     && matches!(
@@ -1842,12 +1959,39 @@ impl Workspace {
             Command::FocusSearch => {
                 self.show_goto = false;
                 self.show_presets = false;
+                self.dismiss_path_editing(cx);
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
+            }
+            Command::FocusFilePath => {
+                self.focus_file_path(window, cx);
+                return;
+            }
+            Command::ReplaceLogPath => {
+                self.submit_file_path(false, window, cx);
+                return;
+            }
+            Command::OpenPathInNewTab => {
+                self.submit_file_path(true, window, cx);
+                return;
+            }
+            Command::CompleteFilePath => {
+                self.complete_file_path(window, cx);
+                return;
+            }
+            Command::PreviousFilePathCompletion => {
+                self.navigate_path_completions(false, cx);
+                return;
             }
             Command::FocusLog => {
                 if self.show_presets {
                     self.close_presets(window, cx);
+                } else if self.path_input_focused(window, cx) && self.show_path_completions {
+                    self.close_path_completions();
+                    cx.notify();
                 } else {
+                    if self.path_input_focused(window, cx) {
+                        self.sync_path_input(cx);
+                    }
                     let (min_h, max_h) = self.results_height_bounds(window);
                     let eff = self.results_height.clamp(min_h, max_h);
                     if is_main_hidden(eff, max_h) && !is_results_hidden(eff) {
@@ -2098,6 +2242,7 @@ impl Workspace {
                         self.target_results_height = restored;
                     }
                     self.show_goto = true;
+                    self.dismiss_path_editing(cx);
                     self.goto.update(cx, |input, cx| input.emplace("", cx));
                     self.goto.read(cx).focus_handle(cx).focus(window, cx);
                 }
@@ -2120,6 +2265,296 @@ impl Workspace {
             self.command(Command::FocusLog, window, cx);
         } else {
             self.command(Command::GoToLine, window, cx);
+        }
+    }
+
+    fn path_input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.path_input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    fn set_path_input_silently(&mut self, text: &str, cx: &mut Context<Self>) {
+        let version = self.path_input.update(cx, |input, cx| {
+            if input.as_str() != text {
+                input.emplace(text, cx);
+            }
+            input.version()
+        });
+        self.last_handled_path_version = version;
+    }
+
+    fn sync_path_input(&mut self, cx: &mut Context<Self>) {
+        let path = self
+            .tabs
+            .get(self.active)
+            .map(|tab| tab.path.display().to_string())
+            .unwrap_or_default();
+        self.set_path_input_silently(&path, cx);
+    }
+
+    fn close_path_completions(&mut self) {
+        self.show_path_completions = false;
+        self.path_completion_index = None;
+        self.path_completions = CompletionResult::default();
+    }
+
+    fn dismiss_path_editing(&mut self, cx: &mut Context<Self>) {
+        self.close_path_completions();
+        self.sync_path_input(cx);
+    }
+
+    fn refresh_path_completions(&mut self, open_menu: bool, cx: &mut Context<Self>) {
+        let text = self.path_input.read(cx).as_str().to_owned();
+        self.path_completions = complete_path(&text);
+        self.path_completion_index = None;
+        self.show_path_completions = open_menu && !self.path_completions.items.is_empty();
+        if self.show_path_completions {
+            self.path_completions_scroll.scroll_to_item(0);
+        }
+        cx.notify();
+    }
+
+    fn on_path_input_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let version = self.path_input.read(cx).version();
+        if version == self.last_handled_path_version {
+            return;
+        }
+        self.last_handled_path_version = version;
+        if !self.path_input_focused(window, cx) {
+            return;
+        }
+        self.refresh_path_completions(true, cx);
+    }
+
+    fn on_path_input_blur(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_path_editing(cx);
+        cx.notify();
+    }
+
+    fn focus_file_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let (min_h, max_h) = self.results_height_bounds(window);
+        let eff = self.results_height.clamp(min_h, max_h);
+        if is_main_hidden(eff, max_h) {
+            let restored = self
+                .config
+                .window
+                .results_height
+                .min((max_h - 140.0).max(0.0))
+                .clamp(min_h, max_h);
+            self.resize_motion.cancel();
+            self.results_height = restored;
+            self.target_results_height = restored;
+        }
+        self.show_goto = false;
+        self.show_presets = false;
+        self.sync_path_input(cx);
+        self.path_input.update(cx, |input, cx| {
+            input.select_document(cx);
+        });
+        self.path_input.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn navigate_path_completions(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.show_path_completions {
+            self.refresh_path_completions(true, cx);
+            if !self.path_completions.items.is_empty() {
+                let idx = if forward {
+                    0
+                } else {
+                    self.path_completions.items.len() - 1
+                };
+                self.path_completion_index = Some(idx);
+                self.path_completions_scroll.scroll_to_item(idx);
+                cx.notify();
+            }
+            return;
+        }
+        let len = self.path_completions.items.len();
+        if len == 0 {
+            self.path_completion_index = None;
+            return;
+        }
+        let next = match (self.path_completion_index, forward) {
+            (None, true) => 0,
+            (None, false) => len - 1,
+            (Some(i), true) => (i + 1) % len,
+            (Some(i), false) => (i + len - 1) % len,
+        };
+        self.path_completion_index = Some(next);
+        self.path_completions_scroll.scroll_to_item(next);
+        cx.notify();
+    }
+
+    fn apply_path_completion_text(
+        &mut self,
+        item: &PathCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let replacement = &item.replacement;
+        let version = self.path_input.update(cx, |input, cx| {
+            input.emplace(replacement, cx);
+            input.move_to(replacement.len(), cx);
+            input.version()
+        });
+        self.last_handled_path_version = version;
+        self.path_input.read(cx).focus_handle(cx).focus(window, cx);
+        if item.is_dir {
+            self.refresh_path_completions(true, cx);
+        } else {
+            self.close_path_completions();
+            cx.notify();
+        }
+    }
+
+    fn complete_file_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_path_completions
+            && let Some(index) = self.path_completion_index
+            && let Some(item) = self.path_completions.items.get(index).cloned()
+        {
+            self.apply_path_completion_text(&item, window, cx);
+            return;
+        }
+
+        if !self.show_path_completions {
+            let text = self.path_input.read(cx).as_str().to_owned();
+            self.path_completions = complete_path(&text);
+            self.path_completion_index = None;
+        }
+
+        if self.path_completions.items.is_empty() {
+            self.show_path_completions = false;
+            cx.notify();
+            return;
+        }
+
+        if self.path_completions.items.len() == 1 {
+            let item = self.path_completions.items[0].clone();
+            self.apply_path_completion_text(&item, window, cx);
+            return;
+        }
+
+        if let Some(prefix) = self.path_completions.common_prefix.clone() {
+            let version = self.path_input.update(cx, |input, cx| {
+                input.emplace(&prefix, cx);
+                input.move_to(prefix.len(), cx);
+                input.version()
+            });
+            self.last_handled_path_version = version;
+            self.refresh_path_completions(true, cx);
+            return;
+        }
+
+        self.show_path_completions = true;
+        self.path_completion_index = Some(0);
+        self.path_completions_scroll.scroll_to_item(0);
+        cx.notify();
+    }
+
+    fn activate_path_completion(
+        &mut self,
+        index: usize,
+        open_in_new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.path_completions.items.get(index).cloned() else {
+            return;
+        };
+        if item.is_dir {
+            self.apply_path_completion_text(&item, window, cx);
+        } else {
+            self.open_or_replace_from_path_bar(item.resolved, open_in_new_tab, window, cx);
+        }
+    }
+
+    fn open_or_replace_from_path_bar(
+        &mut self,
+        path: PathBuf,
+        open_in_new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = None;
+        self.close_path_completions();
+        if open_in_new_tab {
+            self.open(path, cx);
+        } else {
+            self.replace_active_tab(path, cx);
+        }
+        self.focus_pane(Pane::Main, window, cx);
+    }
+
+    fn submit_file_path(
+        &mut self,
+        open_in_new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.show_path_completions
+            && let Some(index) = self.path_completion_index
+        {
+            self.activate_path_completion(index, open_in_new_tab, window, cx);
+            return;
+        }
+
+        let raw = self.path_input.read(cx).as_str().to_owned();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home = home_dir();
+        let Some(resolved) = resolve_input_path(&raw, &cwd, home.as_deref()) else {
+            self.status = Some(StatusMessage::warning("Enter a file path"));
+            cx.notify();
+            return;
+        };
+
+        match std::fs::metadata(&resolved) {
+            Ok(meta) if meta.is_dir() => {
+                let with_sep = ensure_trailing_separator(raw.trim());
+                if raw != with_sep {
+                    let version = self.path_input.update(cx, |input, cx| {
+                        input.emplace(&with_sep, cx);
+                        input.move_to(with_sep.len(), cx);
+                        input.version()
+                    });
+                    self.last_handled_path_version = version;
+                    self.refresh_path_completions(true, cx);
+                } else {
+                    self.refresh_path_completions(true, cx);
+                    self.status = Some(StatusMessage::warning(
+                        "Path is a directory — choose a file",
+                    ));
+                    cx.notify();
+                }
+            }
+            Ok(meta) if !meta.is_file() => {
+                self.status = Some(StatusMessage::error(format!(
+                    "{} is not a regular file",
+                    resolved.display()
+                )));
+                cx.notify();
+            }
+            Ok(_) => match std::fs::File::open(&resolved) {
+                Ok(_) => {
+                    self.open_or_replace_from_path_bar(resolved, open_in_new_tab, window, cx);
+                }
+                Err(error) => {
+                    self.status = Some(StatusMessage::error(format!(
+                        "Cannot open {}: {error}",
+                        resolved.display()
+                    )));
+                    cx.notify();
+                }
+            },
+            Err(error) => {
+                self.status = Some(StatusMessage::error(format!(
+                    "Cannot open {}: {error}",
+                    resolved.display()
+                )));
+                cx.notify();
+            }
         }
     }
 
@@ -2149,6 +2584,7 @@ impl Workspace {
             self.close_presets(window, cx);
         } else {
             self.show_goto = false;
+            self.dismiss_path_editing(cx);
             self.show_presets = true;
             self.preset_index = self.active_preset_index(cx).unwrap_or(0);
             self.presets_scroll.scroll_to_item(self.preset_index);
@@ -2610,6 +3046,7 @@ impl Workspace {
         self.active_pane = id.pane;
         self.show_goto = false;
         self.show_presets = false;
+        self.dismiss_path_editing(cx);
         match id.pane {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => self.results_focus.focus(window, cx),
@@ -2720,6 +3157,7 @@ impl Workspace {
                             this.active_pane = Pane::Main;
                             this.show_goto = false;
                             this.show_presets = false;
+                            this.dismiss_path_editing(cx);
                             this.focus.focus(window, cx);
                             cx.notify();
                         }))
@@ -3430,6 +3868,386 @@ impl Workspace {
         }
 
         list
+    }
+
+    fn render_path_completions(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
+        let t = &self.theme;
+        let menu_w = (f32::from(window.viewport_size().width) - 48.0).clamp(280.0, 560.0);
+        let highlighted = self.path_completion_index;
+        let count_label = if self.path_completions.total_matches > self.path_completions.items.len()
+            || self.path_completions.scan_truncated
+        {
+            format!("{}+", format_count(self.path_completions.items.len()))
+        } else {
+            format_count(self.path_completions.items.len())
+        };
+        let new_tab_key = t.shortcut(Command::OpenPathInNewTab).unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                "⌘↵"
+            } else {
+                "Ctrl+↵"
+            }
+            .into()
+        });
+
+        let mut list = div()
+            .id("path-completions-list")
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .track_scroll(&self.path_completions_scroll)
+            .flex()
+            .flex_col()
+            .gap_0p5();
+
+        for (index, item) in self.path_completions.items.iter().enumerate() {
+            let item_highlighted = highlighted == Some(index);
+            let hover = t.hover;
+            let is_dir = item.is_dir;
+
+            list = list.child(
+                div()
+                    .id(("path-completion", index))
+                    .debug_selector(move || format!("path-completion-{index}"))
+                    .h(px(28.))
+                    .px_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if item_highlighted {
+                        t.accent_border
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .bg(if item_highlighted {
+                        t.selection
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .cursor_pointer()
+                    .hover(move |s| if item_highlighted { s } else { s.bg(hover) })
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        if this.path_completion_index != Some(index) {
+                            this.path_completion_index = Some(index);
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.activate_path_completion(
+                            index,
+                            event.modifiers().secondary(),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .child(if is_dir {
+                        Icon::Folder.element(ICON_XS, t.accent)
+                    } else {
+                        Icon::FileText.element(ICON_XS, t.muted)
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .font(t.mono_font_spec())
+                            .text_size(t.small_size)
+                            .font_weight(if is_dir {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if is_dir { t.accent } else { t.foreground })
+                            .child(item.label.clone()),
+                    ),
+            );
+        }
+
+        let out_bar_bounds = self.path_bar_bounds.clone();
+        div()
+            .id("path-completions-menu")
+            .debug_selector(|| "path-completions-menu".into())
+            .occlude()
+            .absolute()
+            .left_0()
+            .top(px(26.))
+            .w(px(menu_w))
+            .p_1p5()
+            .rounded_lg()
+            .bg(t.elevated)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                if !out_bar_bounds.get().contains(&event.position) {
+                    this.close_path_completions();
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .px_2()
+                    .pt_0p5()
+                    .pb_1()
+                    .border_b_1()
+                    .border_color(t.border.opacity(0.6))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .min_w_0()
+                            .flex_1()
+                            .child(Icon::Folder.element(px(11.), t.muted))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .font(t.mono_font_spec())
+                                    .text_size(px(10.5))
+                                    .text_color(t.muted)
+                                    .child(self.path_completions.directory_label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .bg(t.background)
+                                    .font(t.mono_font_spec())
+                                    .text_size(px(10.))
+                                    .text_color(t.muted)
+                                    .child(count_label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font(t.mono_font_spec())
+                            .text_size(px(10.))
+                            .text_color(t.muted)
+                            .child(format!("Tab · ↑↓ · ↵ · {new_tab_key}")),
+                    ),
+            )
+            .child(list)
+    }
+
+    fn render_file_path_bar(
+        &self,
+        main_focused: bool,
+        loading: bool,
+        line_count: usize,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let t = &self.theme;
+        let path_focused = self.path_input_focused(window, cx);
+        let bar_bounds = self.path_bar_bounds.clone();
+        let bounds_tracker = canvas(
+            move |bounds, _window, _cx| {
+                bar_bounds.set(bounds);
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        let replace_key = t
+            .shortcut(Command::ReplaceLogPath)
+            .unwrap_or_else(|| "↵".into());
+        let new_tab_key = t.shortcut(Command::OpenPathInNewTab).unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                "⌘↵"
+            } else {
+                "Ctrl+↵"
+            }
+            .into()
+        });
+
+        let path_editor = div()
+            .id("file-path-wrapper")
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .key_context("FilePath")
+            .on_action(cx.listener(|this, _: &input_actions::Enter, window, cx| {
+                this.submit_file_path(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &input_actions::Tab, window, cx| {
+                this.complete_file_path(window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "enter" && event.keystroke.modifiers.secondary() {
+                    cx.stop_propagation();
+                    this.submit_file_path(true, window, cx);
+                } else if event.keystroke.key == "tab" && event.keystroke.modifiers.shift {
+                    cx.stop_propagation();
+                    this.navigate_path_completions(false, cx);
+                }
+            }))
+            .child(
+                div()
+                    .relative()
+                    .h(px(22.))
+                    .px_1p5()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(if path_focused {
+                        t.accent_border
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .bg(if path_focused {
+                        t.panel
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .when(!path_focused, |el| {
+                        let hover_bg = t.hover.opacity(0.5);
+                        let hover_border = t.border.opacity(0.7);
+                        el.hover(move |s| s.bg(hover_bg).border_color(hover_border))
+                    })
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.path_input.read(cx).focus_handle(cx).focus(window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(bounds_tracker)
+                    .child(
+                        text_input("file-path-input")
+                            .debug_selector(|| "file-path-input".into())
+                            .key_context(format!("{DEFAULT_INPUT_CONTEXT} FilePath").as_str())
+                            .state(self.path_input.downgrade())
+                            .placeholder("Enter file path…")
+                            .caret_color(t.accent)
+                            .placeholder_color(t.muted)
+                            .font(t.mono_font_spec())
+                            .text_size(t.xs_size)
+                            .text_color(if main_focused || path_focused {
+                                t.foreground
+                            } else {
+                                t.muted
+                            })
+                            .line_height(relative(1.35))
+                            .min_w_0()
+                            .w_full()
+                            .whitespace_nowrap()
+                            .overflow_x_scroll(),
+                    ),
+            )
+            .when(
+                path_focused
+                    && self.show_path_completions
+                    && !self.path_completions.items.is_empty(),
+                |el| el.child(deferred(self.render_path_completions(window, cx)).priority(1)),
+            );
+
+        div()
+            .debug_selector(|| "file-path-bar".into())
+            .h(px(28.))
+            .px_3()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .bg(t.background)
+            .border_b_1()
+            .border_color(if path_focused {
+                t.accent_border
+            } else {
+                t.border.opacity(0.6)
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.focus_pane(Pane::Main, window, cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .min_w_0()
+                    .flex_1()
+                    .child(div().w(px(2.)).h(px(12.)).rounded_full().bg(
+                        if main_focused || path_focused {
+                            t.accent
+                        } else {
+                            gpui::transparent_black()
+                        },
+                    ))
+                    .child(Icon::Lines.element(
+                        px(12.),
+                        if main_focused || path_focused {
+                            t.accent
+                        } else {
+                            t.muted
+                        },
+                    ))
+                    .child(path_editor),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .font(t.mono_font_spec())
+                    .text_size(t.xs_size)
+                    .text_color(t.muted)
+                    .when(path_focused, |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .text_size(px(10.))
+                                .text_color(t.muted)
+                                .child(
+                                    div()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(t.panel)
+                                        .border_1()
+                                        .border_color(t.border)
+                                        .child(replace_key),
+                                )
+                                .child("Replace")
+                                .child(
+                                    div()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(t.panel)
+                                        .border_1()
+                                        .border_color(t.border)
+                                        .child(new_tab_key),
+                                )
+                                .child("New tab"),
+                        )
+                    })
+                    .when(loading, |el| el.text_color(t.accent).child("Indexing…"))
+                    .child(format_count(line_count)),
+            )
     }
 
     fn render_goto_popover(&self, line_count: usize, cx: &Context<Self>) -> Stateful<Div> {
@@ -4380,7 +5198,6 @@ impl Render for Workspace {
             .unwrap_or_else(|| self.config.search.clone());
         let scroll = tab.map(|tab| tab.scroll.clone()).unwrap_or_default();
         let result_scroll = tab.map(|tab| tab.result_scroll.clone()).unwrap_or_default();
-        let file_path = tab.map(|tab| tab.path.display().to_string());
         let main_multi_selected = tab.is_some_and(|tab| tab.main_selection.has_multi_selection());
         let results_multi_selected =
             tab.is_some_and(|tab| tab.result_selection.has_multi_selection());
@@ -4506,66 +5323,7 @@ impl Render for Workspace {
                 .overflow_hidden()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .debug_selector(|| "file-path-bar".into())
-                        .h(px(26.))
-                        .px_3()
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .bg(t.background)
-                        .border_b_1()
-                        .border_color(t.border.opacity(0.6))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                this.focus_pane(Pane::Main, window, cx)
-                            }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .min_w_0()
-                                .flex_1()
-                                .text_color(if main_focused { t.foreground } else { t.muted })
-                                .child(div().w(px(2.)).h(px(12.)).rounded_full().bg(
-                                    if main_focused {
-                                        t.accent
-                                    } else {
-                                        gpui::transparent_black()
-                                    },
-                                ))
-                                .child(Icon::Lines.element(
-                                    px(12.),
-                                    if main_focused { t.accent } else { t.muted },
-                                ))
-                                .child(
-                                    div()
-                                        .font(t.mono_font_spec())
-                                        .text_size(t.xs_size)
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .child(file_path.unwrap_or_default()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .flex_shrink_0()
-                                .font(t.mono_font_spec())
-                                .text_size(t.xs_size)
-                                .text_color(t.muted)
-                                .when(loading, |el| el.text_color(t.accent).child("Indexing…"))
-                                .child(format_count(line_count)),
-                        ),
-                )
+                .child(self.render_file_path_bar(main_focused, loading, line_count, window, cx))
                 .child(
                     div()
                         .relative()
@@ -7953,6 +8711,499 @@ mod tests {
             assert!(view.tabs.is_empty());
             assert_eq!(view.active, 0);
             assert_eq!(view.input.read(cx).as_str(), "");
+            assert_eq!(view.path_input.read(cx).as_str(), "");
+        });
+    }
+
+    fn wait_for_tab_loaded(view: &Entity<Workspace>, tab_index: usize, cx: &mut VisualTestContext) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            view.update(cx, |view, cx| view.tick(cx));
+            cx.run_until_parked();
+            let loaded = view.read_with(cx, |view, _| {
+                view.tabs
+                    .get(tab_index)
+                    .is_some_and(|tab| !tab.loading && tab.log.is_some())
+            });
+            if loaded {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for tab {tab_index} to finish loading"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[gpui::test]
+    fn file_path_bar_enter_replaces_active_log_and_cmd_enter_opens_new_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        let third = directory.path().join("third.log");
+        std::fs::write(&first, "alpha line\nmatch one\n").unwrap();
+        std::fs::write(&second, "beta line\nmatch two\nthird line\n").unwrap();
+        std::fs::write(&third, "gamma line\n").unwrap();
+        let first_canon = first.canonicalize().unwrap();
+        let second_canon = second.canonicalize().unwrap();
+        let third_canon = third.canonicalize().unwrap();
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![first], window, cx));
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // Initial path bar shows canonical path, stays single-line, and does not open completions.
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                first_canon.display().to_string()
+            );
+            assert!(!view.show_path_completions);
+        });
+        let input_bounds = cx
+            .debug_bounds("file-path-input")
+            .expect("file path input should render");
+        assert!(
+            input_bounds.size.height <= px(28.),
+            "file path input should stay single-line, got {:?}",
+            input_bounds.size.height
+        );
+
+        // Set a search query and bookmark on tab 0 before replacing it.
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("match", cx));
+            view.tabs[0].bookmarks.insert(0);
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+
+        // Clicking the file path input focuses it without popping open completions immediately.
+        cx.simulate_click(input_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.path_input_focused(window, cx));
+            assert!(!view.show_path_completions);
+        });
+
+        // Typing log-shortcut letters (`m`, `f`) inside the file path input must not trigger Log actions.
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        let new_tab_enter = if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        };
+        cx.simulate_keystrokes(select_all);
+        cx.simulate_input("mf");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.path_input.read(cx).as_str(), "mf");
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
+            assert!(!view.tabs[0].follow);
+        });
+
+        // Entering second.log and pressing Enter replaces tab 0 in place, preserving query and clearing bookmarks.
+        cx.simulate_keystrokes(select_all);
+        cx.simulate_input(&second.display().to_string());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, second_canon);
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                second_canon.display().to_string()
+            );
+            assert!(view.tabs[0].bookmarks.is_empty());
+            assert_eq!(view.tabs[0].query, "match");
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+            assert_eq!(view.tabs[0].log.as_ref().unwrap().len(), 3);
+            assert_eq!(view.recent.first(), Some(&second_canon));
+            assert!(view.focus.is_focused(window));
+            assert!(!view.show_path_completions);
+        });
+
+        // Focusing via FocusFilePath, entering third.log, and pressing Cmd+Enter opens a new tab.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&third.display().to_string());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(new_tab_enter);
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 1, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[0].path, second_canon);
+            assert_eq!(view.tabs[1].path, third_canon);
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                third_canon.display().to_string()
+            );
+            assert!(view.focus.is_focused(window));
+            assert!(!view.show_path_completions);
+        });
+
+        // Switching back to tab 0 syncs the file path input without opening completions.
+        view.update(cx, |view, cx| view.switch(0, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                second_canon.display().to_string()
+            );
+            assert!(!view.show_path_completions);
+        });
+    }
+
+    #[gpui::test]
+    fn file_path_bar_completes_filesystem_names_with_tab_arrows_and_mouse(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let archive = root.join("archive");
+        std::fs::create_dir(&archive).unwrap();
+        let nested = archive.join("nested.log");
+        let app1 = root.join("app-2026-01.log");
+        let app2 = root.join("app-2026-02.log");
+        let base = root.join("base.log");
+        let base_rot = root.join("base.log.1");
+        let unique = root.join("unique.log");
+        let hidden = root.join(".secret.log");
+        for file in [&nested, &app1, &app2, &base, &base_rot, &unique, &hidden] {
+            std::fs::write(file, "line\n").unwrap();
+        }
+        let dir_prefix = ensure_trailing_separator(&root.display().to_string());
+        let new_tab_enter = if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        };
+
+        let (view, cx) = cx
+            .add_window_view(|window, cx| Workspace::new(config, vec![unique.clone()], window, cx));
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // Typing a directory prefix opens the completion dropdown with matching files.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&format!("{dir_prefix}ap"));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("path-completions-menu").is_some());
+        view.read_with(cx, |view, _| {
+            let labels: Vec<&str> = view
+                .path_completions
+                .items
+                .iter()
+                .map(|i| i.label.as_str())
+                .collect();
+            assert_eq!(labels, vec!["app-2026-01.log", "app-2026-02.log"]);
+            assert_eq!(view.path_completion_index, None);
+        });
+
+        // Tab extends to the longest common prefix while keeping the dropdown open.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                format!("{dir_prefix}app-2026-0")
+            );
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completion_index, None);
+        });
+
+        // Down/Down selects the second match and Cmd+Enter opens it in a new tab.
+        cx.simulate_keystrokes("down down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(1));
+        });
+        cx.simulate_keystrokes(new_tab_enter);
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 1, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[0].path, unique);
+            assert_eq!(view.tabs[1].path, app2);
+        });
+
+        // Tab on a unique directory completes with trailing separator and immediately lists its children.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&format!("{dir_prefix}ar"));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let expected_dir = format!("{dir_prefix}archive{}", std::path::MAIN_SEPARATOR);
+            assert_eq!(view.path_input.read(cx).as_str(), expected_dir);
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completions.items.len(), 1);
+            assert_eq!(view.path_completions.items[0].label, "nested.log");
+        });
+
+        // Tab on the unique child file completes its path and closes the dropdown; Enter replaces tab 1.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                nested.display().to_string()
+            );
+            assert!(!view.show_path_completions);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 1, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[1].path, nested);
+        });
+
+        // Typing exact file `base.log` when `base.log.1` also exists still submits `base.log` on Enter.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&base.display().to_string());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completion_index, None);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 1, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.tabs[1].path, base);
+        });
+
+        // Mouse click on a completion item replaces active tab; secondary-click opens in a new tab.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&format!("{dir_prefix}app-2026-0"));
+        cx.run_until_parked();
+        let item0 = cx
+            .debug_bounds("path-completion-0")
+            .expect("first completion item")
+            .center();
+        cx.simulate_click(item0, Modifiers::none());
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 1, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.tabs[1].path, app1);
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&format!("{dir_prefix}app-2026-0"));
+        cx.run_until_parked();
+        let item1 = cx
+            .debug_bounds("path-completion-1")
+            .expect("second completion item")
+            .center();
+        cx.simulate_click(item1, Modifiers::secondary_key());
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 2, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 3);
+            assert_eq!(view.active, 2);
+            assert_eq!(view.tabs[1].path, app1);
+            assert_eq!(view.tabs[2].path, app2);
+        });
+
+        // Typing a leading dot reveals dotfiles.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&format!("{dir_prefix}."));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completions.items.len(), 1);
+            assert_eq!(view.path_completions.items[0].label, ".secret.log");
+        });
+    }
+
+    #[gpui::test]
+    fn file_path_bar_escape_blur_and_invalid_or_directory_paths_behave_safely(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let valid = root.join("valid.log");
+        let subdir = root.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(&valid, "ok\n").unwrap();
+        std::fs::write(subdir.join("child.log"), "child\n").unwrap();
+        let missing = root.join("does-not-exist.log");
+        let new_tab_enter = if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        };
+
+        let (view, cx) = cx
+            .add_window_view(|window, cx| Workspace::new(config, vec![valid.clone()], window, cx));
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // Nonexistent path on Enter and Cmd+Enter keeps focus in the input, sets error status,
+        // and leaves the active tab untouched.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&missing.display().to_string());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.path_input_focused(window, cx));
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].path, valid);
+            assert!(matches!(
+                view.status.as_ref().map(|s| s.tone),
+                Some(StatusTone::Error)
+            ));
+        });
+
+        cx.simulate_keystrokes(new_tab_enter);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.path_input_focused(window, cx));
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].path, valid);
+        });
+
+        // Pressing Enter on a directory without trailing separator descends into it and opens completions.
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        cx.simulate_keystrokes(select_all);
+        cx.simulate_input(&subdir.display().to_string());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.path_input_focused(window, cx));
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                ensure_trailing_separator(&subdir.display().to_string())
+            );
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completions.items.len(), 1);
+            assert_eq!(view.path_completions.items[0].label, "child.log");
+        });
+
+        // First Escape dismisses the completion dropdown while staying in the path input.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.path_input_focused(window, cx));
+            assert!(!view.show_path_completions);
+        });
+
+        // Second Escape reverts the text to the active tab's path and returns focus to the log pane.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.focus.is_focused(window));
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                valid.display().to_string()
+            );
+        });
+
+        // Blurring the path bar after a partial edit closes completions and reverts the path.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&ensure_trailing_separator(&root.display().to_string()));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.show_path_completions));
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Main, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_path_completions);
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                valid.display().to_string()
+            );
+        });
+
+        // Focusing search while editing the path bar also closes completions and reverts the path.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&ensure_trailing_separator(&root.display().to_string()));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.show_path_completions));
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_path_completions);
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                valid.display().to_string()
+            );
         });
     }
 }
