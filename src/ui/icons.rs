@@ -35,6 +35,8 @@ pub enum Icon {
     Check,
     PanelExpand,
     PanelShrink,
+    ZoomIn,
+    ZoomOut,
 }
 
 impl Icon {
@@ -70,6 +72,8 @@ impl Icon {
         Icon::Check,
         Icon::PanelExpand,
         Icon::PanelShrink,
+        Icon::ZoomIn,
+        Icon::ZoomOut,
     ];
 
     pub fn svg_bytes(self) -> &'static [u8] {
@@ -133,6 +137,10 @@ impl Icon {
             Icon::PanelExpand => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="6" x2="19" y2="6"/><polyline points="7.5 15.5 12 10.5 16.5 15.5"/></svg>"##,
 
             Icon::PanelShrink => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round"><polyline points="7.5 8.5 12 13.5 16.5 8.5"/><line x1="5" y1="18" x2="19" y2="18"/></svg>"##,
+
+            Icon::ZoomIn => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.75" cy="10.75" r="6.75"/><line x1="15.8" y1="15.8" x2="20.5" y2="20.5"/><line x1="10.75" y1="8" x2="10.75" y2="13.5"/><line x1="8" y1="10.75" x2="13.5" y2="10.75"/></svg>"##,
+
+            Icon::ZoomOut => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.75" cy="10.75" r="6.75"/><line x1="15.8" y1="15.8" x2="20.5" y2="20.5"/><line x1="8" y1="10.75" x2="13.5" y2="10.75"/></svg>"##,
         }
     }
 

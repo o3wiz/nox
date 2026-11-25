@@ -1,5 +1,8 @@
 //! Session state is separate from user configuration; writes replace it atomically.
-use crate::config::{Config, FilesConfig, SearchConfig};
+use crate::{
+    config::{Config, FilesConfig, SearchConfig},
+    zoom::{MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT},
+};
 use anyhow::{Context, Result, ensure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,8 @@ pub struct Session {
     pub recent: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub results_height: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom_percent: Option<u16>,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -37,6 +42,7 @@ impl Default for Session {
             tabs: Vec::new(),
             recent: Vec::new(),
             results_height: None,
+            zoom_percent: None,
         }
     }
 }
@@ -56,6 +62,12 @@ impl Session {
             ensure!(
                 height.is_finite() && (0.0..=4320.0).contains(&height),
                 "Invalid session results_height {height}"
+            );
+        }
+        if let Some(zoom_percent) = state.zoom_percent {
+            ensure!(
+                (MIN_ZOOM_PERCENT..=MAX_ZOOM_PERCENT).contains(&zoom_percent),
+                "Invalid session zoom_percent {zoom_percent}"
             );
         }
         for tab in &state.tabs {

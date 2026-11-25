@@ -26,6 +26,10 @@ use nox::{
     search::{self, SearchResults},
     selection::{LineSelection, TextPosition, TextSelection, word_range_at},
     session::{self, SavedTab, Session},
+    zoom::{
+        DEFAULT_ZOOM_PERCENT, MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, ZoomMetrics, clamp_zoom_percent,
+        scaled_scroll_offset, zoom_in_percent, zoom_out_percent,
+    },
 };
 use regex::Regex;
 use resize::{
@@ -83,47 +87,50 @@ pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
     // (such as `TextSelected && RegexMode` over `TextSelected`) always take precedence.
     parsed.sort_by_key(|(binding, _)| binding.context.specificity());
 
-    let mut out = Vec::with_capacity(parsed.len() + 2);
+    let mut out = Vec::with_capacity(parsed.len() + 4);
     for (binding, loaded) in parsed {
-        // On macOS (and X11/Windows), pressing Shift + '-' folds Shift into '_' and clears
-        // the shift modifier. Register an automatic companion alias so bindings like
-        // `alt-shift--` match both simulated `alt-shift--` and native `alt-_` keystrokes
-        // unless the user explicitly bound the unshifted `_` combination in the same context.
-        let alias = if loaded.keystrokes().len() == 1 {
+        // On macOS (and X11/Windows), pressing Shift + '-' folds Shift into '_' and Shift + '='
+        // folds Shift into '+', clearing the shift modifier. Register automatic companion aliases
+        // so bindings match both simulated shifted keystrokes and native folded keystrokes, and
+        // allow `ZoomIn` on `secondary-=` to also respond to `secondary-+` / `secondary-shift-=`,
+        // unless the user explicitly bound those combinations in the same context.
+        let mut alias_candidates: Vec<(Modifiers, &'static str)> = Vec::new();
+        if loaded.keystrokes().len() == 1 {
             let ks = loaded.keystrokes()[0].inner();
             if ks.modifiers.shift && ks.key == "-" {
                 let mut unshifted = ks.modifiers;
                 unshifted.shift = false;
-                if explicit.insert((binding.context, unshifted, "_".to_owned())) {
-                    let alias_ks = Keystroke {
-                        modifiers: unshifted,
-                        key: "_".to_owned(),
-                        key_char: None,
-                    };
-                    Some(KeyBinding::load(
-                        &alias_ks.unparse(),
-                        Box::new(Execute {
-                            command: binding.action,
-                        }),
-                        Some(
-                            KeyBindingContextPredicate::parse(binding.context.predicate())?.into(),
-                        ),
-                        false,
-                        None,
-                        &DummyKeyboardMapper,
-                    )?)
-                } else {
-                    None
-                }
-            } else {
-                None
+                alias_candidates.push((unshifted, "_"));
+            } else if ks.modifiers.shift && ks.key == "=" {
+                let mut unshifted = ks.modifiers;
+                unshifted.shift = false;
+                alias_candidates.push((unshifted, "+"));
+            } else if binding.action == Command::ZoomIn && !ks.modifiers.shift && ks.key == "=" {
+                alias_candidates.push((ks.modifiers, "+"));
+                let mut shifted = ks.modifiers;
+                shifted.shift = true;
+                alias_candidates.push((shifted, "="));
             }
-        } else {
-            None
-        };
+        }
         out.push(loaded);
-        if let Some(alias) = alias {
-            out.push(alias);
+        for (alias_mods, alias_key) in alias_candidates {
+            if explicit.insert((binding.context, alias_mods, alias_key.to_owned())) {
+                let alias_ks = Keystroke {
+                    modifiers: alias_mods,
+                    key: alias_key.to_owned(),
+                    key_char: None,
+                };
+                out.push(KeyBinding::load(
+                    &alias_ks.unparse(),
+                    Box::new(Execute {
+                        command: binding.action,
+                    }),
+                    Some(KeyBindingContextPredicate::parse(binding.context.predicate())?.into()),
+                    false,
+                    None,
+                    &DummyKeyboardMapper,
+                )?);
+            }
         }
     }
     Ok(out)
@@ -325,6 +332,7 @@ pub struct Workspace {
     scrollbar_drag: Option<ScrollbarDrag>,
     results_height: f32,
     target_results_height: f32,
+    zoom_percent: u16,
     results_resize_drag: Option<ResultsResizeDrag>,
     resize_motion: ResizeMotion,
     resize_frame_scheduled: bool,
@@ -412,6 +420,14 @@ impl Workspace {
         } else {
             config.window.results_height
         };
+        let zoom_percent = if config.files.restore_session {
+            saved
+                .zoom_percent
+                .map(clamp_zoom_percent)
+                .unwrap_or(DEFAULT_ZOOM_PERCENT)
+        } else {
+            DEFAULT_ZOOM_PERCENT
+        };
         let path_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let path_focus = path_input.read(cx).focus_handle(cx);
         let last_handled_path_version = path_input.read(cx).version();
@@ -487,6 +503,7 @@ impl Workspace {
             scrollbar_drag: None,
             results_height,
             target_results_height: results_height,
+            zoom_percent,
             results_resize_drag: None,
             resize_motion: ResizeMotion::default(),
             resize_frame_scheduled: false,
@@ -553,6 +570,7 @@ impl Workspace {
             active: self.active,
             recent: self.recent.clone(),
             results_height: Some(self.target_results_height.round()),
+            zoom_percent: (self.zoom_percent != DEFAULT_ZOOM_PERCENT).then_some(self.zoom_percent),
             tabs: self
                 .tabs
                 .iter()
@@ -1685,6 +1703,7 @@ impl Workspace {
         let pane = self.active_pane_for(window);
         self.active_pane = pane;
         let results_h = self.effective_results_height(window);
+        let line_height = self.zoom_metrics().line_height;
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -1699,7 +1718,7 @@ impl Workspace {
                 }
                 tab.main_text_selection = None;
                 let step = ((f32::from(window.viewport_size().height) - results_h - 180.)
-                    / self.config.viewer.line_height)
+                    / line_height)
                     .max(1.) as usize;
                 let current = tab.main_selection.cursor.min(len - 1);
                 let target = match command {
@@ -1728,7 +1747,7 @@ impl Workspace {
                     return;
                 }
                 tab.result_text_selection = None;
-                let step = (results_h / self.config.viewer.line_height).max(1.) as usize;
+                let step = (results_h / line_height).max(1.) as usize;
                 let current = tab.result_selection.cursor.min(len - 1);
                 let target = match command {
                     Command::NextLine | Command::SelectNextLine => current.saturating_add(1),
@@ -2267,6 +2286,79 @@ impl Workspace {
                 self.resize_filter_height_keyboard(ResizeDirection::Shrink, window, cx);
                 return;
             }
+            Command::ZoomIn => {
+                self.set_zoom_percent(zoom_in_percent(self.zoom_percent), cx);
+                return;
+            }
+            Command::ZoomOut => {
+                self.set_zoom_percent(zoom_out_percent(self.zoom_percent), cx);
+                return;
+            }
+            Command::ZoomReset => {
+                self.set_zoom_percent(DEFAULT_ZOOM_PERCENT, cx);
+                return;
+            }
+        }
+        cx.notify();
+    }
+
+    fn zoom_metrics(&self) -> ZoomMetrics {
+        ZoomMetrics::compute(
+            self.config.appearance.font_size,
+            self.config.viewer.line_height,
+            f32::from(self.theme.small_size),
+            self.zoom_percent,
+        )
+    }
+
+    fn scale_uniform_list_scroll(
+        handle: &UniformListScrollHandle,
+        old_metrics: ZoomMetrics,
+        new_metrics: ZoomMetrics,
+        row_count: usize,
+    ) {
+        let state = handle.0.borrow();
+        let offset = state.base_handle.offset();
+        let viewport_height = state
+            .last_item_size
+            .map(|item_size| f32::from(item_size.item.height));
+        let (next_x, next_y) = scaled_scroll_offset(
+            f32::from(offset.x),
+            f32::from(offset.y),
+            old_metrics.line_height,
+            new_metrics.line_height,
+            old_metrics.scale,
+            new_metrics.scale,
+            viewport_height,
+            row_count,
+        );
+        state.base_handle.set_offset(point(px(next_x), px(next_y)));
+    }
+
+    fn set_zoom_percent(&mut self, next_percent: u16, cx: &mut Context<Self>) {
+        let clamped = clamp_zoom_percent(next_percent);
+        if clamped == self.zoom_percent {
+            return;
+        }
+        let old_metrics = self.zoom_metrics();
+        self.zoom_percent = clamped;
+        let new_metrics = self.zoom_metrics();
+        self.text_drag = None;
+        self.scrollbar_drag = None;
+        self.clear_row_layouts();
+        for tab in &mut self.tabs {
+            let main_rows = tab.log.as_ref().map_or(0, |log| log.len());
+            Self::scale_uniform_list_scroll(&tab.scroll, old_metrics, new_metrics, main_rows);
+            if tab.follow {
+                tab.scroll.scroll_to_bottom();
+            }
+            let result_rows = tab.results.visible.len();
+            Self::scale_uniform_list_scroll(
+                &tab.result_scroll,
+                old_metrics,
+                new_metrics,
+                result_rows,
+            );
         }
         cx.notify();
     }
@@ -3288,7 +3380,8 @@ impl Workspace {
         let search_mode = tab.options.mode;
         let max_display_chars = self.config.viewer.max_display_chars;
         let tab_width = self.config.viewer.tab_width;
-        let row_height = px(self.config.viewer.line_height);
+        let metrics = self.zoom_metrics();
+        let row_height = px(metrics.line_height);
         let frame = self.render_frame;
         let cache = self.row_layouts(pane).clone();
         let text_selection = tab.text_selection(pane);
@@ -3396,11 +3489,11 @@ impl Workspace {
                         })
                         .flex()
                         .items_center()
-                        .h(px(self.config.viewer.line_height))
+                        .h(row_height)
                         .min_w_full()
                         .whitespace_nowrap()
                         .font(t.mono_font_spec())
-                        .text_size(t.mono_size)
+                        .text_size(px(metrics.font_size))
                         .bg(row_bg)
                         .hover(move |s| s.bg(hover_bg))
                         .border_l_2()
@@ -3410,17 +3503,23 @@ impl Workspace {
                         .child(
                             div()
                                 .id((if results { "rmark" } else { "mark" }, line))
-                                .w(px(28.))
+                                .w(px(metrics.mark_gutter_width))
                                 .h_full()
                                 .flex_shrink_0()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .when(marked, |g| {
-                                    g.child(Icon::BookmarkFilled.element(px(12.), t.warning))
+                                    g.child(
+                                        Icon::BookmarkFilled
+                                            .element(px(metrics.bookmark_icon_size), t.warning),
+                                    )
                                 })
                                 .when(!marked && matched, |g| {
-                                    g.child(Icon::MatchDot.element(px(9.), t.accent))
+                                    g.child(
+                                        Icon::MatchDot
+                                            .element(px(metrics.match_dot_size), t.accent),
+                                    )
                                 })
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -3433,17 +3532,17 @@ impl Workspace {
                         .when(self.config.viewer.line_numbers, |row| {
                             row.child(
                                 div()
-                                    .w(px(72.))
+                                    .w(px(metrics.line_number_width))
                                     .h_full()
-                                    .pr_3()
-                                    .mr_3()
+                                    .pr(px(metrics.line_number_padding))
+                                    .mr(px(metrics.line_number_padding))
                                     .flex_shrink_0()
                                     .flex()
                                     .items_center()
                                     .justify_end()
                                     .border_r_1()
                                     .border_color(t.border.opacity(0.6))
-                                    .text_size(t.small_size)
+                                    .text_size(px(metrics.line_number_size))
                                     .text_color(if selected { t.foreground } else { t.muted })
                                     .child(format!("{}", line + 1)),
                             )
@@ -3507,6 +3606,57 @@ impl Workspace {
                 self.header_click_armed = false;
             }
         }
+    }
+
+    fn render_zoom_button(
+        &self,
+        id: &'static str,
+        icon: Icon,
+        tooltip: &'static str,
+        command: Command,
+        disabled: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let t = &self.theme;
+        let tip_theme = t.clone();
+        let shortcut = t.shortcut(command);
+        let fg = if disabled {
+            t.muted.opacity(0.35)
+        } else {
+            t.muted
+        };
+        let hover_bg = t.hover;
+        let hover_fg = t.foreground;
+
+        let mut btn = div()
+            .id(id)
+            .group(id)
+            .debug_selector(move || id.into())
+            .size(px(32.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .child(icon.element(ICON_SM, fg).when(!disabled, |el| {
+                el.group_hover(id, move |s| s.text_color(hover_fg))
+            }))
+            .tooltip_show_delay(TOOLTIP_DELAY)
+            .tooltip(move |_window, cx| {
+                Tooltip::view(tooltip, shortcut.clone(), tip_theme.clone(), cx)
+            });
+
+        if !disabled {
+            btn = btn
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.command(command, window, cx);
+                }));
+        }
+        btn
     }
 
     fn render_header(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
@@ -3819,6 +3969,23 @@ impl Workspace {
                                     Command::CopyLine
                                 },
                                 ButtonTone::Ghost,
+                                cx,
+                            ))
+                            .child(toolbar_divider(t))
+                            .child(self.render_zoom_button(
+                                "zoom-out",
+                                Icon::ZoomOut,
+                                "Zoom out",
+                                Command::ZoomOut,
+                                self.zoom_percent <= MIN_ZOOM_PERCENT,
+                                cx,
+                            ))
+                            .child(self.render_zoom_button(
+                                "zoom-in",
+                                Icon::ZoomIn,
+                                "Zoom in",
+                                Command::ZoomIn,
+                                self.zoom_percent >= MAX_ZOOM_PERCENT,
                                 cx,
                             ))
                     }),
@@ -5228,7 +5395,39 @@ impl Workspace {
                             )
                         })
                     })
-                    .when(tab.is_none(), |left| left.child("Ready")),
+                    .when(tab.is_none(), |left| left.child("Ready"))
+                    .when(self.zoom_percent != DEFAULT_ZOOM_PERCENT, |left| {
+                        let tip_theme = t.clone();
+                        let reset_shortcut = t.shortcut(Command::ZoomReset);
+                        let fg = t.foreground;
+                        left.child(
+                            div()
+                                .id("status-zoom")
+                                .debug_selector(|| "status-zoom".into())
+                                .px_1p5()
+                                .rounded_sm()
+                                .bg(t.elevated)
+                                .border_1()
+                                .border_color(t.border)
+                                .font(t.mono_font_spec())
+                                .text_color(t.accent)
+                                .cursor_pointer()
+                                .hover(move |s| s.text_color(fg))
+                                .child(format!("{}%", self.zoom_percent))
+                                .tooltip_show_delay(TOOLTIP_DELAY)
+                                .tooltip(move |_window, cx| {
+                                    Tooltip::view(
+                                        "Reset zoom",
+                                        reset_shortcut.clone(),
+                                        tip_theme.clone(),
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.command(Command::ZoomReset, window, cx)
+                                })),
+                        )
+                    }),
             )
             .when_some(self.status.clone(), |bar, feedback| {
                 let (icon, color) = feedback.icon_and_color(t);
@@ -9589,5 +9788,425 @@ mod tests {
             .center();
         simulate_double_click(cx, fullscreen_strip);
         view.read_with(cx, |view, _| assert_eq!(view.header_zoom_count, 4));
+    }
+
+    #[gpui::test]
+    fn zoom_shortcuts_scale_main_and_filter_rows_clamp_bounds_and_reset(cx: &mut TestAppContext) {
+        use nox::zoom::{MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT};
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zoom.log");
+        let content: String = (0..120)
+            .map(|i| format!("INFO line {i} payload ERROR sample\n"))
+            .collect();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log);
+            workspace.tabs[0].loading = false;
+            workspace
+                .input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            workspace.start_search(0, cx);
+            workspace
+        });
+        cx.run_until_parked();
+
+        // Shortcut labels format cleanly for Cmd+=, Cmd+-, Cmd+0 (or Ctrl variants).
+        view.read_with(cx, |view, _| {
+            if cfg!(target_os = "macos") {
+                assert_eq!(view.theme.shortcut(Command::ZoomIn).as_deref(), Some("⌘="));
+                assert_eq!(view.theme.shortcut(Command::ZoomOut).as_deref(), Some("⌘-"));
+                assert_eq!(
+                    view.theme.shortcut(Command::ZoomReset).as_deref(),
+                    Some("⌘0")
+                );
+            } else {
+                assert_eq!(
+                    view.theme.shortcut(Command::ZoomIn).as_deref(),
+                    Some("Ctrl+=")
+                );
+                assert_eq!(
+                    view.theme.shortcut(Command::ZoomOut).as_deref(),
+                    Some("Ctrl+-")
+                );
+                assert_eq!(
+                    view.theme.shortcut(Command::ZoomReset).as_deref(),
+                    Some("Ctrl+0")
+                );
+            }
+            assert_eq!(view.zoom_percent, DEFAULT_ZOOM_PERCENT);
+        });
+
+        // Baseline row heights match configured viewer.line_height (24px) and no zoom pill is shown.
+        let main_h_100 = f32::from(cx.debug_bounds("main-row-0").unwrap().size.height);
+        let result_h_100 = f32::from(cx.debug_bounds("result-row-0").unwrap().size.height);
+        assert_eq!(main_h_100, 24.0);
+        assert_eq!(result_h_100, 24.0);
+        assert!(cx.debug_bounds("status-zoom").is_none());
+
+        // Cmd+= (or Ctrl+=) zooms in to 110%, growing both main and filter rows and showing status pill.
+        let zoom_in_key = if cfg!(target_os = "macos") {
+            "cmd-="
+        } else {
+            "ctrl-="
+        };
+        let zoom_plus_key = if cfg!(target_os = "macos") {
+            "cmd-+"
+        } else {
+            "ctrl-+"
+        };
+        let zoom_shift_eq_key = if cfg!(target_os = "macos") {
+            "cmd-shift-="
+        } else {
+            "ctrl-shift-="
+        };
+        let zoom_out_key = if cfg!(target_os = "macos") {
+            "cmd--"
+        } else {
+            "ctrl--"
+        };
+        let zoom_reset_key = if cfg!(target_os = "macos") {
+            "cmd-0"
+        } else {
+            "ctrl-0"
+        };
+
+        cx.simulate_keystrokes(zoom_in_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.zoom_percent, 110));
+        let main_h_110 = f32::from(cx.debug_bounds("main-row-0").unwrap().size.height);
+        let result_h_110 = f32::from(cx.debug_bounds("result-row-0").unwrap().size.height);
+        assert_eq!(main_h_110, 26.0);
+        assert_eq!(result_h_110, 26.0);
+        assert!(cx.debug_bounds("status-zoom").is_some());
+
+        // Companion aliases Cmd++ and Cmd+Shift+= also zoom in cleanly.
+        cx.simulate_keystrokes(zoom_plus_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.zoom_percent, 120));
+        cx.simulate_keystrokes(zoom_shift_eq_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.zoom_percent, 130));
+
+        // Cmd+- zooms out one step to 120%.
+        cx.simulate_keystrokes(zoom_out_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.zoom_percent, 120));
+        let main_h_120 = f32::from(cx.debug_bounds("main-row-0").unwrap().size.height);
+        assert_eq!(main_h_120, 29.0);
+
+        // Clicking the status-bar zoom badge resets zoom to 100% and hides the badge.
+        let zoom_pill = cx.debug_bounds("status-zoom").unwrap().center();
+        cx.simulate_click(zoom_pill, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.zoom_percent, 100));
+        assert_eq!(
+            f32::from(cx.debug_bounds("main-row-0").unwrap().size.height),
+            24.0
+        );
+        assert!(cx.debug_bounds("status-zoom").is_none());
+
+        // Zoom works while the search input is focused without inserting characters into the query.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(zoom_in_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.zoom_percent, 110);
+            assert_eq!(view.input.read(cx).as_str(), "ERROR");
+        });
+        cx.simulate_keystrokes(zoom_out_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.zoom_percent, 100);
+            assert_eq!(view.input.read(cx).as_str(), "ERROR");
+        });
+
+        // Clamps cleanly at MAX_ZOOM_PERCENT and MIN_ZOOM_PERCENT, and Cmd+0 resets to 100%.
+        for _ in 0..30 {
+            cx.simulate_keystrokes(zoom_in_key);
+        }
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.zoom_percent, MAX_ZOOM_PERCENT);
+        });
+        assert_eq!(
+            f32::from(cx.debug_bounds("main-row-0").unwrap().size.height),
+            72.0
+        );
+
+        for _ in 0..40 {
+            cx.simulate_keystrokes(zoom_out_key);
+        }
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.zoom_percent, MIN_ZOOM_PERCENT);
+        });
+        assert_eq!(
+            f32::from(cx.debug_bounds("main-row-0").unwrap().size.height),
+            12.0
+        );
+        assert_eq!(
+            f32::from(cx.debug_bounds("result-row-0").unwrap().size.height),
+            12.0
+        );
+
+        cx.simulate_keystrokes(zoom_reset_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.zoom_percent, 100));
+
+        // Explicit user binding on `secondary-+` is preserved and not overridden by the ZoomIn alias.
+        let mut custom = config;
+        custom.keyboard.bindings.push(config::Binding {
+            keys: "secondary-+".into(),
+            context: config::KeyContext::Workspace,
+            action: Command::Reload,
+        });
+        let custom_bindings = keybindings(&custom).unwrap();
+        let plus = Keystroke::parse("secondary-+").unwrap();
+        let plus_actions: Vec<Command> = custom_bindings
+            .iter()
+            .filter(|b| b.keystrokes().len() == 1 && b.keystrokes()[0].inner() == &plus)
+            .filter_map(|b| {
+                b.action()
+                    .as_any()
+                    .downcast_ref::<Execute>()
+                    .map(|e| e.command)
+            })
+            .collect();
+        assert_eq!(plus_actions, vec![Command::Reload]);
+    }
+
+    #[gpui::test]
+    fn zoom_preserves_scroll_position_adapts_page_navigation_and_persists_in_session(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let state_file = directory.path().join("session.json");
+        let path = directory.path().join("scroll.log");
+        let content: String = (0..300)
+            .map(|i| format!("2026-11-25 INFO row-{i:04} message body\n"))
+            .collect();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = true;
+        config.files.restore_session = true;
+        config.files.state_file = Some(state_file.display().to_string());
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log);
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        vcx.run_until_parked();
+
+        // Scroll main pane so row 100 sits at the top of the viewport (100 * 24px = 2400px).
+        view.update(vcx, |view, cx| {
+            view.tabs[0]
+                .scroll
+                .scroll_to_item_strict(100, ScrollStrategy::Top);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            let offset_y = f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!((offset_y - -2400.0).abs() < 1.0, "got offset_y={offset_y}");
+        });
+
+        // Zoom in 5 steps to 150% (line_height = 36px): row 100 stays anchored at top (-3600px).
+        view.update_in(vcx, |view, window, cx| {
+            for _ in 0..5 {
+                view.command(Command::ZoomIn, window, cx);
+            }
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.zoom_percent, 150);
+            let offset_y = f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                (offset_y - -3600.0).abs() < 2.0,
+                "expected row 100 anchored near -3600px, got {offset_y}"
+            );
+        });
+
+        // PageDown moves fewer rows when zoomed in to 200% than at 100%.
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::ZoomReset, window, cx);
+            view.tabs[0].selected = 0;
+            view.tabs[0].main_selection.select_single(0);
+            view.command(Command::PageDown, window, cx);
+        });
+        vcx.run_until_parked();
+        let step_100 = view.read_with(vcx, |view, _| view.tabs[0].selected);
+
+        view.update_in(vcx, |view, window, cx| {
+            for _ in 0..10 {
+                view.command(Command::ZoomIn, window, cx);
+            }
+            view.tabs[0].selected = 0;
+            view.tabs[0].main_selection.select_single(0);
+            view.command(Command::PageDown, window, cx);
+        });
+        vcx.run_until_parked();
+        let step_200 = view.read_with(vcx, |view, _| view.tabs[0].selected);
+        assert!(
+            step_200 > 0 && step_200 < step_100,
+            "expected smaller page step at 200% zoom (100%={step_100}, 200%={step_200})"
+        );
+
+        // Following mode stays pinned to the bottom when zooming in/out.
+        view.update_in(vcx, |view, window, cx| {
+            view.tabs[0].follow = true;
+            view.tabs[0].scroll.scroll_to_bottom();
+            view.command(Command::ZoomOut, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.zoom_percent, 190);
+            assert_eq!(view.tabs[0].scroll.is_scrolled_to_end(), Some(true));
+        });
+
+        // Session persistence saves and restores zoom_percent, and omits it when reset to 100%.
+        view.read_with(vcx, |view, cx| view.save_session(cx));
+        let saved = Session::load(&state_file, &config).unwrap();
+        assert_eq!(saved.zoom_percent, Some(190));
+
+        let (restored_view, restored_cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config.clone(), Vec::new(), window, cx));
+        restored_cx.run_until_parked();
+        restored_view.read_with(restored_cx, |view, _| {
+            assert_eq!(view.zoom_percent, 190);
+        });
+
+        restored_view.update_in(restored_cx, |view, window, cx| {
+            view.command(Command::ZoomReset, window, cx);
+            view.save_session(cx);
+        });
+        let saved_reset = Session::load(&state_file, &config).unwrap();
+        assert_eq!(saved_reset.zoom_percent, None);
+    }
+
+    #[gpui::test]
+    fn header_zoom_buttons_adjust_zoom_stay_stable_clamp_and_never_maximize_window(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("buttons.log");
+        std::fs::write(&path, "INFO alpha\nERROR beta\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, Vec::new(), window, cx));
+        cx.run_until_parked();
+
+        // Zoom buttons are hidden on the empty welcome screen.
+        assert!(cx.debug_bounds("zoom-in").is_none());
+        assert!(cx.debug_bounds("zoom-out").is_none());
+
+        // Opening a tab shows both zoom buttons in the top toolbar.
+        view.update(cx, |view, cx| {
+            view.open(path.clone(), cx);
+            view.tabs[0].log = Some(log);
+            view.tabs[0].loading = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let zoom_in_bounds = cx.debug_bounds("zoom-in").expect("zoom-in button bounds");
+        let zoom_out_bounds = cx.debug_bounds("zoom-out").expect("zoom-out button bounds");
+        assert!(
+            zoom_out_bounds.right() <= zoom_in_bounds.left(),
+            "zoom-out should sit to the left of zoom-in"
+        );
+
+        // Clicking zoom-in grows zoom to 110% without shifting button coordinates.
+        cx.simulate_click(zoom_in_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.zoom_percent, 110));
+        assert_eq!(
+            cx.debug_bounds("zoom-in").expect("zoom-in after click"),
+            zoom_in_bounds
+        );
+        assert_eq!(
+            cx.debug_bounds("zoom-out").expect("zoom-out after click"),
+            zoom_out_bounds
+        );
+
+        // Rapid double-clicking zoom-in zooms twice without maximizing the window.
+        let pos = zoom_in_bounds.center();
+        for count in [1, 2] {
+            cx.simulate_event(MouseDownEvent {
+                button: MouseButton::Left,
+                position: pos,
+                modifiers: Modifiers::none(),
+                click_count: count,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: pos,
+                modifiers: Modifiers::none(),
+                click_count: count,
+            });
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.zoom_percent, 130);
+            assert_eq!(view.header_zoom_count, 0);
+        });
+
+        // Clicking zoom-out steps back down.
+        cx.simulate_click(zoom_out_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.zoom_percent, 120));
+
+        // At MAX_ZOOM_PERCENT, zoom-in is disabled (no-op); at MIN_ZOOM_PERCENT, zoom-out is disabled.
+        view.update(cx, |view, cx| {
+            view.set_zoom_percent(MAX_ZOOM_PERCENT, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_click(zoom_in_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.zoom_percent, MAX_ZOOM_PERCENT);
+            assert_eq!(view.header_zoom_count, 0);
+        });
+
+        view.update(cx, |view, cx| {
+            view.set_zoom_percent(MIN_ZOOM_PERCENT, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_click(zoom_out_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.zoom_percent, MIN_ZOOM_PERCENT);
+            assert_eq!(view.header_zoom_count, 0);
+        });
     }
 }

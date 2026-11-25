@@ -57,6 +57,21 @@
       "context": "Workspace"
     },
     {
+      "keys": "secondary-=",
+      "action": "zoom_in",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary--",
+      "action": "zoom_out",
+      "context": "Workspace"
+    },
+    {
+      "keys": "secondary-0",
+      "action": "zoom_reset",
+      "context": "Workspace"
+    },
+    {
       "keys": "secondary-q",
       "action": "quit",
       "context": "Workspace"

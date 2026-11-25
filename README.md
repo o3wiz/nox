@@ -17,7 +17,7 @@ Open files with the folder icon (**⌘O** / **Ctrl+O**), by editing the file pat
 
 Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Select text directly inside displayed rows in either pane by clicking and dragging across characters or multiple rows, double-clicking a word, triple-clicking a line, or **Shift+Clicking** to extend an active text selection (**⌘C** / **Ctrl+C** copies the selected text and **Escape** clears it). Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Alt+O** / **⌥O** flips the selection anchor between the top and bottom ends, and **Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
-The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Resize the filter pane vertically all the way from the bottom (hiding the filter pane) to the top (hiding the main log pane) by dragging the horizontal split handle above the search bar (double-click it to reset to `window.results_height`), clicking the resize buttons in the results header, or pressing **-** (taller) and **⇧-** / **Shift+-** (shorter) in the log/filter panes — holding either key smoothly glides with an automatic acceleration gradient. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
+The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Resize the filter pane vertically all the way from the bottom (hiding the filter pane) to the top (hiding the main log pane) by dragging the horizontal split handle above the search bar (double-click it to reset to `window.results_height`), clicking the resize buttons in the results header, or pressing **-** (taller) and **⇧-** / **Shift+-** (shorter) in the log/filter panes — holding either key smoothly glides with an automatic acceleration gradient. Zoom the log and filter panes in and out with the zoom buttons in the top toolbar or **⌘=** / **Ctrl+=** (or **⌘+** / **Ctrl++**) and **⌘-** / **Ctrl+-**, and reset back to 100% with **⌘0** / **Ctrl+0** or by clicking the zoom indicator in the status bar. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
 
 Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 
@@ -30,6 +30,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Workspace | secondary-p | Toggle saved patterns dropdown |
 | Workspace | secondary-alt-h | Toggle search match highlighting |
 | Workspace | secondary-r / secondary-e | Reload / export results |
+| Workspace | secondary-= / secondary-- / secondary-0 | Zoom in / zoom out / reset zoom |
 | Workspace | F3 / shift-F3 | Next / previous match |
 | Workspace | secondary-q | Quit |
 | Log | arrows, home/end, pageup/pagedown | Navigate lines (in active pane) |
@@ -117,7 +118,7 @@ The second example replaces all application bindings. GPUI's standard text-editi
 
 ## Session state
 
-Session state is separate from configuration and has its own `schemas/session.schema.json`. On a normal close or quit, Nox atomically saves open files, active tab, per-tab query/options, selected line, bookmarks, follow state, recent files, and the resized filter pane height. Command-line or configured startup files take priority over restoring the previous tabs. Corrupt/unsupported session files are reported and preserved rather than overwritten.
+Session state is separate from configuration and has its own `schemas/session.schema.json`. On a normal close or quit, Nox atomically saves open files, active tab, per-tab query/options, selected line, bookmarks, follow state, recent files, the resized filter pane height, and zoom level. Command-line or configured startup files take priority over restoring the previous tabs. Corrupt/unsupported session files are reported and preserved rather than overwritten.
 
 The default state location is:
 

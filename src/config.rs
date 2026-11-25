@@ -183,6 +183,9 @@ pub enum Command {
     ApplyPreset,
     IncreaseFilterHeight,
     DecreaseFilterHeight,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 pub enum KeyContext {

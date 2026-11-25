@@ -31,6 +31,15 @@
         "null"
       ],
       "format": "float"
+    },
+    "zoom_percent": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "minimum": 0,
+      "maximum": 65535
     }
   },
   "additionalProperties": false,

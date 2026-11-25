@@ -354,6 +354,7 @@ fn session_saves_atomically_restores_and_rejects_unknown_versions() {
         active: 0,
         recent: vec!["app.log".into()],
         results_height: Some(340.0),
+        zoom_percent: Some(130),
         tabs: vec![SavedTab {
             path: "app.log".into(),
             query: "ERROR".into(),
@@ -369,6 +370,7 @@ fn session_saves_atomically_restores_and_rejects_unknown_versions() {
     assert_eq!(restored.tabs[0].query, "ERROR");
     assert_eq!(restored.tabs[0].bookmarks, BTreeSet::from([1, 3]));
     assert_eq!(restored.results_height, Some(340.0));
+    assert_eq!(restored.zoom_percent, Some(130));
     let mut invalid = serde_json::to_value(session).unwrap();
     invalid["version"] = 99.into();
     fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
@@ -386,6 +388,7 @@ fn legacy_session_without_highlight_matches_or_results_height_loads_and_rejects_
         active: 0,
         recent: Vec::new(),
         results_height: None,
+        zoom_percent: None,
         tabs: vec![SavedTab {
             path: "app.log".into(),
             query: "ERROR".into(),
@@ -419,6 +422,7 @@ fn legacy_session_without_highlight_matches_or_results_height_loads_and_rejects_
             .all(|preset| preset.highlight_match)
     );
     assert_eq!(restored.results_height, None);
+    assert_eq!(restored.zoom_percent, None);
 
     // Hidden filter pane (`0.0`) is a valid persisted height.
     let mut hidden = legacy.clone();
@@ -436,6 +440,16 @@ fn legacy_session_without_highlight_matches_or_results_height_loads_and_rejects_
         assert!(
             Session::load(&path, &config).is_err(),
             "accepted invalid results_height {bad_height}"
+        );
+    }
+
+    for bad_zoom in [0, 40, 49, 301, 500] {
+        let mut invalid = legacy.clone();
+        invalid["zoom_percent"] = serde_json::json!(bad_zoom);
+        fs::write(&path, serde_json::to_vec_pretty(&invalid).unwrap()).unwrap();
+        assert!(
+            Session::load(&path, &config).is_err(),
+            "accepted invalid zoom_percent {bad_zoom}"
         );
     }
 }

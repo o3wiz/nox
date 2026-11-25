@@ -104,7 +104,10 @@
         "toggle_presets",
         "apply_preset",
         "increase_filter_height",
-        "decrease_filter_height"
+        "decrease_filter_height",
+        "zoom_in",
+        "zoom_out",
+        "zoom_reset"
       ]
     }
   }
