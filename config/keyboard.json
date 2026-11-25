@@ -22,6 +22,11 @@
       "context": "Workspace"
     },
     {
+      "keys": "ctrl-shift-tab",
+      "action": "previous_tab",
+      "context": "Workspace"
+    },
+    {
       "keys": "secondary-f",
       "action": "focus_search",
       "context": "Workspace"

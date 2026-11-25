@@ -2046,6 +2046,12 @@ impl Workspace {
                     self.switch((self.active + 1) % self.tabs.len(), cx);
                 }
             }
+            Command::PreviousTab => {
+                if !self.tabs.is_empty() {
+                    let len = self.tabs.len();
+                    self.switch((self.active + len - 1) % len, cx);
+                }
+            }
             Command::ToggleFollow => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.follow = !tab.follow;
@@ -9200,6 +9206,140 @@ mod tests {
                 view.path_input.read(cx).as_str(),
                 valid.display().to_string()
             );
+        });
+    }
+
+    #[gpui::test]
+    fn previous_tab_cycles_backward_with_wrap_around_and_handles_single_or_empty_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        let third = directory.path().join("third.log");
+        std::fs::write(&first, "one\n").unwrap();
+        std::fs::write(&second, "two\n").unwrap();
+        std::fs::write(&third, "three\n").unwrap();
+        let first_canon = first.canonicalize().unwrap_or_else(|_| first.clone());
+        let second_canon = second.canonicalize().unwrap_or_else(|_| second.clone());
+        let third_canon = third.canonicalize().unwrap_or_else(|_| third.clone());
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(config, vec![first, second, third], window, cx)
+        });
+        cx.run_until_parked();
+
+        // Start on tab 0 with distinct queries across all three tabs.
+        view.update(cx, |view, cx| {
+            view.switch(0, cx);
+            view.tabs[1].query = "q1".into();
+            view.tabs[2].query = "q2".into();
+            view.input.update(cx, |input, cx| input.emplace("q0", cx));
+        });
+        cx.run_until_parked();
+
+        // Default shortcut label is populated for PreviousTab.
+        view.read_with(cx, |view, _| {
+            let expected = if cfg!(target_os = "macos") {
+                "⌃⇧⇥"
+            } else {
+                "Ctrl+Shift+⇥"
+            };
+            assert_eq!(
+                view.theme.shortcut(Command::PreviousTab).as_deref(),
+                Some(expected)
+            );
+        });
+
+        // Ctrl+Shift+Tab wraps from tab 0 to the last tab (2), saving tab 0's query and syncing path.
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(view.tabs[0].query, "q0");
+            assert_eq!(view.input.read(cx).as_str(), "q2");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                third_canon.display().to_string()
+            );
+        });
+
+        // Pressing Ctrl+Shift+Tab again moves to tab 1, then back to tab 0.
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.input.read(cx).as_str(), "q1");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                second_canon.display().to_string()
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                first_canon.display().to_string()
+            );
+        });
+
+        // Works while search input has focus (Workspace context).
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(view.input.read(cx).as_str(), "q2");
+        });
+
+        // Ctrl+Tab cycles forward back to tab 0.
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // With a single tab, PreviousTab keeps index 0 and preserves its query.
+        view.update(cx, |view, cx| {
+            view.close_tab_at(2, cx);
+            view.close_tab_at(1, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // With no tabs open, PreviousTab is a safe no-op.
+        view.update(cx, |view, cx| {
+            view.close_tab_at(0, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs.is_empty());
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "");
         });
     }
 }

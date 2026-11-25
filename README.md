@@ -25,7 +25,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | --- | --- | --- |
 | Workspace | secondary-o / secondary-w | Open / close tab |
 | Workspace | secondary-shift-o | Focus editable file path bar |
-| Workspace | ctrl-tab | Next tab |
+| Workspace | ctrl-tab / ctrl-shift-tab | Next / previous tab |
 | Workspace | secondary-f / secondary-l | Focus search / go to line |
 | Workspace | secondary-p | Toggle saved patterns dropdown |
 | Workspace | secondary-alt-h | Toggle search match highlighting |

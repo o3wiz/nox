@@ -134,6 +134,7 @@ pub enum Command {
     Open,
     CloseTab,
     NextTab,
+    PreviousTab,
     Search,
     ToggleRegex,
     ToggleCaseSensitive,
