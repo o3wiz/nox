@@ -119,7 +119,7 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | --- | --- |
 | `window.json` | Title, initial dimensions/maximized state, results-pane height, status bar |
 | `appearance.json` | UI sans-serif & monospace font families/sizes, semantic colors, text selection color & opacity (`0.0`–`1.0`), and match foreground/background colors (`#RRGGBB`) |
-| `viewer.json` | Line numbers/height, match overview visibility/width, tab expansion, display character limit, following, bookmark inclusion, polling interval |
+| `viewer.json` | Line numbers/height, match overview visibility/width, cursor surrounding lines, tab expansion, display character limit, following, bookmark inclusion, polling interval |
 | `search.json` | Default search mode, case/word/inversion/match highlighting, context lines, match limit, named presets (pattern, mode, `highlight_match`) |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |
 | `files.json` | Startup paths, favorites, session restore/save, session path, recent-file limit |

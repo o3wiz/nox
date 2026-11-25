@@ -67,6 +67,9 @@ pub struct ViewerConfig {
     pub include_bookmarks: bool,
     #[schemars(range(min = 100, max = 60000))]
     pub poll_interval_ms: u64,
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 1000))]
+    pub cursor_surrounding_lines: usize,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -368,6 +371,10 @@ impl Config {
         ensure!(
             (100..=60000).contains(&v.poll_interval_ms),
             "viewer.poll_interval_ms must be 100..60000"
+        );
+        ensure!(
+            v.cursor_surrounding_lines <= 1000,
+            "viewer.cursor_surrounding_lines must be 0..1000"
         );
         ensure!(
             s.context_lines <= 100 && (1..=10000000).contains(&s.max_results),

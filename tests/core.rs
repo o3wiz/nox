@@ -320,6 +320,45 @@ fn appearance_overlays_configurable_text_selection_color_and_opacity() {
         );
     }
 }
+
+#[test]
+fn viewer_overlays_and_validates_cursor_surrounding_lines() {
+    let defaults = Config::load(None).unwrap();
+    assert_eq!(defaults.viewer.cursor_surrounding_lines, 0);
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("viewer.json");
+    fs::write(&path, r#"{"cursor_surrounding_lines": 5}"#).unwrap();
+    let custom = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(custom.viewer.cursor_surrounding_lines, 5);
+    assert_eq!(custom.viewer.line_height, defaults.viewer.line_height);
+
+    // Boundary values 0 and 1000 are accepted.
+    for valid in [0usize, 1000] {
+        fs::write(&path, format!(r#"{{"cursor_surrounding_lines":{valid}}}"#)).unwrap();
+        assert_eq!(
+            Config::load(Some(dir.path()))
+                .unwrap()
+                .viewer
+                .cursor_surrounding_lines,
+            valid
+        );
+    }
+
+    for invalid in [
+        r#"{"cursor_surrounding_lines":-1}"#,
+        r#"{"cursor_surrounding_lines":1001}"#,
+        r#"{"cursor_surrounding_lines":2.5}"#,
+        r#"{"cursor_surrounding_lines":"5"}"#,
+        r#"{"cursor_surrounding_lines":null}"#,
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert!(
+            Config::load(Some(dir.path())).is_err(),
+            "accepted invalid cursor_surrounding_lines {invalid}"
+        );
+    }
+}
 #[test]
 fn generated_config_round_trips_and_preserves_existing_files() {
     let dir = tempdir().unwrap();

@@ -38,9 +38,10 @@ use resize::{
     height_for_drag, is_main_hidden, is_results_hidden, results_height_bounds,
 };
 use scrollbar::{
-    DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, ScrollAxis, ScrollbarTrackState,
-    horizontal_scroll_step, resolve_track_press, scroll_offset_for_drag, scrollbar_canvas,
-    set_uniform_list_axis_offset, step_uniform_list_axis_offset,
+    DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, RevealOutcome, RevealStrategy, ScrollAxis,
+    ScrollbarTrackState, horizontal_scroll_step, resolve_track_press, reveal_uniform_list_row,
+    scroll_offset_for_drag, scrollbar_canvas, set_uniform_list_axis_offset,
+    step_uniform_list_axis_offset,
 };
 use selectable_text::{RowLayoutCache, SelectableRowText, TextPressEvent};
 use serde::Deserialize;
@@ -189,6 +190,12 @@ struct TextDrag {
     anchor_end: TextPosition,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingReveal {
+    row: usize,
+    strategy: RevealStrategy,
+}
+
 struct Tab {
     id: usize,
     path: PathBuf,
@@ -213,6 +220,8 @@ struct Tab {
     follow: bool,
     scroll: UniformListScrollHandle,
     result_scroll: UniformListScrollHandle,
+    pending_main_reveal: Option<PendingReveal>,
+    pending_results_reveal: Option<PendingReveal>,
     error: Option<String>,
 }
 
@@ -341,6 +350,7 @@ pub struct Workspace {
     results_resize_drag: Option<ResultsResizeDrag>,
     resize_motion: ResizeMotion,
     resize_frame_scheduled: bool,
+    pending_reveal_frame_scheduled: bool,
     main_vscroll_state: ScrollbarTrackState,
     main_hscroll_state: ScrollbarTrackState,
     results_vscroll_state: ScrollbarTrackState,
@@ -525,6 +535,7 @@ impl Workspace {
             results_resize_drag: None,
             resize_motion: ResizeMotion::default(),
             resize_frame_scheduled: false,
+            pending_reveal_frame_scheduled: false,
             main_vscroll_state: ScrollbarTrackState::new(),
             main_hscroll_state: ScrollbarTrackState::new(),
             results_vscroll_state: ScrollbarTrackState::new(),
@@ -647,6 +658,8 @@ impl Workspace {
             follow: self.config.viewer.follow,
             scroll: UniformListScrollHandle::new(),
             result_scroll: UniformListScrollHandle::new(),
+            pending_main_reveal: None,
+            pending_results_reveal: None,
             error: None,
         });
         self.switch(self.tabs.len() - 1, cx);
@@ -782,6 +795,8 @@ impl Workspace {
         tab.result_text_selection = None;
         tab.scroll = UniformListScrollHandle::new();
         tab.result_scroll = UniformListScrollHandle::new();
+        tab.pending_main_reveal = None;
+        tab.pending_results_reveal = None;
         tab.error = None;
 
         self.sync_path_input(cx);
@@ -869,6 +884,7 @@ impl Workspace {
                 tab.results = results;
                 tab.result_selection = LineSelection::single_clamped(0, len);
                 tab.result_text_selection = None;
+                tab.pending_results_reveal = None;
                 tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
             cx.notify();
@@ -946,6 +962,7 @@ impl Workspace {
                     tab.results = results;
                     tab.result_selection = LineSelection::single_clamped(0, len);
                     tab.result_text_selection = None;
+                    tab.pending_results_reveal = None;
                     tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 }
             }
@@ -998,6 +1015,8 @@ impl Workspace {
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         while let Ok(message) = self.receiver.try_recv() {
             changed = true;
             match message {
@@ -1030,14 +1049,20 @@ impl Workspace {
                                 }
                                 tab.selected = tab.main_selection.cursor;
                                 tab.bookmarks.retain(|&line| line < log.len());
-                                if initial && !tab.follow && !log.is_empty() {
-                                    tab.scroll
-                                        .scroll_to_item(tab.selected, ScrollStrategy::Center);
-                                }
+                                let non_empty = !log.is_empty();
                                 tab.log = Some(log);
                                 tab.error = None;
                                 if tab.follow {
+                                    tab.pending_main_reveal = None;
                                     tab.scroll.scroll_to_bottom();
+                                } else if initial && non_empty {
+                                    Self::reveal_main_row_in_tab(
+                                        tab,
+                                        tab.selected,
+                                        line_height,
+                                        surrounding_lines,
+                                        RevealStrategy::Center,
+                                    );
                                 }
                                 self.start_search_preserving(index, !replaced && !initial, cx);
                             }
@@ -1172,6 +1197,8 @@ impl Workspace {
         match pane {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => {
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active)
                     && tab.result_selection.is_empty()
                     && !tab.results.visible.is_empty()
@@ -1182,8 +1209,13 @@ impl Workspace {
                         .binary_search(&tab.selected)
                         .unwrap_or_else(|idx| idx.min(tab.results.visible.len() - 1));
                     tab.result_selection.select_single(row);
-                    tab.result_scroll
-                        .scroll_to_item(row, ScrollStrategy::Nearest);
+                    Self::reveal_results_row_in_tab(
+                        tab,
+                        row,
+                        line_height,
+                        surrounding_lines,
+                        RevealStrategy::Nearest,
+                    );
                 }
                 self.results_focus.focus(window, cx);
             }
@@ -1251,14 +1283,141 @@ impl Workspace {
         Self::selected_source_lines(tab, pane).all(|line| tab.bookmarks.contains(&line))
     }
 
-    fn sync_main_to_result_cursor(tab: &mut Tab) {
+    fn reveal_main_row_in_tab(
+        tab: &mut Tab,
+        row: usize,
+        line_height: f32,
+        surrounding_lines: usize,
+        strategy: RevealStrategy,
+    ) {
+        let Some(log) = &tab.log else {
+            tab.pending_main_reveal = None;
+            return;
+        };
+        let len = log.len();
+        if len == 0 {
+            tab.pending_main_reveal = None;
+            return;
+        }
+        let target = row.min(len - 1);
+        match reveal_uniform_list_row(
+            &tab.scroll,
+            target,
+            len,
+            line_height,
+            surrounding_lines,
+            strategy,
+        ) {
+            RevealOutcome::Deferred => {
+                tab.pending_main_reveal = Some(PendingReveal {
+                    row: target,
+                    strategy,
+                });
+            }
+            RevealOutcome::Scrolled | RevealOutcome::Unchanged => {
+                tab.pending_main_reveal = None;
+            }
+        }
+    }
+
+    fn reveal_results_row_in_tab(
+        tab: &mut Tab,
+        row: usize,
+        line_height: f32,
+        surrounding_lines: usize,
+        strategy: RevealStrategy,
+    ) {
+        let len = tab.results.visible.len();
+        if len == 0 {
+            tab.pending_results_reveal = None;
+            return;
+        }
+        let target = row.min(len - 1);
+        match reveal_uniform_list_row(
+            &tab.result_scroll,
+            target,
+            len,
+            line_height,
+            surrounding_lines,
+            strategy,
+        ) {
+            RevealOutcome::Deferred => {
+                tab.pending_results_reveal = Some(PendingReveal {
+                    row: target,
+                    strategy,
+                });
+            }
+            RevealOutcome::Scrolled | RevealOutcome::Unchanged => {
+                tab.pending_results_reveal = None;
+            }
+        }
+    }
+
+    fn flush_pending_reveals(&mut self, cx: &mut Context<Self>) {
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let mut changed = false;
+        if let Some(pending) = tab.pending_main_reveal {
+            let len = tab.log.as_ref().map_or(0, |log| log.len());
+            let laid_out = tab.scroll.0.borrow().last_item_size.is_some();
+            if len == 0 {
+                tab.pending_main_reveal = None;
+            } else if laid_out {
+                tab.pending_main_reveal = None;
+                if reveal_uniform_list_row(
+                    &tab.scroll,
+                    pending.row,
+                    len,
+                    line_height,
+                    surrounding_lines,
+                    pending.strategy,
+                ) == RevealOutcome::Scrolled
+                {
+                    changed = true;
+                }
+            }
+        }
+        if let Some(pending) = tab.pending_results_reveal {
+            let len = tab.results.visible.len();
+            let laid_out = tab.result_scroll.0.borrow().last_item_size.is_some();
+            if len == 0 {
+                tab.pending_results_reveal = None;
+            } else if laid_out {
+                tab.pending_results_reveal = None;
+                if reveal_uniform_list_row(
+                    &tab.result_scroll,
+                    pending.row,
+                    len,
+                    line_height,
+                    surrounding_lines,
+                    pending.strategy,
+                ) == RevealOutcome::Scrolled
+                {
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn sync_main_to_result_cursor(tab: &mut Tab, line_height: f32, surrounding_lines: usize) {
         if let Some(&source_line) = tab.results.visible.get(tab.result_selection.cursor) {
             tab.selected = source_line;
             tab.main_selection.select_single(source_line);
             tab.main_text_selection = None;
             tab.follow = false;
-            tab.scroll
-                .scroll_to_item(source_line, ScrollStrategy::Center);
+            Self::reveal_main_row_in_tab(
+                tab,
+                source_line,
+                line_height,
+                surrounding_lines,
+                RevealStrategy::Center,
+            );
         }
     }
 
@@ -1279,6 +1438,8 @@ impl Workspace {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => self.results_focus.focus(window, cx),
         }
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         if let Some(tab) = self.tabs.get_mut(self.active) {
             *tab.text_selection_mut(pane) = None;
             match pane {
@@ -1311,7 +1472,7 @@ impl Workspace {
                             tab.result_selection.select_single(row);
                             self.drag_selecting = Some(Pane::Results);
                         }
-                        Self::sync_main_to_result_cursor(tab);
+                        Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                     }
                 }
             }
@@ -1374,6 +1535,8 @@ impl Workspace {
             Pane::Results => self.results_focus.focus(window, cx),
         }
 
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         if let Some(tab) = self.tabs.get_mut(self.active) {
             let in_bounds = match pane {
                 Pane::Main => {
@@ -1390,7 +1553,7 @@ impl Workspace {
                 Pane::Results => {
                     if press.row < tab.results.visible.len() {
                         tab.result_selection.select_single(press.row);
-                        Self::sync_main_to_result_cursor(tab);
+                        Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                         true
                     } else {
                         false
@@ -1687,6 +1850,8 @@ impl Workspace {
             return;
         }
         let mut changed = false;
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         if let Some(tab) = self.tabs.get_mut(self.active) {
             match pane {
                 Pane::Main => {
@@ -1701,7 +1866,7 @@ impl Workspace {
                 Pane::Results => {
                     if row < tab.results.visible.len() && tab.result_selection.cursor != row {
                         tab.result_selection.extend_to(row);
-                        Self::sync_main_to_result_cursor(tab);
+                        Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                         changed = true;
                     }
                 }
@@ -1735,6 +1900,7 @@ impl Workspace {
         self.active_pane = pane;
         let results_h = self.effective_results_height(window);
         let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -1770,7 +1936,13 @@ impl Workspace {
                 }
                 tab.selected = target;
                 tab.follow = false;
-                tab.scroll.scroll_to_item(target, ScrollStrategy::Nearest);
+                Self::reveal_main_row_in_tab(
+                    tab,
+                    target,
+                    line_height,
+                    surrounding_lines,
+                    RevealStrategy::Nearest,
+                );
             }
             Pane::Results => {
                 let len = tab.results.visible.len();
@@ -1796,9 +1968,14 @@ impl Workspace {
                 } else {
                     tab.result_selection.select_single(target);
                 }
-                tab.result_scroll
-                    .scroll_to_item(target, ScrollStrategy::Nearest);
-                Self::sync_main_to_result_cursor(tab);
+                Self::reveal_results_row_in_tab(
+                    tab,
+                    target,
+                    line_height,
+                    surrounding_lines,
+                    RevealStrategy::Nearest,
+                );
+                Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
             }
         }
         cx.notify();
@@ -1932,6 +2109,8 @@ impl Workspace {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
                 self.text_drag = None;
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     *tab.text_selection_mut(pane) = None;
                     match pane {
@@ -1945,7 +2124,7 @@ impl Workspace {
                         Pane::Results => {
                             let len = tab.results.visible.len();
                             tab.result_selection.collapse_to_cursor(len);
-                            Self::sync_main_to_result_cursor(tab);
+                            Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                         }
                     }
                 }
@@ -1953,6 +2132,8 @@ impl Workspace {
             Command::SwapSelectionAnchor => {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     match pane {
                         Pane::Main => {
@@ -1962,7 +2143,13 @@ impl Workspace {
                                 tab.main_selection.cursor = cursor;
                                 tab.selected = cursor;
                                 tab.follow = false;
-                                tab.scroll.scroll_to_item(cursor, ScrollStrategy::Nearest);
+                                Self::reveal_main_row_in_tab(
+                                    tab,
+                                    cursor,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Nearest,
+                                );
                             }
                         }
                         Pane::Results => {
@@ -1970,9 +2157,18 @@ impl Workspace {
                             if len > 0 && tab.result_selection.swap_anchor() {
                                 let cursor = tab.result_selection.cursor.min(len - 1);
                                 tab.result_selection.cursor = cursor;
-                                tab.result_scroll
-                                    .scroll_to_item(cursor, ScrollStrategy::Nearest);
-                                Self::sync_main_to_result_cursor(tab);
+                                Self::reveal_results_row_in_tab(
+                                    tab,
+                                    cursor,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Nearest,
+                                );
+                                Self::sync_main_to_result_cursor(
+                                    tab,
+                                    line_height,
+                                    surrounding_lines,
+                                );
                             }
                         }
                     }
@@ -2004,6 +2200,8 @@ impl Workspace {
             Command::NextBookmark | Command::PreviousBookmark => {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     if pane == Pane::Results && !tab.results.visible.is_empty() {
                         let current_row = tab
@@ -2023,9 +2221,14 @@ impl Workspace {
                         if let Some(row) = target_row {
                             tab.result_selection.select_single(row);
                             tab.result_text_selection = None;
-                            tab.result_scroll
-                                .scroll_to_item(row, ScrollStrategy::Center);
-                            Self::sync_main_to_result_cursor(tab);
+                            Self::reveal_results_row_in_tab(
+                                tab,
+                                row,
+                                line_height,
+                                surrounding_lines,
+                                RevealStrategy::Center,
+                            );
+                            Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                         }
                     } else {
                         let target = if command == Command::NextBookmark {
@@ -2045,12 +2248,23 @@ impl Workspace {
                             tab.main_selection.select_single(line);
                             tab.main_text_selection = None;
                             tab.follow = false;
-                            tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                            Self::reveal_main_row_in_tab(
+                                tab,
+                                line,
+                                line_height,
+                                surrounding_lines,
+                                RevealStrategy::Center,
+                            );
                             if let Ok(index) = tab.results.visible.binary_search(&line) {
                                 tab.result_selection.select_single(index);
                                 tab.result_text_selection = None;
-                                tab.result_scroll
-                                    .scroll_to_item(index, ScrollStrategy::Center);
+                                Self::reveal_results_row_in_tab(
+                                    tab,
+                                    index,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Center,
+                                );
                             }
                         }
                     }
@@ -2152,6 +2366,7 @@ impl Workspace {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.follow = !tab.follow;
                     if tab.follow {
+                        tab.pending_main_reveal = None;
                         tab.scroll.scroll_to_bottom();
                     }
                 }
@@ -2188,6 +2403,8 @@ impl Workspace {
                 }
             }
             Command::NextMatch | Command::PreviousMatch => {
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let matches = &tab.results.matches;
                     let target = if command == Command::NextMatch {
@@ -2207,12 +2424,23 @@ impl Workspace {
                         tab.main_selection.select_single(target);
                         tab.main_text_selection = None;
                         tab.follow = false;
-                        tab.scroll.scroll_to_item(target, ScrollStrategy::Center);
+                        Self::reveal_main_row_in_tab(
+                            tab,
+                            target,
+                            line_height,
+                            surrounding_lines,
+                            RevealStrategy::Center,
+                        );
                         if let Ok(index) = tab.results.visible.binary_search(&target) {
                             tab.result_selection.select_single(index);
                             tab.result_text_selection = None;
-                            tab.result_scroll
-                                .scroll_to_item(index, ScrollStrategy::Center);
+                            Self::reveal_results_row_in_tab(
+                                tab,
+                                index,
+                                line_height,
+                                surrounding_lines,
+                                RevealStrategy::Center,
+                            );
                         }
                     }
                 }
@@ -2303,6 +2531,8 @@ impl Workspace {
                     self.show_goto = false;
                 } else if self.show_goto {
                     let line = self.goto.read(cx).as_str().trim().parse::<usize>();
+                    let line_height = self.zoom_metrics().line_height;
+                    let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         if let (Ok(line), Some(log)) = (line, &tab.log) {
                             if line > 0 && line <= log.len() {
@@ -2310,7 +2540,13 @@ impl Workspace {
                                 tab.main_selection.select_single(line - 1);
                                 tab.main_text_selection = None;
                                 tab.follow = false;
-                                tab.scroll.scroll_to_item(line - 1, ScrollStrategy::Center);
+                                Self::reveal_main_row_in_tab(
+                                    tab,
+                                    line - 1,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Center,
+                                );
                                 self.show_goto = false;
                                 self.status = None;
                                 self.active_pane = Pane::Main;
@@ -2959,6 +3195,8 @@ impl Workspace {
                 self.active_pane = Pane::Results;
             }
             if self.focus.is_focused(window) {
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active)
                     && tab.result_selection.is_empty()
                     && !tab.results.visible.is_empty()
@@ -2969,8 +3207,13 @@ impl Workspace {
                         .binary_search(&tab.selected)
                         .unwrap_or_else(|idx| idx.min(tab.results.visible.len() - 1));
                     tab.result_selection.select_single(row);
-                    tab.result_scroll
-                        .scroll_to_item(row, ScrollStrategy::Nearest);
+                    Self::reveal_results_row_in_tab(
+                        tab,
+                        row,
+                        line_height,
+                        surrounding_lines,
+                        RevealStrategy::Nearest,
+                    );
                 }
                 self.results_focus.focus(window, cx);
             }
@@ -3308,8 +3551,16 @@ impl Workspace {
                 Pane::Results => &tab.result_scroll,
             };
             set_uniform_list_axis_offset(handle, id.axis, offset);
-            if id.pane == Pane::Main && id.axis == ScrollAxis::Vertical {
-                tab.follow = false;
+            if id.axis == ScrollAxis::Vertical {
+                match id.pane {
+                    Pane::Main => {
+                        tab.follow = false;
+                        tab.pending_main_reveal = None;
+                    }
+                    Pane::Results => {
+                        tab.pending_results_reveal = None;
+                    }
+                }
             }
         }
         cx.notify();
@@ -3334,8 +3585,16 @@ impl Workspace {
                 Pane::Results => &tab.result_scroll,
             };
             set_uniform_list_axis_offset(handle, drag.id.axis, offset);
-            if drag.id.pane == Pane::Main && drag.id.axis == ScrollAxis::Vertical {
-                tab.follow = false;
+            if drag.id.axis == ScrollAxis::Vertical {
+                match drag.id.pane {
+                    Pane::Main => {
+                        tab.follow = false;
+                        tab.pending_main_reveal = None;
+                    }
+                    Pane::Results => {
+                        tab.pending_results_reveal = None;
+                    }
+                }
             }
         }
         cx.notify();
@@ -3389,12 +3648,20 @@ impl Workspace {
                         .cursor_pointer()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, window, cx| {
+                            let line_height = this.zoom_metrics().line_height;
+                            let surrounding_lines = this.config.viewer.cursor_surrounding_lines;
                             if let Some(tab) = this.tabs.get_mut(this.active) {
                                 tab.selected = line;
                                 tab.main_selection.select_single(line);
                                 tab.main_text_selection = None;
                                 tab.follow = false;
-                                tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                                Self::reveal_main_row_in_tab(
+                                    tab,
+                                    line,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Center,
+                                );
                             }
                             this.active_pane = Pane::Main;
                             this.show_goto = false;
@@ -5757,6 +6024,17 @@ impl Render for Workspace {
             self.results_vscroll_state.clear();
             self.results_hscroll_state.clear();
             self.results_row_layouts.clear();
+        }
+        let needs_pending_reveal = self.tabs.get(self.active).is_some_and(|tab| {
+            (tab.pending_main_reveal.is_some() && line_count > 0 && !main_hidden)
+                || (tab.pending_results_reveal.is_some() && result_count > 0 && !results_hidden)
+        });
+        if needs_pending_reveal && !self.pending_reveal_frame_scheduled {
+            self.pending_reveal_frame_scheduled = true;
+            cx.on_next_frame(window, |this, _window, cx| {
+                this.pending_reveal_frame_scheduled = false;
+                this.flush_pending_reveals(cx);
+            });
         }
 
         let main_area = if self.tabs.is_empty() {
@@ -11156,6 +11434,532 @@ mod tests {
             assert_eq!(
                 f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
                 0.0
+            );
+        });
+    }
+
+    fn assert_surrounding_margin(
+        handle: &UniformListScrollHandle,
+        row: usize,
+        row_count: usize,
+        row_height: f32,
+        surrounding_lines: usize,
+        label: &str,
+    ) {
+        let state = handle.0.borrow();
+        let item_size = state
+            .last_item_size
+            .expect("list should have been laid out");
+        let viewport_h = f32::from(item_size.item.height);
+        let scroll_top = -f32::from(state.base_handle.offset().y);
+        let content_h = row_count as f32 * row_height;
+        let max_scroll = (content_h - viewport_h).max(0.0);
+        let desired_margin = surrounding_lines as f32 * row_height;
+        let effective_margin = desired_margin.min(((viewport_h - row_height) * 0.5).max(0.0));
+        let row_top = row as f32 * row_height;
+        let row_bottom = row_top + row_height;
+        let above = row_top - scroll_top;
+        let below = (scroll_top + viewport_h) - row_bottom;
+
+        if scroll_top > 0.5 {
+            assert!(
+                above + 0.5 >= effective_margin,
+                "{label}: row {row} only has {above}px above (expected >= {effective_margin}px, scroll_top={scroll_top}, vp={viewport_h})"
+            );
+        }
+        if scroll_top + 0.5 < max_scroll {
+            assert!(
+                below + 0.5 >= effective_margin,
+                "{label}: row {row} only has {below}px below (expected >= {effective_margin}px, scroll_top={scroll_top}, vp={viewport_h}, max={max_scroll})"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn cursor_surrounding_lines_keeps_gap_in_main_and_filter_panes_and_preserves_zero_default(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("surrounding.log");
+        let content: String = (0..200)
+            .map(|i| {
+                let level = if i % 2 == 0 { "ERROR" } else { "INFO" };
+                format!(
+                    "2026-11-26 {level} line-{i:04} token_{i:04} {}",
+                    "x".repeat(400)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        // 1. Default (0): stepping down through all initially visible rows does not scroll.
+        let default_config = Config::load(None).unwrap();
+        assert_eq!(default_config.viewer.cursor_surrounding_lines, 0);
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&default_config).unwrap());
+        });
+        let (default_view, default_cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(default_config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        default_cx.run_until_parked();
+        let initial_full_rows = default_view.read_with(default_cx, |view, _| {
+            let vp = f32::from(
+                view.tabs[0]
+                    .scroll
+                    .0
+                    .borrow()
+                    .last_item_size
+                    .unwrap()
+                    .item
+                    .height,
+            );
+            (vp / view.zoom_metrics().line_height).floor() as usize
+        });
+        assert!(
+            initial_full_rows >= 10,
+            "expected at least 10 visible rows, got {initial_full_rows}"
+        );
+        default_view.update_in(default_cx, |view, window, cx| {
+            for _ in 0..(initial_full_rows - 1) {
+                view.command(Command::NextLine, window, cx);
+            }
+        });
+        default_cx.run_until_parked();
+        default_view.read_with(default_cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, initial_full_rows - 1);
+            let scroll_top = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                scroll_top.abs() < 0.5,
+                "default cursor_surrounding_lines=0 should not scroll on last fully visible row, got {scroll_top}"
+            );
+        });
+
+        // 2. Main pane with cursor_surrounding_lines = 4.
+        let mut config = Config::load(None).unwrap();
+        config.viewer.cursor_surrounding_lines = 4;
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        vcx.run_until_parked();
+
+        // Preserve horizontal scroll while stepping down with surrounding lines.
+        view.update(vcx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 120.0);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        let line_height = view.read_with(vcx, |view, _| view.zoom_metrics().line_height);
+        let main_vp = view.read_with(vcx, |view, _| {
+            f32::from(
+                view.tabs[0]
+                    .scroll
+                    .0
+                    .borrow()
+                    .last_item_size
+                    .unwrap()
+                    .item
+                    .height,
+            )
+        });
+        let main_full_rows = (main_vp / line_height).floor() as usize;
+        assert!(main_full_rows >= 10);
+
+        // Stepping down starts scrolling 4 rows before the bottom edge and preserves horizontal scroll.
+        let mut scrolled_early = false;
+        for step in 1..=50 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::NextLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                assert_eq!(view.tabs[0].selected, step);
+                assert_surrounding_margin(
+                    &view.tabs[0].scroll,
+                    step,
+                    200,
+                    line_height,
+                    4,
+                    "main NextLine",
+                );
+                let offset = view.tabs[0].scroll.0.borrow().base_handle.offset();
+                assert!(
+                    (f32::from(offset.x) - -120.0).abs() < 1.0,
+                    "horizontal scroll must be preserved during vertical reveal, got {:?}",
+                    offset.x
+                );
+                if step == main_full_rows - 2 && -f32::from(offset.y) > 0.5 {
+                    scrolled_early = true;
+                }
+            });
+        }
+        assert!(
+            scrolled_early,
+            "expected main pane to start scrolling before reaching the bottom edge"
+        );
+
+        // Stepping back up stays stationary inside the safe band, then scrolls with 4 rows above.
+        let scroll_before_up = view.read_with(vcx, |view, _| {
+            -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y)
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::PreviousLine, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            let after_one_up = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                (after_one_up - scroll_before_up).abs() < 0.5,
+                "stepping up inside the safe band should not scroll (before={scroll_before_up}, after={after_one_up})"
+            );
+        });
+        for _ in 0..30 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::PreviousLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                let row = view.tabs[0].selected;
+                assert_surrounding_margin(
+                    &view.tabs[0].scroll,
+                    row,
+                    200,
+                    line_height,
+                    4,
+                    "main PreviousLine",
+                );
+            });
+        }
+
+        // Shift+Down range extension and Alt+O swap anchor keep the 4-row margin.
+        view.update_in(vcx, |view, window, cx| {
+            for _ in 0..25 {
+                view.command(Command::SelectNextLine, window, cx);
+            }
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_surrounding_margin(
+                &view.tabs[0].scroll,
+                view.tabs[0].selected,
+                200,
+                line_height,
+                4,
+                "main SelectNextLine",
+            );
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::SwapSelectionAnchor, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_surrounding_margin(
+                &view.tabs[0].scroll,
+                view.tabs[0].selected,
+                200,
+                line_height,
+                4,
+                "main SwapSelectionAnchor",
+            );
+        });
+
+        // LastLine clamps cleanly to bottom; FirstLine returns cleanly to top.
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::LastLine, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 199);
+            assert_eq!(view.tabs[0].scroll.is_scrolled_to_end(), Some(true));
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::FirstLine, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 0);
+            let scroll_top = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(scroll_top.abs() < 0.5);
+        });
+
+        // GoToLine / NextBookmark on a row inside the bottom 4-row edge margin scrolls to center it.
+        let edge_row = main_full_rows - 1;
+        view.update_in(vcx, |view, window, cx| {
+            view.tabs[0].bookmarks.insert(edge_row);
+            view.command(Command::NextBookmark, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].selected, edge_row);
+            let scroll_top = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                scroll_top > 0.5,
+                "NextBookmark onto edge row {edge_row} must scroll to satisfy surrounding margin"
+            );
+            assert_surrounding_margin(
+                &view.tabs[0].scroll,
+                edge_row,
+                200,
+                line_height,
+                4,
+                "main NextBookmark",
+            );
+        });
+
+        // Mouse clicking a visible row near the bottom edge does not yank it away mid-double-click.
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::FirstLine, window, cx);
+        });
+        vcx.run_until_parked();
+        let bottom_visible_row = main_full_rows - 2;
+        let row0_bounds = vcx.debug_bounds("main-text-0").expect("row 0 text bounds");
+        let scroll_before_click = view.read_with(vcx, |view, _| {
+            -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y)
+        });
+        let click_pos = point(
+            row0_bounds.left() + px(8.0),
+            row0_bounds.center().y + px(bottom_visible_row as f32 * line_height),
+        );
+        for count in [1, 2] {
+            vcx.simulate_event(MouseDownEvent {
+                button: MouseButton::Left,
+                position: click_pos,
+                modifiers: Modifiers::none(),
+                click_count: count,
+                first_mouse: false,
+            });
+            vcx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: click_pos,
+                modifiers: Modifiers::none(),
+                click_count: count,
+            });
+            vcx.run_until_parked();
+        }
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].selected, bottom_visible_row);
+            let scroll_after_click =
+                -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                (scroll_after_click - scroll_before_click).abs() < 0.5,
+                "clicking a visible row must not yank it out from under the pointer"
+            );
+            let sel = view.tabs[0]
+                .main_text_selection
+                .expect("double-click should select a word on the clicked row");
+            assert_eq!(sel.row_range(), bottom_visible_row..=bottom_visible_row);
+        });
+
+        // 3. Filter/results pane also respects cursor_surrounding_lines when navigating filtered rows.
+        view.update_in(vcx, |view, window, cx| {
+            let matches: Vec<usize> = (0..200).filter(|i| i % 2 == 0).collect();
+            view.tabs[0].results.matches = matches.clone();
+            view.tabs[0].results.visible = matches;
+            view.tabs[0].result_selection = LineSelection::single(0);
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        vcx.run_until_parked();
+        for step in 1..=25 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::NextLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                assert_eq!(view.tabs[0].result_selection.cursor, step);
+                assert_surrounding_margin(
+                    &view.tabs[0].result_scroll,
+                    step,
+                    100,
+                    line_height,
+                    4,
+                    "results NextLine",
+                );
+                assert_surrounding_margin(
+                    &view.tabs[0].scroll,
+                    step * 2,
+                    200,
+                    line_height,
+                    4,
+                    "main synced from results NextLine",
+                );
+            });
+        }
+        for _ in 0..15 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::PreviousLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                let row = view.tabs[0].result_selection.cursor;
+                assert_surrounding_margin(
+                    &view.tabs[0].result_scroll,
+                    row,
+                    100,
+                    line_height,
+                    4,
+                    "results PreviousLine",
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn cursor_surrounding_lines_adapts_to_zoom_centers_when_large_and_handles_initial_load(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zoom_surrounding.log");
+        let content: String = (0..200)
+            .map(|i| format!("2026-11-26 INFO row-{i:04} payload\n"))
+            .collect();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        // 1. Zooming scales the surrounding margin in rows (using zoomed line_height).
+        let mut config = Config::load(None).unwrap();
+        config.viewer.cursor_surrounding_lines = 4;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        vcx.run_until_parked();
+
+        view.update_in(vcx, |view, window, cx| {
+            for _ in 0..5 {
+                view.command(Command::ZoomIn, window, cx);
+            }
+        });
+        vcx.run_until_parked();
+        let zoomed_line_height = view.read_with(vcx, |view, _| {
+            assert_eq!(view.zoom_percent, 150);
+            view.zoom_metrics().line_height
+        });
+        assert!((zoomed_line_height - 36.0).abs() < 0.5);
+
+        for _ in 0..25 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::NextLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                assert_surrounding_margin(
+                    &view.tabs[0].scroll,
+                    view.tabs[0].selected,
+                    200,
+                    zoomed_line_height,
+                    4,
+                    "zoomed NextLine",
+                );
+            });
+        }
+
+        // 2. Large cursor_surrounding_lines (larger than half viewport) centers cursor vertically.
+        let mut center_config = Config::load(None).unwrap();
+        center_config.viewer.cursor_surrounding_lines = 500;
+        let (center_view, center_cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(center_config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        center_cx.run_until_parked();
+
+        center_view.update_in(center_cx, |view, window, cx| {
+            for _ in 0..50 {
+                view.command(Command::NextLine, window, cx);
+            }
+        });
+        center_cx.run_until_parked();
+        center_view.read_with(center_cx, |view, _| {
+            let state = view.tabs[0].scroll.0.borrow();
+            let vp = f32::from(state.last_item_size.unwrap().item.height);
+            let line_h = view.zoom_metrics().line_height;
+            let scroll_top = -f32::from(state.base_handle.offset().y);
+            let expected_center = (50.0 * line_h + line_h * 0.5) - vp * 0.5;
+            assert!(
+                (scroll_top - expected_center).abs() < 1.0,
+                "expected cursor centered at {expected_center}, got {scroll_top}"
+            );
+        });
+
+        // 3. Initial load before first layout resolves pending reveal once viewport size is known,
+        //    even when the restored line sits inside the bottom margin of the first screen.
+        let initial_edge_row = center_view.read_with(center_cx, |view, _| {
+            let vp = f32::from(
+                view.tabs[0]
+                    .scroll
+                    .0
+                    .borrow()
+                    .last_item_size
+                    .unwrap()
+                    .item
+                    .height,
+            );
+            ((vp / view.zoom_metrics().line_height).floor() as usize).saturating_sub(1)
+        });
+        assert!(initial_edge_row >= 8);
+        let mut init_config = Config::load(None).unwrap();
+        init_config.viewer.cursor_surrounding_lines = 5;
+        let (init_view, init_cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(init_config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].selected = initial_edge_row;
+            workspace.tabs[0].main_selection = LineSelection::single(initial_edge_row);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            let lh = workspace.zoom_metrics().line_height;
+            Workspace::reveal_main_row_in_tab(
+                &mut workspace.tabs[0],
+                initial_edge_row,
+                lh,
+                5,
+                RevealStrategy::Center,
+            );
+            workspace
+        });
+        init_cx.run_until_parked();
+        // Advance the scheduled next-frame callback (tests have no platform frame loop).
+        init_cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        init_cx.run_until_parked();
+        init_view.read_with(init_cx, |view, _| {
+            assert!(
+                view.tabs[0].pending_main_reveal.is_none(),
+                "pending reveal should have been flushed after initial layout"
+            );
+            let scroll_top = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                scroll_top > 0.5,
+                "deferred initial reveal must scroll edge row {initial_edge_row} into the safe margin"
+            );
+            assert_surrounding_margin(
+                &view.tabs[0].scroll,
+                initial_edge_row,
+                200,
+                view.zoom_metrics().line_height,
+                5,
+                "initial load deferred reveal",
             );
         });
     }
