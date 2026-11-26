@@ -44,6 +44,7 @@
         "TextSelected",
         "TextSelected && RegexMode",
         "RegexMode",
+        "TextInput",
         "Search",
         "FilePath",
         "GoTo",
@@ -87,6 +88,8 @@
         "last_line",
         "page_up",
         "page_down",
+        "scroll_left",
+        "scroll_right",
         "next_bookmark",
         "previous_bookmark",
         "show_files",
@@ -107,7 +110,9 @@
         "decrease_filter_height",
         "zoom_in",
         "zoom_out",
-        "zoom_reset"
+        "zoom_reset",
+        "move_to_line_start",
+        "move_to_line_end"
       ]
     }
   }

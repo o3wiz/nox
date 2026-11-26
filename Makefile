@@ -31,7 +31,7 @@ help:
 	@echo "  make release        Build optimized release binary ($(CARGO_TARGET_DIR)/release/$(BIN_NAME))"
 	@echo "  make macos-app      Build signed macOS app bundle ($(DIST_DIR)/Nox.app)"
 	@echo "  make package-macos  Build macOS .app, .dmg, .app.zip, CLI .tar.gz, and SHA256SUMS"
-	@echo "  make install-macos  Build and install Nox.app into /Applications"
+	@echo "  make install-macos  Build and install Nox.app into /Applications (and migrate existing config)"
 	@echo "  make package-linux  Build Linux release .tar.gz with desktop entry, icon, and SHA256SUMS"
 	@echo "  make clean-dist     Remove $(DIST_DIR)/ packaging output"
 
@@ -100,6 +100,11 @@ package-macos: macos-app
 install-macos: macos-app
 	@rm -rf "/Applications/Nox.app"
 	@ditto "$(DIST_DIR)/Nox.app" "/Applications/Nox.app"
+	@if [ -n "$(CONFIG_DIR)" ]; then \
+		"/Applications/Nox.app/Contents/MacOS/$(BIN_NAME)" --migrate-config "$(CONFIG_DIR)"; \
+	else \
+		"/Applications/Nox.app/Contents/MacOS/$(BIN_NAME)" --migrate-config; \
+	fi
 	@echo "Installed /Applications/Nox.app (v$(VERSION))"
 
 package-linux: release

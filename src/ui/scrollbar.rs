@@ -1,13 +1,14 @@
 use super::theme::Theme;
 use gpui::{
     App, Bounds, ColorExt, Corners, CursorStyle, DispatchPhase, HitboxBehavior, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Size,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, PaintQuad, Pixels, Point, ScrollStrategy, Size,
     UniformListScrollHandle, Window, canvas, point, prelude::*, px, size,
 };
 use std::{cell::Cell, rc::Rc};
 
 pub const DEFAULT_SCROLLBAR_WIDTH: f32 = 10.0;
 pub const HORIZONTAL_BAR_HEIGHT: f32 = 8.0;
+pub const HORIZONTAL_SCROLL_STEP: f32 = 48.0;
 pub const MIN_VERTICAL_THUMB: f32 = 24.0;
 pub const MIN_HORIZONTAL_THUMB: f32 = 28.0;
 pub const TRACK_END_PADDING: f32 = 2.0;
@@ -244,13 +245,88 @@ pub fn scroll_offset_for_drag(
     )
 }
 
+/// Computes the horizontal keyboard scroll distance in pixels for the current zoom scale and viewport.
+pub fn horizontal_scroll_step(viewport: f32, zoom_scale: f32) -> f32 {
+    let scaled = (HORIZONTAL_SCROLL_STEP * zoom_scale).max(16.0);
+    if viewport > 0.0 {
+        scaled.min((viewport * 0.5).max(16.0))
+    } else {
+        scaled
+    }
+}
+
+/// Computes the next clamped positive scroll offset when stepping by `delta` (`< 0` left/up, `> 0` right/down).
+/// Returns `Some(next_offset)` only when the offset changes meaningfully.
+pub fn stepped_scroll_offset(
+    raw_offset: f32,
+    viewport: f32,
+    content: f32,
+    delta: f32,
+) -> Option<f32> {
+    if viewport <= 0.0 || content <= 0.0 {
+        return None;
+    }
+    let max_offset = (content - viewport).max(0.0);
+    let next = if max_offset <= 0.5 {
+        0.0
+    } else {
+        (raw_offset.clamp(0.0, max_offset) + delta).clamp(0.0, max_offset)
+    };
+    if (next - raw_offset).abs() <= 0.01 {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+/// Steps the scroll offset of a `UniformListScrollHandle` along `axis` by the delta returned by
+/// `delta_for_viewport` (`< 0` toward the start, `> 0` toward the end), clamped to `[0.0, max_offset]`.
+/// Preserves the orthogonal axis offset and returns `true` if the offset changed.
+pub fn step_uniform_list_axis_offset(
+    handle: &UniformListScrollHandle,
+    axis: ScrollAxis,
+    delta_for_viewport: impl FnOnce(f32) -> f32,
+) -> bool {
+    let state = handle.0.borrow();
+    let Some(item_size) = state.last_item_size else {
+        return false;
+    };
+    let mut current = state.base_handle.offset();
+    let (viewport, content, raw_offset) = match axis {
+        ScrollAxis::Vertical => (
+            f32::from(item_size.item.height),
+            f32::from(item_size.contents.height),
+            -f32::from(current.y),
+        ),
+        ScrollAxis::Horizontal => (
+            f32::from(item_size.item.width),
+            f32::from(item_size.contents.width),
+            -f32::from(current.x),
+        ),
+    };
+    let delta = delta_for_viewport(viewport);
+    let Some(next) = stepped_scroll_offset(raw_offset, viewport, content, delta) else {
+        return false;
+    };
+    let clamped = if next <= 0.0 { 0.0 } else { -next };
+    match axis {
+        ScrollAxis::Vertical => current.y = px(clamped),
+        ScrollAxis::Horizontal => current.x = px(clamped),
+    }
+    state.base_handle.set_offset(current);
+    true
+}
+
 /// Applies a positive scroll offset along `axis` to `handle`, preserving the orthogonal axis.
 pub fn set_uniform_list_axis_offset(
     handle: &UniformListScrollHandle,
     axis: ScrollAxis,
     positive_offset: f32,
 ) {
-    let state = handle.0.borrow();
+    let mut state = handle.0.borrow_mut();
+    if axis == ScrollAxis::Vertical {
+        state.deferred_scroll_to_item = None;
+    }
     let mut current = state.base_handle.offset();
     let clamped = -positive_offset.max(0.0);
     match axis {
@@ -258,6 +334,169 @@ pub fn set_uniform_list_axis_offset(
         ScrollAxis::Horizontal => current.x = px(clamped),
     }
     state.base_handle.set_offset(current);
+}
+
+/// Placement preference when revealing a target row in a uniform list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevealStrategy {
+    /// Scroll the minimum distance needed so the row stays at least `surrounding_lines` rows
+    /// inside the viewport's top and bottom edges (clamped by list and viewport bounds).
+    Nearest,
+    /// If the row is outside the inner band defined by `surrounding_lines`, center it vertically
+    /// in the viewport (clamped by list bounds).
+    Center,
+}
+
+/// Result of attempting to reveal a row in a `UniformListScrollHandle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevealOutcome {
+    /// Viewport geometry was known and the scroll offset already satisfied the reveal margin.
+    Unchanged,
+    /// Viewport geometry was known and the vertical scroll offset was updated immediately.
+    Scrolled,
+    /// The list has not been laid out yet; a deferred scroll was queued and a post-layout pass
+    /// should enforce the exact surrounding-lines margin once geometry is available.
+    Deferred,
+}
+
+/// Computes the new positive vertical scroll offset (`scroll_top >= 0.0`) needed to reveal `row`
+/// while keeping at least `surrounding_lines` rows visible above and below it whenever space allows.
+///
+/// When `surrounding_lines` fills or exceeds the available viewport around the active row, the
+/// target row is centered vertically (clamped to the start and end of the list), matching editor
+/// `cursorSurroundingLines` / `scrolloff` behavior.
+///
+/// Returns `None` when the list is empty or row/viewport geometry is non-positive or non-finite.
+pub fn reveal_scroll_top(
+    row: usize,
+    row_count: usize,
+    row_height: f32,
+    viewport_height: f32,
+    current_scroll_top: f32,
+    surrounding_lines: usize,
+    strategy: RevealStrategy,
+) -> Option<f32> {
+    if row_count == 0
+        || !row_height.is_finite()
+        || row_height <= 0.0
+        || !viewport_height.is_finite()
+        || viewport_height <= 0.0
+    {
+        return None;
+    }
+
+    let row = row.min(row_count - 1);
+    let row_h = f64::from(row_height);
+    let vp_h = f64::from(viewport_height);
+    let content_h = row_count as f64 * row_h;
+    let max_scroll = (content_h - vp_h).max(0.0);
+    if max_scroll <= 0.0 {
+        return Some(0.0);
+    }
+
+    let current = if current_scroll_top.is_finite() {
+        f64::from(current_scroll_top).clamp(0.0, max_scroll)
+    } else {
+        0.0
+    };
+
+    let row_top = row as f64 * row_h;
+    let row_bottom = row_top + row_h;
+
+    if vp_h <= row_h {
+        return Some(row_top.clamp(0.0, max_scroll) as f32);
+    }
+
+    let max_margin = (vp_h - row_h) * 0.5;
+    let desired_margin = surrounding_lines as f64 * row_h;
+    let centered = ((row_top + row_h * 0.5) - vp_h * 0.5).clamp(0.0, max_scroll);
+
+    if desired_margin >= max_margin {
+        return Some(centered as f32);
+    }
+
+    let lower = (row_bottom + desired_margin - vp_h).clamp(0.0, max_scroll);
+    let upper = (row_top - desired_margin).clamp(0.0, max_scroll);
+
+    if lower >= upper {
+        return Some(lower as f32);
+    }
+
+    const EPSILON: f64 = 0.01;
+    if current >= lower - EPSILON && current <= upper + EPSILON {
+        return Some(current as f32);
+    }
+
+    let target = match strategy {
+        RevealStrategy::Nearest => current.clamp(lower, upper),
+        RevealStrategy::Center => centered,
+    };
+    Some(target as f32)
+}
+
+/// Reveals `row` in `handle` while maintaining `surrounding_lines` rows of margin above and below.
+pub fn reveal_uniform_list_row(
+    handle: &UniformListScrollHandle,
+    row: usize,
+    row_count: usize,
+    row_height: f32,
+    surrounding_lines: usize,
+    strategy: RevealStrategy,
+) -> RevealOutcome {
+    if row_count == 0 {
+        return RevealOutcome::Unchanged;
+    }
+    let row = row.min(row_count - 1);
+    let viewport_height = {
+        let state = handle.0.borrow();
+        state
+            .last_item_size
+            .map(|item_size| f32::from(item_size.item.height))
+            .filter(|height| height.is_finite() && *height > 0.0)
+    };
+
+    if let Some(viewport_height) = viewport_height {
+        let current_scroll_top = {
+            let state = handle.0.borrow();
+            -f32::from(state.base_handle.offset().y)
+        };
+        if let Some(target_scroll_top) = reveal_scroll_top(
+            row,
+            row_count,
+            row_height,
+            viewport_height,
+            current_scroll_top,
+            surrounding_lines,
+            strategy,
+        ) {
+            let mut state = handle.0.borrow_mut();
+            let had_deferred = state.deferred_scroll_to_item.take().is_some();
+            let current_y = f32::from(state.base_handle.offset().y);
+            let target_y = if target_scroll_top <= 0.0 {
+                0.0
+            } else {
+                -target_scroll_top
+            };
+            if had_deferred || (target_y - current_y).abs() > 1e-4 {
+                let mut offset = state.base_handle.offset();
+                offset.y = px(target_y);
+                state.base_handle.set_offset(offset);
+                return RevealOutcome::Scrolled;
+            }
+            return RevealOutcome::Unchanged;
+        }
+    }
+
+    let gpui_strategy = match strategy {
+        RevealStrategy::Nearest => ScrollStrategy::Nearest,
+        RevealStrategy::Center => ScrollStrategy::Center,
+    };
+    handle.scroll_to_item(row, gpui_strategy);
+    if surrounding_lines > 0 {
+        RevealOutcome::Deferred
+    } else {
+        RevealOutcome::Scrolled
+    }
 }
 
 /// Renders a zero-lag scrollbar canvas that reads scroll geometry after sibling `uniform_list` prepaint.
@@ -542,6 +781,197 @@ mod tests {
                 20.0
             ),
             1000.0
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_step_scales_with_zoom_and_caps_to_half_viewport() {
+        assert_eq!(horizontal_scroll_step(800.0, 1.0), HORIZONTAL_SCROLL_STEP);
+        assert_eq!(
+            horizontal_scroll_step(800.0, 2.0),
+            HORIZONTAL_SCROLL_STEP * 2.0
+        );
+        assert_eq!(
+            horizontal_scroll_step(800.0, 0.5),
+            HORIZONTAL_SCROLL_STEP * 0.5
+        );
+        assert_eq!(horizontal_scroll_step(60.0, 2.0), 30.0);
+        assert_eq!(horizontal_scroll_step(10.0, 1.0), 16.0);
+    }
+
+    #[test]
+    fn stepped_scroll_offset_clamps_to_bounds_and_skips_noops() {
+        // Content fits within viewport -> no horizontal scrolling, stale offset resets to 0.
+        assert_eq!(stepped_scroll_offset(0.0, 400.0, 300.0, 48.0), None);
+        assert_eq!(stepped_scroll_offset(0.0, 400.0, 300.0, -48.0), None);
+        assert_eq!(stepped_scroll_offset(50.0, 400.0, 300.0, -48.0), Some(0.0));
+        assert_eq!(stepped_scroll_offset(0.0, 0.0, 300.0, 48.0), None);
+
+        // Overflowing content (max_offset = 600.0).
+        assert_eq!(stepped_scroll_offset(0.0, 400.0, 1000.0, -48.0), None);
+        assert_eq!(stepped_scroll_offset(0.0, 400.0, 1000.0, 48.0), Some(48.0));
+        assert_eq!(stepped_scroll_offset(30.0, 400.0, 1000.0, -48.0), Some(0.0));
+        assert_eq!(
+            stepped_scroll_offset(580.0, 400.0, 1000.0, 48.0),
+            Some(600.0)
+        );
+        assert_eq!(stepped_scroll_offset(600.0, 400.0, 1000.0, 48.0), None);
+    }
+
+    #[test]
+    fn reveal_scroll_top_with_zero_surrounding_matches_standard_nearest_and_center() {
+        // 100 rows * 24px = 2400px, viewport = 240px (10 rows), max_scroll = 2160px.
+        // Visible rows at scroll_top = 0 are 0..10.
+        assert_eq!(
+            reveal_scroll_top(0, 100, 24.0, 240.0, 0.0, 0, RevealStrategy::Nearest),
+            Some(0.0)
+        );
+        assert_eq!(
+            reveal_scroll_top(9, 100, 24.0, 240.0, 0.0, 0, RevealStrategy::Nearest),
+            Some(0.0)
+        );
+        // Row 10 is just below viewport -> scrolls down 1 row (24px).
+        assert_eq!(
+            reveal_scroll_top(10, 100, 24.0, 240.0, 0.0, 0, RevealStrategy::Nearest),
+            Some(24.0)
+        );
+        // Row 4 at scroll_top = 120 (showing 5..15) -> scrolls up to row 4 top (96px).
+        assert_eq!(
+            reveal_scroll_top(4, 100, 24.0, 240.0, 120.0, 0, RevealStrategy::Nearest),
+            Some(96.0)
+        );
+        // Center strategy stays put when visible and centers when off-screen.
+        assert_eq!(
+            reveal_scroll_top(9, 100, 24.0, 240.0, 0.0, 0, RevealStrategy::Center),
+            Some(0.0)
+        );
+        // Row 50 center = 50*24 + 12 = 1212, viewport/2 = 120 -> 1092.
+        assert_eq!(
+            reveal_scroll_top(50, 100, 24.0, 240.0, 0.0, 0, RevealStrategy::Center),
+            Some(1092.0)
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_top_keeps_exact_surrounding_rows_above_and_below() {
+        // 100 rows * 24px = 2400px, viewport = 240px (10 rows), surrounding = 3 (72px margin).
+        // Moving down from row 0 at scroll_top = 0:
+        // Row 6 still has 3 full rows below (7, 8, 9), so no scroll yet.
+        assert_eq!(
+            reveal_scroll_top(6, 100, 24.0, 240.0, 0.0, 3, RevealStrategy::Nearest),
+            Some(0.0)
+        );
+        // Row 7 needs 3 full rows below (8, 9, 10) -> scroll_top = 24px (rows 1..11 visible).
+        assert_eq!(
+            reveal_scroll_top(7, 100, 24.0, 240.0, 0.0, 3, RevealStrategy::Nearest),
+            Some(24.0)
+        );
+        // Row 8 -> scroll_top = 48px (rows 2..12 visible).
+        assert_eq!(
+            reveal_scroll_top(8, 100, 24.0, 240.0, 24.0, 3, RevealStrategy::Nearest),
+            Some(48.0)
+        );
+
+        // Moving back up from row 8 at scroll_top = 48 (rows 2..12 visible):
+        // Rows 7, 6, 5 all have >= 3 rows above (row 5 has rows 2, 3, 4 above) -> no scroll!
+        for row in [7, 6, 5] {
+            assert_eq!(
+                reveal_scroll_top(row, 100, 24.0, 240.0, 48.0, 3, RevealStrategy::Nearest),
+                Some(48.0)
+            );
+        }
+        // Row 4 only has rows 2, 3 above -> scrolls up to 24px so rows 1, 2, 3 are above.
+        assert_eq!(
+            reveal_scroll_top(4, 100, 24.0, 240.0, 48.0, 3, RevealStrategy::Nearest),
+            Some(24.0)
+        );
+        // Row 3 -> scrolls to 0px (rows 0, 1, 2 above).
+        assert_eq!(
+            reveal_scroll_top(3, 100, 24.0, 240.0, 24.0, 3, RevealStrategy::Nearest),
+            Some(0.0)
+        );
+
+        // Clamping near the end of the file: max_scroll = 2160 (rows 90..100 visible).
+        assert_eq!(
+            reveal_scroll_top(95, 100, 24.0, 240.0, 2112.0, 3, RevealStrategy::Nearest),
+            Some(2136.0)
+        );
+        for row in 96..100 {
+            assert_eq!(
+                reveal_scroll_top(row, 100, 24.0, 240.0, 2136.0, 3, RevealStrategy::Nearest),
+                Some(2160.0)
+            );
+        }
+        // Moving back up from row 99 at bottom: row 93 has 3 rows above (90, 91, 92) -> stays at 2160.
+        assert_eq!(
+            reveal_scroll_top(93, 100, 24.0, 240.0, 2160.0, 3, RevealStrategy::Nearest),
+            Some(2160.0)
+        );
+        // Row 92 scrolls up to 2136 so rows 89, 90, 91 are above.
+        assert_eq!(
+            reveal_scroll_top(92, 100, 24.0, 240.0, 2160.0, 3, RevealStrategy::Nearest),
+            Some(2136.0)
+        );
+    }
+
+    #[test]
+    fn reveal_scroll_top_handles_fractional_viewports_large_margins_center_and_edge_cases() {
+        // Fractional viewport (250px = 10.416 rows of 24px), surrounding = 3 (72px):
+        // Row 7 bottom is 192px; keeping 72px below requires viewport bottom >= 264 -> scroll_top = 14px.
+        assert_eq!(
+            reveal_scroll_top(7, 100, 24.0, 250.0, 0.0, 3, RevealStrategy::Nearest),
+            Some(14.0)
+        );
+
+        // Surrounding lines exceeding half the viewport (e.g. 500) centers the cursor (clamped at ends).
+        assert_eq!(
+            reveal_scroll_top(50, 100, 24.0, 240.0, 0.0, 500, RevealStrategy::Nearest),
+            Some(1092.0)
+        );
+        assert_eq!(
+            reveal_scroll_top(0, 100, 24.0, 240.0, 500.0, 500, RevealStrategy::Nearest),
+            Some(0.0)
+        );
+        assert_eq!(
+            reveal_scroll_top(99, 100, 24.0, 240.0, 500.0, 500, RevealStrategy::Nearest),
+            Some(2160.0)
+        );
+
+        // Center strategy triggers when a visible row encroaches on the surrounding margin,
+        // and stays put when the row is already comfortably inside the inner safe band.
+        assert_eq!(
+            reveal_scroll_top(8, 100, 24.0, 240.0, 0.0, 3, RevealStrategy::Center),
+            Some(84.0) // row 8 center = 204 - 120 = 84
+        );
+        assert_eq!(
+            reveal_scroll_top(5, 100, 24.0, 240.0, 0.0, 3, RevealStrategy::Center),
+            Some(0.0) // row 5 already has 5 above and 4 below -> unchanged
+        );
+
+        // Short file that fits inside the viewport never scrolls past 0.
+        assert_eq!(
+            reveal_scroll_top(4, 5, 24.0, 240.0, 0.0, 3, RevealStrategy::Nearest),
+            Some(0.0)
+        );
+
+        // Tiny viewport shorter than one row aligns row top safely without panicking.
+        assert_eq!(
+            reveal_scroll_top(10, 100, 24.0, 12.0, 0.0, 5, RevealStrategy::Nearest),
+            Some(240.0)
+        );
+
+        // Invalid or empty inputs return None.
+        assert_eq!(
+            reveal_scroll_top(0, 0, 24.0, 240.0, 0.0, 3, RevealStrategy::Nearest),
+            None
+        );
+        assert_eq!(
+            reveal_scroll_top(0, 10, 0.0, 240.0, 0.0, 3, RevealStrategy::Nearest),
+            None
+        );
+        assert_eq!(
+            reveal_scroll_top(0, 10, 24.0, f32::NAN, 0.0, 3, RevealStrategy::Nearest),
+            None
         );
     }
 }

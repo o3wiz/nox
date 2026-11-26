@@ -5,7 +5,7 @@
 `nox` is a native Rust (edition 2024, MSRV 1.95) GPU-accelerated log explorer built with GPUI Community Edition.
 
 - `src/lib.rs`: core library modules (`config`, `logfile`, `path_complete`, `search`, `selection`, `session`, `zoom`).
-- `src/main.rs`: CLI argument parsing (`--help`, `--version`, `--config-dir`, `--init-config`, `--write-schemas`, `--check-config`) and application startup.
+- `src/main.rs`: CLI argument parsing (`--help`, `--version`, `--config-dir`, `--init-config`, `--migrate-config`, `--write-schemas`, `--check-config`) and application startup.
 - `src/ui/`: GPUI presentation layer (`mod.rs`, `components.rs`, `icons.rs`, `resize.rs`, `scrollbar.rs`, `selectable_text.rs`, `theme.rs`).
 - `config/`: default JSON configuration files embedded into the binary at compile time.
 - `schemas/`: JSON Schemas generated from the Rust config/session types (verified by tests).

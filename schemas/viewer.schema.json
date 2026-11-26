@@ -45,6 +45,13 @@
       "minimum": 100,
       "maximum": 60000
     },
+    "cursor_surrounding_lines": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0,
+      "maximum": 1000,
+      "default": 0
+    },
     "$schema": {
       "type": "string"
     }

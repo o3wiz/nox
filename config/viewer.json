@@ -8,5 +8,6 @@
   "include_bookmarks": true,
   "poll_interval_ms": 1000,
   "show_overview": true,
-  "overview_width": 16
+  "overview_width": 16,
+  "cursor_surrounding_lines": 0
 }

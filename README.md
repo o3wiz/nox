@@ -23,6 +23,8 @@ Download the latest release package for your platform from [GitHub Releases](htt
 - **Linux (`x86_64`)**: Extract `nox-v<version>-x86_64-unknown-linux-gnu.tar.gz`, copy `nox` onto your `PATH` (e.g. `~/.local/bin/nox`), and optionally install `nox.desktop` into `~/.local/share/applications/` and `nox.svg` into `~/.local/share/icons/hicolor/scalable/apps/`.
 - **Windows (`x86_64`)**: Extract `nox-v<version>-x86_64-pc-windows-msvc.zip` and run `nox.exe` (or add its folder to `PATH`).
 
+When upgrading an existing installation with a custom configuration directory, run `nox --migrate-config` (or `nox --migrate-config DIR`) to add newly introduced files, fields, and default keybindings and refresh `schemas/` without removing any existing or deprecated fields. `make install-macos` runs this migration step automatically.
+
 ### Build from source
 
 Requires Rust `1.95+` (edition 2024) and the native build prerequisites for [GPUI CE](https://github.com/gpui-ce/gpui-ce/blob/main/SETUP.md):
@@ -47,11 +49,11 @@ cargo run -- fixtures/demo.log
 
 ## Using the viewer
 
-Open files with the folder icon (**⌘O** / **Ctrl+O**), by editing the file path bar above the log (click it or press **⌘⇧O** / **Ctrl+Shift+O** — use **Tab** / **↑** / **↓** for filesystem filename completion, **Enter** to replace the current tab's log, **⌘↵** / **Ctrl+Enter** to open in a new tab, and **Escape** to cancel), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and middle-click it or click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar, and toggle search match background highlighting from the highlighter icon on the left side of the search bar (or **⌘⌥H** / **Ctrl+Alt+H**). In regex mode, highlighting emphasizes only capturing groups when present (or the full match if there are none); in literal mode, it highlights the matched literal text across both panes. Open saved patterns from the **Patterns** dropdown (or **⌘P** / **Ctrl+P**), navigate with **↑**/**↓** (**Home**/**End**), and press **Enter** or click an item to apply it immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
+Open files with the folder icon (**⌘O** / **Ctrl+O**), by editing the file path bar above the log (click it or press **⌘⇧O** / **Ctrl+Shift+O** — use **Tab** / **↑** / **↓** for filesystem filename completion, **Enter** to replace the current tab's log, **⌘↵** / **Ctrl+Enter** to open in a new tab, and **Escape** to cancel), by dragging files onto the window, the command line, or the history icon (**Recent & favorites**). Click a tab to switch and middle-click it or click its inline `×` icon to close it. Hover any icon button to see its action label and active keyboard shortcut. Enter a query and press **Enter** or click the apply icon; toggle **Regular expression**, **Match case**, **Whole words**, and **Exclude matches** directly from the inline icons inside the search bar, and toggle search match background highlighting from the highlighter icon on the left side of the search bar (or **⌘⌥H** / **Ctrl+Alt+H**). In regex mode, highlighting emphasizes only capturing groups when present (or the full match if there are none); in literal mode, it highlights the matched literal text across both panes. Open saved patterns from the **Patterns** dropdown (or **⌘P** / **Ctrl+P**), type to live fuzzy-filter by pattern name, optionally refine with **↑**/**↓**, and press **Enter** or click an item to apply it immediately. An empty search shows only bookmarks when `include_bookmarks` is enabled.
 
-Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, or press **Tab** to switch focus between the main pane and the filter pane. Select text directly inside displayed rows in either pane by clicking and dragging across characters or multiple rows, double-clicking a word, triple-clicking a line, or **Shift+Clicking** to extend an active text selection (**⌘C** / **Ctrl+C** copies the selected text and **Escape** clears it). Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Alt+O** / **⌥O** flips the selection anchor between the top and bottom ends, and **Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
+Click a result to focus the filter pane and jump the main pane to its source line; press **↑**/**↓** (or **Home**/**End**/**PageUp**/**PageDown**) to keep navigating inside the filter pane, **←**/**→** to scroll long lines horizontally in the active pane, or press **Tab** to switch focus between the main pane and the filter pane. Select text directly inside displayed rows in either pane by clicking and dragging across characters or multiple rows, double-clicking a word, triple-clicking a line, or **Shift+Clicking** to extend an active text selection (**⌘C** / **Ctrl+C** copies the selected text and **Escape** clears it). Multi-select lines in either pane with **Shift+Click**, **⌘+Click** / **Ctrl+Click**, click-and-drag, **Shift+Arrows** / **PageUp** / **PageDown** / **Home** / **End**, or **⌘A** / **Ctrl+A** (**Alt+O** / **⌥O** flips the selection anchor between the top and bottom ends, and **Escape** collapses back to the active line). Click the gutter to bookmark a single line, or press **m** (or the bookmark icon) to toggle bookmarks on all selected lines. Selecting a line stops following; the follow icon resumes scrolling to the end as changes arrive. Watching continues even when following is off. The reload icon retries failed opens and forces reindexing. Truncation and replacement clear stale bookmarks while ordinary appends preserve them.
 
-The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Resize the filter pane vertically all the way from the bottom (hiding the filter pane) to the top (hiding the main log pane) by dragging the horizontal split handle above the search bar (double-click it to reset to `window.results_height`), clicking the resize buttons in the results header, or pressing **-** (taller) and **⇧-** / **Shift+-** (shorter) in the log/filter panes — holding either key smoothly glides with an automatic acceleration gradient. Zoom the log and filter panes in and out with the zoom buttons in the top toolbar or **⌘=** / **Ctrl+=** (or **⌘+** / **Ctrl++**) and **⌘-** / **Ctrl+-**, and reset back to 100% with **⌘0** / **Ctrl+0** or by clicking the zoom indicator in the status bar. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
+The export icon in the results header writes all currently displayed result rows, including context and bookmarks, in source order. It exports complete original bytes, regardless of the display limit, and refuses to overwrite an existing file. Resize the filter pane vertically all the way from the bottom (hiding the filter pane) up to the file path bar (hiding the main log pane while keeping the file path bar visible) by dragging the horizontal split handle above the search bar (double-click it to reset to `window.results_height`), clicking the resize buttons in the results header, or pressing **-** (taller) and **⇧-** / **Shift+-** (shorter) in the log/filter panes — holding either key smoothly glides with an automatic acceleration gradient. Zoom the log and filter panes in and out with the zoom buttons in the top toolbar or **⌘=** / **Ctrl+=** (or **⌘+** / **Ctrl++**) and **⌘-** / **Ctrl+-**, and reset back to 100% with **⌘0** / **Ctrl+0** or by clicking the zoom indicator in the status bar. The copy icon (or **⌘C** / **Ctrl+C**) copies all selected lines in the active pane as text. Regex errors and file errors appear in a banner above the viewer, even when the status bar is hidden.
 
 Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 
@@ -67,8 +69,9 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Workspace | secondary-= / secondary-- / secondary-0 | Zoom in / zoom out / reset zoom |
 | Workspace | F3 / shift-F3 | Next / previous match |
 | Workspace | secondary-q | Quit |
-| Log | arrows, home/end, pageup/pagedown | Navigate lines (in active pane) |
-| Log | shift-arrows, shift-home/end, shift-pageup/pagedown | Extend selection (in active pane) |
+| Log | up/down, home/end, pageup/pagedown | Navigate lines (in active pane) |
+| Log | left / right | Scroll horizontally (in active pane) |
+| Log | shift-up/down, shift-home/end, shift-pageup/pagedown | Extend selection (in active pane) |
 | Log | secondary-a / escape | Select all / collapse selection |
 | Log | tab | Switch focus between main and filter pane |
 | Log | m | Toggle bookmark on selected lines |
@@ -81,6 +84,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | TextSelected | f | Insert selected text into search box (regex-escaped in Regex mode) and focus end |
 | TextSelected && RegexMode | a | Append regex-escaped selected text to search pattern with `\|` (or copy if empty) and focus end |
 | TextSelected | escape | Clear text selection |
+| TextInput | cmd-left / home, cmd-right / end | Move cursor to start / end of line in any text input (Search, FilePath, GoTo, Presets) |
 | Search | Enter / Escape | Apply search / focus log |
 | Search | secondary-alt-r | Toggle regular expression |
 | Search | secondary-alt-c | Toggle match case |
@@ -89,7 +93,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | GoTo | Enter / Escape | Jump / cancel |
 | FilePath | Enter / secondary-enter | Replace current tab's log / open in new tab |
 | FilePath | Tab / shift-tab, up/down, Escape | Complete filesystem path / navigate suggestions / cancel |
-| Presets | up/down, home/end, Enter/Space, Escape | Navigate / apply / close saved patterns |
+| Presets | type to filter, up/down, Enter, Escape | Fuzzy-filter / navigate / apply / close saved patterns |
 
 Text editing uses GPUI CE's native editable-text element, including clipboard operations, selection, undo, and IME support.
 
@@ -102,6 +106,10 @@ Configuration is grouped by responsibility. The checked-in files in `config/` ar
 cargo run -- --version
 # Create editable defaults and local JSON schemas in a NEW directory.
 cargo run -- --init-config ./my-config
+# Migrate an existing configuration directory (adds missing files/fields/keybindings and updates schemas).
+cargo run -- --migrate-config ./my-config
+# Or migrate the default directory ($NOX_CONFIG_DIR, ~/.config/nox, or %APPDATA%/nox) if it exists.
+cargo run -- --migrate-config
 # Use that configuration.
 cargo run -- --config-dir ./my-config fixtures/demo.log
 # Validate without opening a window.
@@ -112,17 +120,17 @@ cargo run -- --write-schemas schemas
 
 `--config-dir` takes precedence over `NOX_CONFIG_DIR`. Without either, Nox uses embedded defaults. To edit and run the repository defaults directly, use `--config-dir config`. Restart Nox after editing configuration.
 
-Files and individual fields may be omitted. Objects overlay defaults; arrays replace the entire default array. Unknown fields, invalid types, out-of-range values, invalid colors/regexes, duplicate bindings in one context, and invalid key sequences produce an error. Explicitly selecting a nonexistent directory also produces an error. `--init-config` refuses to overwrite existing configuration files.
+Files and individual fields may be omitted. Objects overlay defaults; arrays replace the entire default array. Unknown fields, invalid types, out-of-range values, invalid colors/regexes, duplicate bindings in one context, and invalid key sequences produce an error. Explicitly selecting a nonexistent directory also produces an error. `--init-config` refuses to overwrite existing configuration files. `--migrate-config` updates an existing configuration directory non-destructively: it creates missing section files, adds missing object fields (including defaulted fields on existing `search.json` presets), appends missing default `keyboard.json` bindings whose `(context, action)` and `(context, keys)` are not already configured, refreshes all `schemas/*.schema.json` files, and never deletes existing or deprecated fields.
 
 | File | Settings |
 | --- | --- |
 | `window.json` | Title, initial dimensions/maximized state, results-pane height, status bar |
 | `appearance.json` | UI sans-serif & monospace font families/sizes, semantic colors, text selection color & opacity (`0.0`–`1.0`), and match foreground/background colors (`#RRGGBB`) |
-| `viewer.json` | Line numbers/height, match overview visibility/width, tab expansion, display character limit, following, bookmark inclusion, polling interval |
+| `viewer.json` | Line numbers/height, match overview visibility/width, cursor surrounding lines, tab expansion, display character limit, following, bookmark inclusion, polling interval |
 | `search.json` | Default search mode, case/word/inversion/match highlighting, context lines, match limit, named presets (pattern, mode, `highlight_match`) |
 | `highlighting.json` | Enable highlighting; ordered regex rules with colors and case sensitivity (first match wins) |
 | `files.json` | Startup paths, favorites, session restore/save, session path, recent-file limit |
-| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Selection`, `TextSelected`, `TextSelected && RegexMode`, `RegexMode`, `Search`, `FilePath`, `GoTo`, or `Presets` contexts |
+| `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `Selection`, `TextSelected`, `TextSelected && RegexMode`, `RegexMode`, `TextInput`, `Search`, `FilePath`, `GoTo`, or `Presets` contexts |
 
 Each JSON file has a `$schema` link for editor completion and validation. Schemas are generated from the same Rust types used to deserialize configuration. Top-level properties are optional because files are overlays; objects inside replacement arrays require their fields. Additional semantic checks (for example regex syntax and shortcut conflicts) run in the application.
 
@@ -191,7 +199,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Core tests cover indexing, CRLF/UTF-8 handling, file replacement/truncation, search modes/context/limits/cancellation, safe export, configuration overlays/validation, and session persistence. UI regression tests exercise keyboard focus, text/line selection, zooming, path completion, and binding validation. CLI integration tests verify `--help`, `--version`, `--init-config`, `--write-schemas`, and `--check-config`.
+Core tests cover indexing, CRLF/UTF-8 handling, file replacement/truncation, search modes/context/limits/cancellation, safe export, configuration overlays/migration/validation, and session persistence. UI regression tests exercise keyboard focus, text/line selection, zooming, path completion, and binding validation. CLI integration tests verify `--help`, `--version`, `--init-config`, `--migrate-config`, `--write-schemas`, and `--check-config`.
 
 ### Building local deliverables
 
@@ -199,7 +207,7 @@ Core tests cover indexing, CRLF/UTF-8 handling, file replacement/truncation, sea
 # macOS: build Nox.app, drag-to-Applications .dmg, .app.zip, CLI .tar.gz, and SHA256SUMS.txt in dist/
 make package-macos
 
-# macOS: build and install directly to /Applications/Nox.app
+# macOS: build and install directly to /Applications/Nox.app (and migrate existing config if present)
 make install-macos
 
 # Linux: build release .tar.gz with desktop entry, icon, and SHA256SUMS.txt in dist/

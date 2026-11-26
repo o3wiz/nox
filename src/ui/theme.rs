@@ -293,11 +293,20 @@ pub fn format_shortcut(keys: &str) -> String {
             let mut out = Vec::with_capacity(parts.len());
             for part in parts {
                 let token = match part.to_ascii_lowercase().as_str() {
-                    "secondary" | "cmd" => {
+                    "secondary" => {
                         if mac {
                             "⌘".to_owned()
                         } else {
                             "Ctrl".to_owned()
+                        }
+                    }
+                    "cmd" | "super" | "win" => {
+                        if mac {
+                            "⌘".to_owned()
+                        } else if cfg!(target_os = "windows") {
+                            "Win".to_owned()
+                        } else {
+                            "Super".to_owned()
                         }
                     }
                     "ctrl" | "control" => {
@@ -326,6 +335,10 @@ pub fn format_shortcut(keys: &str) -> String {
                     "tab" => "⇥".to_owned(),
                     "up" => "↑".to_owned(),
                     "down" => "↓".to_owned(),
+                    "left" => "←".to_owned(),
+                    "right" => "→".to_owned(),
+                    "home" => "Home".to_owned(),
+                    "end" => "End".to_owned(),
                     "pageup" => "PgUp".to_owned(),
                     "pagedown" => "PgDn".to_owned(),
                     other => other.to_ascii_uppercase(),

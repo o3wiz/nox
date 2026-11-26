@@ -12,12 +12,15 @@ use components::{
 use gpui::{prelude::*, *};
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
-    actions::{self as input_actions, DEFAULT_INPUT_CONTEXT, default_bindings},
+    actions::{
+        self as input_actions, DEFAULT_INPUT_CONTEXT, EditableTextActionHandler, default_bindings,
+    },
     text_input,
 };
 use icons::Icon;
 use nox::{
     config::{self, Command, Config, SearchConfig, SearchMode},
+    fuzzy::{self, PresetMatch},
     logfile::{LogFile, Stamp},
     path_complete::{
         CompletionResult, PathCompletion, complete_path, ensure_trailing_separator, home_dir,
@@ -33,12 +36,14 @@ use nox::{
 };
 use regex::Regex;
 use resize::{
-    RESIZE_SASH_HEIGHT, ResizeDirection, ResizeMotion, ResultsResizeDrag, height_for_drag,
-    is_main_hidden, is_results_hidden, results_height_bounds,
+    FILE_PATH_BAR_HEIGHT, RESIZE_SASH_HEIGHT, ResizeDirection, ResizeMotion, ResultsResizeDrag,
+    height_for_drag, is_main_hidden, is_results_hidden, results_height_bounds,
 };
 use scrollbar::{
-    DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, ScrollAxis, ScrollbarTrackState,
-    resolve_track_press, scroll_offset_for_drag, scrollbar_canvas, set_uniform_list_axis_offset,
+    DEFAULT_SCROLLBAR_WIDTH, HORIZONTAL_BAR_HEIGHT, RevealOutcome, RevealStrategy, ScrollAxis,
+    ScrollbarTrackState, horizontal_scroll_step, resolve_track_press, reveal_uniform_list_row,
+    scroll_offset_for_drag, scrollbar_canvas, set_uniform_list_axis_offset,
+    step_uniform_list_axis_offset,
 };
 use selectable_text::{RowLayoutCache, SelectableRowText, TextPressEvent};
 use serde::Deserialize;
@@ -187,6 +192,12 @@ struct TextDrag {
     anchor_end: TextPosition,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingReveal {
+    row: usize,
+    strategy: RevealStrategy,
+}
+
 struct Tab {
     id: usize,
     path: PathBuf,
@@ -211,6 +222,8 @@ struct Tab {
     follow: bool,
     scroll: UniformListScrollHandle,
     result_scroll: UniformListScrollHandle,
+    pending_main_reveal: Option<PendingReveal>,
+    pending_results_reveal: Option<PendingReveal>,
     error: Option<String>,
 }
 
@@ -318,6 +331,9 @@ pub struct Workspace {
     show_goto: bool,
     show_presets: bool,
     preset_index: usize,
+    presets_search: Entity<EditableTextState>,
+    last_handled_presets_search_version: u16,
+    filtered_presets: Vec<PresetMatch>,
     presets_focus: FocusHandle,
     presets_scroll: ScrollHandle,
     presets_trigger_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -336,6 +352,7 @@ pub struct Workspace {
     results_resize_drag: Option<ResultsResizeDrag>,
     resize_motion: ResizeMotion,
     resize_frame_scheduled: bool,
+    pending_reveal_frame_scheduled: bool,
     main_vscroll_state: ScrollbarTrackState,
     main_hscroll_state: ScrollbarTrackState,
     results_vscroll_state: ScrollbarTrackState,
@@ -431,6 +448,9 @@ impl Workspace {
         let path_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let path_focus = path_input.read(cx).focus_handle(cx);
         let last_handled_path_version = path_input.read(cx).version();
+        let presets_search = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let last_handled_presets_search_version = presets_search.read(cx).version();
+        let filtered_presets = fuzzy::filter_presets(&config.search.presets, "");
         let subscriptions = vec![
             cx.on_app_quit(|this, cx| {
                 this.save_session(cx);
@@ -444,9 +464,16 @@ impl Workspace {
                     this.on_path_input_changed(window, cx);
                 },
             ),
+            cx.subscribe_in(
+                &presets_search,
+                window,
+                |this, _, _: &TextChanged, window, cx| {
+                    this.on_presets_search_changed(window, cx);
+                },
+            ),
             cx.on_focus(&path_focus, window, |this, _window, cx| {
                 this.show_goto = false;
-                this.show_presets = false;
+                this.dismiss_presets(cx);
                 cx.notify();
             }),
             cx.on_blur(&path_focus, window, |this, _window, cx| {
@@ -489,6 +516,9 @@ impl Workspace {
             show_goto: false,
             show_presets: false,
             preset_index: 0,
+            presets_search,
+            last_handled_presets_search_version,
+            filtered_presets,
             presets_focus,
             presets_scroll: ScrollHandle::new(),
             presets_trigger_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -507,6 +537,7 @@ impl Workspace {
             results_resize_drag: None,
             resize_motion: ResizeMotion::default(),
             resize_frame_scheduled: false,
+            pending_reveal_frame_scheduled: false,
             main_vscroll_state: ScrollbarTrackState::new(),
             main_hscroll_state: ScrollbarTrackState::new(),
             results_vscroll_state: ScrollbarTrackState::new(),
@@ -629,6 +660,8 @@ impl Workspace {
             follow: self.config.viewer.follow,
             scroll: UniformListScrollHandle::new(),
             result_scroll: UniformListScrollHandle::new(),
+            pending_main_reveal: None,
+            pending_results_reveal: None,
             error: None,
         });
         self.switch(self.tabs.len() - 1, cx);
@@ -650,7 +683,7 @@ impl Workspace {
         self.results_height = self.target_results_height;
         self.clear_scrollbar_states();
         self.clear_row_layouts();
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.close_path_completions();
         let query = self
             .tabs
@@ -680,7 +713,7 @@ impl Workspace {
         self.results_height = self.target_results_height;
         self.clear_scrollbar_states();
         self.clear_row_layouts();
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.close_path_completions();
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -715,7 +748,7 @@ impl Workspace {
         self.recent.insert(0, path.clone());
         self.recent.truncate(self.config.files.recent_limit);
         self.show_files = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.show_goto = false;
         self.close_path_completions();
 
@@ -764,6 +797,8 @@ impl Workspace {
         tab.result_text_selection = None;
         tab.scroll = UniformListScrollHandle::new();
         tab.result_scroll = UniformListScrollHandle::new();
+        tab.pending_main_reveal = None;
+        tab.pending_results_reveal = None;
         tab.error = None;
 
         self.sync_path_input(cx);
@@ -851,6 +886,7 @@ impl Workspace {
                 tab.results = results;
                 tab.result_selection = LineSelection::single_clamped(0, len);
                 tab.result_text_selection = None;
+                tab.pending_results_reveal = None;
                 tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
             cx.notify();
@@ -928,6 +964,7 @@ impl Workspace {
                     tab.results = results;
                     tab.result_selection = LineSelection::single_clamped(0, len);
                     tab.result_text_selection = None;
+                    tab.pending_results_reveal = None;
                     tab.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 }
             }
@@ -980,6 +1017,8 @@ impl Workspace {
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         while let Ok(message) = self.receiver.try_recv() {
             changed = true;
             match message {
@@ -1012,14 +1051,20 @@ impl Workspace {
                                 }
                                 tab.selected = tab.main_selection.cursor;
                                 tab.bookmarks.retain(|&line| line < log.len());
-                                if initial && !tab.follow && !log.is_empty() {
-                                    tab.scroll
-                                        .scroll_to_item(tab.selected, ScrollStrategy::Center);
-                                }
+                                let non_empty = !log.is_empty();
                                 tab.log = Some(log);
                                 tab.error = None;
                                 if tab.follow {
+                                    tab.pending_main_reveal = None;
                                     tab.scroll.scroll_to_bottom();
+                                } else if initial && non_empty {
+                                    Self::reveal_main_row_in_tab(
+                                        tab,
+                                        tab.selected,
+                                        line_height,
+                                        surrounding_lines,
+                                        RevealStrategy::Center,
+                                    );
                                 }
                                 self.start_search_preserving(index, !replaced && !initial, cx);
                             }
@@ -1149,11 +1194,13 @@ impl Workspace {
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         self.active_pane = pane;
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.dismiss_path_editing(cx);
         match pane {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => {
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active)
                     && tab.result_selection.is_empty()
                     && !tab.results.visible.is_empty()
@@ -1164,13 +1211,31 @@ impl Workspace {
                         .binary_search(&tab.selected)
                         .unwrap_or_else(|idx| idx.min(tab.results.visible.len() - 1));
                     tab.result_selection.select_single(row);
-                    tab.result_scroll
-                        .scroll_to_item(row, ScrollStrategy::Nearest);
+                    Self::reveal_results_row_in_tab(
+                        tab,
+                        row,
+                        line_height,
+                        surrounding_lines,
+                        RevealStrategy::Nearest,
+                    );
                 }
                 self.results_focus.focus(window, cx);
             }
         }
         cx.notify();
+    }
+
+    fn focus_visible_pane(&mut self, preferred: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        let (min_h, max_h) = self.results_height_bounds(window);
+        let eff = self.results_height.clamp(min_h, max_h);
+        let main_hidden = is_main_hidden(eff, max_h);
+        let results_hidden = is_results_hidden(eff);
+        let pane = match preferred {
+            Pane::Main if main_hidden && !results_hidden => Pane::Results,
+            Pane::Results if results_hidden && !main_hidden => Pane::Main,
+            _ => preferred,
+        };
+        self.focus_pane(pane, window, cx);
     }
 
     fn selection_count(tab: &Tab, pane: Pane) -> usize {
@@ -1220,14 +1285,141 @@ impl Workspace {
         Self::selected_source_lines(tab, pane).all(|line| tab.bookmarks.contains(&line))
     }
 
-    fn sync_main_to_result_cursor(tab: &mut Tab) {
+    fn reveal_main_row_in_tab(
+        tab: &mut Tab,
+        row: usize,
+        line_height: f32,
+        surrounding_lines: usize,
+        strategy: RevealStrategy,
+    ) {
+        let Some(log) = &tab.log else {
+            tab.pending_main_reveal = None;
+            return;
+        };
+        let len = log.len();
+        if len == 0 {
+            tab.pending_main_reveal = None;
+            return;
+        }
+        let target = row.min(len - 1);
+        match reveal_uniform_list_row(
+            &tab.scroll,
+            target,
+            len,
+            line_height,
+            surrounding_lines,
+            strategy,
+        ) {
+            RevealOutcome::Deferred => {
+                tab.pending_main_reveal = Some(PendingReveal {
+                    row: target,
+                    strategy,
+                });
+            }
+            RevealOutcome::Scrolled | RevealOutcome::Unchanged => {
+                tab.pending_main_reveal = None;
+            }
+        }
+    }
+
+    fn reveal_results_row_in_tab(
+        tab: &mut Tab,
+        row: usize,
+        line_height: f32,
+        surrounding_lines: usize,
+        strategy: RevealStrategy,
+    ) {
+        let len = tab.results.visible.len();
+        if len == 0 {
+            tab.pending_results_reveal = None;
+            return;
+        }
+        let target = row.min(len - 1);
+        match reveal_uniform_list_row(
+            &tab.result_scroll,
+            target,
+            len,
+            line_height,
+            surrounding_lines,
+            strategy,
+        ) {
+            RevealOutcome::Deferred => {
+                tab.pending_results_reveal = Some(PendingReveal {
+                    row: target,
+                    strategy,
+                });
+            }
+            RevealOutcome::Scrolled | RevealOutcome::Unchanged => {
+                tab.pending_results_reveal = None;
+            }
+        }
+    }
+
+    fn flush_pending_reveals(&mut self, cx: &mut Context<Self>) {
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let mut changed = false;
+        if let Some(pending) = tab.pending_main_reveal {
+            let len = tab.log.as_ref().map_or(0, |log| log.len());
+            let laid_out = tab.scroll.0.borrow().last_item_size.is_some();
+            if len == 0 {
+                tab.pending_main_reveal = None;
+            } else if laid_out {
+                tab.pending_main_reveal = None;
+                if reveal_uniform_list_row(
+                    &tab.scroll,
+                    pending.row,
+                    len,
+                    line_height,
+                    surrounding_lines,
+                    pending.strategy,
+                ) == RevealOutcome::Scrolled
+                {
+                    changed = true;
+                }
+            }
+        }
+        if let Some(pending) = tab.pending_results_reveal {
+            let len = tab.results.visible.len();
+            let laid_out = tab.result_scroll.0.borrow().last_item_size.is_some();
+            if len == 0 {
+                tab.pending_results_reveal = None;
+            } else if laid_out {
+                tab.pending_results_reveal = None;
+                if reveal_uniform_list_row(
+                    &tab.result_scroll,
+                    pending.row,
+                    len,
+                    line_height,
+                    surrounding_lines,
+                    pending.strategy,
+                ) == RevealOutcome::Scrolled
+                {
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn sync_main_to_result_cursor(tab: &mut Tab, line_height: f32, surrounding_lines: usize) {
         if let Some(&source_line) = tab.results.visible.get(tab.result_selection.cursor) {
             tab.selected = source_line;
             tab.main_selection.select_single(source_line);
             tab.main_text_selection = None;
             tab.follow = false;
-            tab.scroll
-                .scroll_to_item(source_line, ScrollStrategy::Center);
+            Self::reveal_main_row_in_tab(
+                tab,
+                source_line,
+                line_height,
+                surrounding_lines,
+                RevealStrategy::Center,
+            );
         }
     }
 
@@ -1241,13 +1433,15 @@ impl Workspace {
     ) {
         self.active_pane = pane;
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.dismiss_path_editing(cx);
         self.text_drag = None;
         match pane {
             Pane::Main => self.focus.focus(window, cx),
             Pane::Results => self.results_focus.focus(window, cx),
         }
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         if let Some(tab) = self.tabs.get_mut(self.active) {
             *tab.text_selection_mut(pane) = None;
             match pane {
@@ -1280,7 +1474,7 @@ impl Workspace {
                             tab.result_selection.select_single(row);
                             self.drag_selecting = Some(Pane::Results);
                         }
-                        Self::sync_main_to_result_cursor(tab);
+                        Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                     }
                 }
             }
@@ -1308,7 +1502,7 @@ impl Workspace {
             };
             self.active_pane = pane;
             self.show_goto = false;
-            self.show_presets = false;
+            self.dismiss_presets(cx);
             self.dismiss_path_editing(cx);
             self.drag_selecting = None;
             self.scrollbar_drag = None;
@@ -1334,7 +1528,7 @@ impl Workspace {
 
         self.active_pane = pane;
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.dismiss_path_editing(cx);
         self.drag_selecting = None;
         self.scrollbar_drag = None;
@@ -1343,6 +1537,8 @@ impl Workspace {
             Pane::Results => self.results_focus.focus(window, cx),
         }
 
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         if let Some(tab) = self.tabs.get_mut(self.active) {
             let in_bounds = match pane {
                 Pane::Main => {
@@ -1359,7 +1555,7 @@ impl Workspace {
                 Pane::Results => {
                     if press.row < tab.results.visible.len() {
                         tab.result_selection.select_single(press.row);
-                        Self::sync_main_to_result_cursor(tab);
+                        Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                         true
                     } else {
                         false
@@ -1557,7 +1753,7 @@ impl Workspace {
             selected
         };
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.input.update(cx, |input, cx| {
             input.emplace(&text, cx);
             input.move_to(text.len(), cx);
@@ -1593,7 +1789,7 @@ impl Workspace {
         let escaped = regex::escape(&selected);
         let next = append_regex_alternative(self.input.read(cx).as_str(), &escaped);
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.input.update(cx, |input, cx| {
             input.emplace(&next, cx);
             input.move_to(next.len(), cx);
@@ -1656,6 +1852,8 @@ impl Workspace {
             return;
         }
         let mut changed = false;
+        let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         if let Some(tab) = self.tabs.get_mut(self.active) {
             match pane {
                 Pane::Main => {
@@ -1670,7 +1868,7 @@ impl Workspace {
                 Pane::Results => {
                     if row < tab.results.visible.len() && tab.result_selection.cursor != row {
                         tab.result_selection.extend_to(row);
-                        Self::sync_main_to_result_cursor(tab);
+                        Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                         changed = true;
                     }
                 }
@@ -1704,6 +1902,7 @@ impl Workspace {
         self.active_pane = pane;
         let results_h = self.effective_results_height(window);
         let line_height = self.zoom_metrics().line_height;
+        let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -1739,7 +1938,13 @@ impl Workspace {
                 }
                 tab.selected = target;
                 tab.follow = false;
-                tab.scroll.scroll_to_item(target, ScrollStrategy::Nearest);
+                Self::reveal_main_row_in_tab(
+                    tab,
+                    target,
+                    line_height,
+                    surrounding_lines,
+                    RevealStrategy::Nearest,
+                );
             }
             Pane::Results => {
                 let len = tab.results.visible.len();
@@ -1765,18 +1970,64 @@ impl Workspace {
                 } else {
                     tab.result_selection.select_single(target);
                 }
-                tab.result_scroll
-                    .scroll_to_item(target, ScrollStrategy::Nearest);
-                Self::sync_main_to_result_cursor(tab);
+                Self::reveal_results_row_in_tab(
+                    tab,
+                    target,
+                    line_height,
+                    surrounding_lines,
+                    RevealStrategy::Nearest,
+                );
+                Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
             }
         }
         cx.notify();
     }
 
+    fn scroll_horizontal(
+        &mut self,
+        scroll_right: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self.active_pane_for(window);
+        self.active_pane = pane;
+        let (min_h, max_h) = self.results_height_bounds(window);
+        let eff = self.results_height.clamp(min_h, max_h);
+        if (pane == Pane::Main && is_main_hidden(eff, max_h))
+            || (pane == Pane::Results && is_results_hidden(eff))
+        {
+            return;
+        }
+        let zoom_scale = self.zoom_metrics().scale;
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let handle = match pane {
+            Pane::Main => {
+                if tab.log.as_ref().is_none_or(|log| log.is_empty()) {
+                    return;
+                }
+                &tab.scroll
+            }
+            Pane::Results => {
+                if tab.results.visible.is_empty() {
+                    return;
+                }
+                &tab.result_scroll
+            }
+        };
+        let sign = if scroll_right { 1.0 } else { -1.0 };
+        if step_uniform_list_axis_offset(handle, ScrollAxis::Horizontal, |viewport| {
+            sign * horizontal_scroll_step(viewport, zoom_scale)
+        }) {
+            cx.notify();
+        }
+    }
+
     fn command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
             Command::ShowFiles => {
-                self.show_presets = false;
+                self.dismiss_presets(cx);
                 self.show_files = !self.show_files;
             }
             Command::TogglePresets => {
@@ -1784,9 +2035,7 @@ impl Workspace {
                 return;
             }
             Command::ApplyPreset => {
-                if self.show_presets {
-                    self.apply_preset(self.preset_index, window, cx);
-                }
+                self.apply_selected_preset(window, cx);
                 return;
             }
             Command::NextLine
@@ -1802,7 +2051,7 @@ impl Workspace {
                     return;
                 }
                 if self.show_presets
-                    && self.presets_focus.is_focused(window)
+                    && self.presets_focused(window, cx)
                     && matches!(
                         command,
                         Command::NextLine
@@ -1824,6 +2073,10 @@ impl Workspace {
             | Command::SelectPageUp
             | Command::SelectPageDown => {
                 self.navigate(command, true, window, cx);
+                return;
+            }
+            Command::ScrollLeft | Command::ScrollRight => {
+                self.scroll_horizontal(command == Command::ScrollRight, window, cx);
                 return;
             }
             Command::SelectAll => {
@@ -1858,6 +2111,8 @@ impl Workspace {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
                 self.text_drag = None;
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     *tab.text_selection_mut(pane) = None;
                     match pane {
@@ -1871,7 +2126,7 @@ impl Workspace {
                         Pane::Results => {
                             let len = tab.results.visible.len();
                             tab.result_selection.collapse_to_cursor(len);
-                            Self::sync_main_to_result_cursor(tab);
+                            Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                         }
                     }
                 }
@@ -1879,6 +2134,8 @@ impl Workspace {
             Command::SwapSelectionAnchor => {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     match pane {
                         Pane::Main => {
@@ -1888,7 +2145,13 @@ impl Workspace {
                                 tab.main_selection.cursor = cursor;
                                 tab.selected = cursor;
                                 tab.follow = false;
-                                tab.scroll.scroll_to_item(cursor, ScrollStrategy::Nearest);
+                                Self::reveal_main_row_in_tab(
+                                    tab,
+                                    cursor,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Nearest,
+                                );
                             }
                         }
                         Pane::Results => {
@@ -1896,9 +2159,18 @@ impl Workspace {
                             if len > 0 && tab.result_selection.swap_anchor() {
                                 let cursor = tab.result_selection.cursor.min(len - 1);
                                 tab.result_selection.cursor = cursor;
-                                tab.result_scroll
-                                    .scroll_to_item(cursor, ScrollStrategy::Nearest);
-                                Self::sync_main_to_result_cursor(tab);
+                                Self::reveal_results_row_in_tab(
+                                    tab,
+                                    cursor,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Nearest,
+                                );
+                                Self::sync_main_to_result_cursor(
+                                    tab,
+                                    line_height,
+                                    surrounding_lines,
+                                );
                             }
                         }
                     }
@@ -1930,6 +2202,8 @@ impl Workspace {
             Command::NextBookmark | Command::PreviousBookmark => {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     if pane == Pane::Results && !tab.results.visible.is_empty() {
                         let current_row = tab
@@ -1949,9 +2223,14 @@ impl Workspace {
                         if let Some(row) = target_row {
                             tab.result_selection.select_single(row);
                             tab.result_text_selection = None;
-                            tab.result_scroll
-                                .scroll_to_item(row, ScrollStrategy::Center);
-                            Self::sync_main_to_result_cursor(tab);
+                            Self::reveal_results_row_in_tab(
+                                tab,
+                                row,
+                                line_height,
+                                surrounding_lines,
+                                RevealStrategy::Center,
+                            );
+                            Self::sync_main_to_result_cursor(tab, line_height, surrounding_lines);
                         }
                     } else {
                         let target = if command == Command::NextBookmark {
@@ -1971,12 +2250,23 @@ impl Workspace {
                             tab.main_selection.select_single(line);
                             tab.main_text_selection = None;
                             tab.follow = false;
-                            tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                            Self::reveal_main_row_in_tab(
+                                tab,
+                                line,
+                                line_height,
+                                surrounding_lines,
+                                RevealStrategy::Center,
+                            );
                             if let Ok(index) = tab.results.visible.binary_search(&line) {
                                 tab.result_selection.select_single(index);
                                 tab.result_text_selection = None;
-                                tab.result_scroll
-                                    .scroll_to_item(index, ScrollStrategy::Center);
+                                Self::reveal_results_row_in_tab(
+                                    tab,
+                                    index,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Center,
+                                );
                             }
                         }
                     }
@@ -1986,7 +2276,7 @@ impl Workspace {
             Command::Quit => cx.quit(),
             Command::FocusSearch => {
                 self.show_goto = false;
-                self.show_presets = false;
+                self.dismiss_presets(cx);
                 self.dismiss_path_editing(cx);
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
             }
@@ -2016,13 +2306,7 @@ impl Workspace {
                     if self.path_input_focused(window, cx) {
                         self.sync_path_input(cx);
                     }
-                    let (min_h, max_h) = self.results_height_bounds(window);
-                    let eff = self.results_height.clamp(min_h, max_h);
-                    if is_main_hidden(eff, max_h) && !is_results_hidden(eff) {
-                        self.focus_pane(Pane::Results, window, cx);
-                    } else {
-                        self.focus_pane(Pane::Main, window, cx);
-                    }
+                    self.focus_visible_pane(Pane::Main, window, cx);
                 }
                 return;
             }
@@ -2084,6 +2368,7 @@ impl Workspace {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.follow = !tab.follow;
                     if tab.follow {
+                        tab.pending_main_reveal = None;
                         tab.scroll.scroll_to_bottom();
                     }
                 }
@@ -2120,6 +2405,8 @@ impl Workspace {
                 }
             }
             Command::NextMatch | Command::PreviousMatch => {
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let matches = &tab.results.matches;
                     let target = if command == Command::NextMatch {
@@ -2139,12 +2426,23 @@ impl Workspace {
                         tab.main_selection.select_single(target);
                         tab.main_text_selection = None;
                         tab.follow = false;
-                        tab.scroll.scroll_to_item(target, ScrollStrategy::Center);
+                        Self::reveal_main_row_in_tab(
+                            tab,
+                            target,
+                            line_height,
+                            surrounding_lines,
+                            RevealStrategy::Center,
+                        );
                         if let Ok(index) = tab.results.visible.binary_search(&target) {
                             tab.result_selection.select_single(index);
                             tab.result_text_selection = None;
-                            tab.result_scroll
-                                .scroll_to_item(index, ScrollStrategy::Center);
+                            Self::reveal_results_row_in_tab(
+                                tab,
+                                index,
+                                line_height,
+                                surrounding_lines,
+                                RevealStrategy::Center,
+                            );
                         }
                     }
                 }
@@ -2230,11 +2528,13 @@ impl Workspace {
                 }
             }
             Command::GoToLine => {
-                self.show_presets = false;
+                self.dismiss_presets(cx);
                 if self.tabs.is_empty() {
                     self.show_goto = false;
                 } else if self.show_goto {
                     let line = self.goto.read(cx).as_str().trim().parse::<usize>();
+                    let line_height = self.zoom_metrics().line_height;
+                    let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         if let (Ok(line), Some(log)) = (line, &tab.log) {
                             if line > 0 && line <= log.len() {
@@ -2242,7 +2542,13 @@ impl Workspace {
                                 tab.main_selection.select_single(line - 1);
                                 tab.main_text_selection = None;
                                 tab.follow = false;
-                                tab.scroll.scroll_to_item(line - 1, ScrollStrategy::Center);
+                                Self::reveal_main_row_in_tab(
+                                    tab,
+                                    line - 1,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Center,
+                                );
                                 self.show_goto = false;
                                 self.status = None;
                                 self.active_pane = Pane::Main;
@@ -2296,6 +2602,20 @@ impl Workspace {
             }
             Command::ZoomReset => {
                 self.set_zoom_percent(DEFAULT_ZOOM_PERCENT, cx);
+                return;
+            }
+            Command::MoveToLineStart | Command::MoveToLineEnd => {
+                if let Some(input) = self.focused_text_input(window, cx) {
+                    input.update(cx, |state, cx| match command {
+                        Command::MoveToLineStart => {
+                            state.nav_line_start(&input_actions::NavLineStart, window, cx);
+                        }
+                        Command::MoveToLineEnd => {
+                            state.nav_line_end(&input_actions::NavLineEnd, window, cx);
+                        }
+                        _ => unreachable!(),
+                    });
+                }
                 return;
             }
         }
@@ -2371,6 +2691,18 @@ impl Workspace {
         }
     }
 
+    fn focused_text_input(&self, window: &Window, cx: &App) -> Option<Entity<EditableTextState>> {
+        [
+            &self.input,
+            &self.path_input,
+            &self.goto,
+            &self.presets_search,
+        ]
+        .into_iter()
+        .find(|input| input.read(cx).focus_handle(cx).is_focused(window))
+        .cloned()
+    }
+
     fn path_input_focused(&self, window: &Window, cx: &App) -> bool {
         self.path_input.read(cx).focus_handle(cx).is_focused(window)
     }
@@ -2437,21 +2769,8 @@ impl Workspace {
         if self.tabs.is_empty() {
             return;
         }
-        let (min_h, max_h) = self.results_height_bounds(window);
-        let eff = self.results_height.clamp(min_h, max_h);
-        if is_main_hidden(eff, max_h) {
-            let restored = self
-                .config
-                .window
-                .results_height
-                .min((max_h - 140.0).max(0.0))
-                .clamp(min_h, max_h);
-            self.resize_motion.cancel();
-            self.results_height = restored;
-            self.target_results_height = restored;
-        }
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.sync_path_input(cx);
         self.path_input.update(cx, |input, cx| {
             input.select_document(cx);
@@ -2588,7 +2907,7 @@ impl Workspace {
         } else {
             self.replace_active_tab(path, cx);
         }
-        self.focus_pane(Pane::Main, window, cx);
+        self.focus_visible_pane(Pane::Main, window, cx);
     }
 
     fn submit_file_path(
@@ -2678,9 +2997,79 @@ impl Workspace {
         self.matching_preset_index(current_input, options)
     }
 
+    fn presets_search_focused(&self, window: &Window, cx: &App) -> bool {
+        self.presets_search
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
+    fn presets_focused(&self, window: &Window, cx: &App) -> bool {
+        self.presets_search_focused(window, cx) || self.presets_focus.is_focused(window)
+    }
+
+    fn set_presets_search_silently(&mut self, text: &str, cx: &mut Context<Self>) {
+        let version = self.presets_search.update(cx, |input, cx| {
+            if input.as_str() != text {
+                input.emplace(text, cx);
+            }
+            input.version()
+        });
+        self.last_handled_presets_search_version = version;
+    }
+
+    fn refresh_filtered_presets(&mut self, select_active_when_empty: bool, cx: &mut Context<Self>) {
+        let query = self.presets_search.read(cx).as_str().to_owned();
+        self.filtered_presets = fuzzy::filter_presets(&self.config.search.presets, &query);
+        if self.filtered_presets.is_empty() {
+            self.preset_index = 0;
+        } else if select_active_when_empty && query.trim().is_empty() {
+            let active = self.active_preset_index(cx);
+            self.preset_index = active
+                .and_then(|idx| self.filtered_presets.iter().position(|m| m.index == idx))
+                .unwrap_or(0);
+            self.presets_scroll.scroll_to_item(self.preset_index);
+        } else {
+            self.preset_index = 0;
+            self.presets_scroll.scroll_to_item(0);
+        }
+    }
+
+    fn on_presets_search_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let version = self.presets_search.read(cx).version();
+        if version == self.last_handled_presets_search_version {
+            return;
+        }
+        self.last_handled_presets_search_version = version;
+        if !self.show_presets {
+            return;
+        }
+        self.refresh_filtered_presets(false, cx);
+        cx.notify();
+    }
+
+    fn dismiss_presets(&mut self, cx: &mut Context<Self>) {
+        if !self.show_presets && self.presets_search.read(cx).as_str().is_empty() {
+            return;
+        }
+        self.show_presets = false;
+        self.set_presets_search_silently("", cx);
+        self.filtered_presets = fuzzy::filter_presets(&self.config.search.presets, "");
+    }
+
+    fn clear_presets_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_presets_search_silently("", cx);
+        self.refresh_filtered_presets(false, cx);
+        self.presets_search
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
     fn toggle_presets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() || self.config.search.presets.is_empty() {
-            self.show_presets = false;
+            self.dismiss_presets(cx);
             return;
         }
         if self.show_presets {
@@ -2689,16 +3078,28 @@ impl Workspace {
             self.show_goto = false;
             self.dismiss_path_editing(cx);
             self.show_presets = true;
-            self.preset_index = self.active_preset_index(cx).unwrap_or(0);
-            self.presets_scroll.scroll_to_item(self.preset_index);
-            self.presets_focus.focus(window, cx);
+            self.set_presets_search_silently("", cx);
+            self.refresh_filtered_presets(true, cx);
+            self.presets_search
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
             cx.notify();
         }
     }
 
     fn close_presets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_presets = false;
-        self.focus_pane(self.active_pane, window, cx);
+        self.dismiss_presets(cx);
+        self.focus_visible_pane(self.active_pane, window, cx);
+    }
+
+    fn apply_selected_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_presets {
+            return;
+        }
+        if let Some(matched) = self.filtered_presets.get(self.preset_index) {
+            self.apply_preset(matched.index, window, cx);
+        }
     }
 
     fn apply_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2711,23 +3112,25 @@ impl Workspace {
             tab.options.mode = preset.mode;
             tab.options.highlight_matches = preset.highlight_match;
         }
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.preset_index = index;
         self.start_search(self.active, cx);
-        self.focus_pane(self.active_pane, window, cx);
+        self.focus_visible_pane(self.active_pane, window, cx);
     }
 
     fn navigate_presets(&mut self, command: Command, cx: &mut Context<Self>) {
-        let len = self.config.search.presets.len();
+        let len = self.filtered_presets.len();
         if len == 0 {
+            self.preset_index = 0;
             return;
         }
+        let current = self.preset_index.min(len - 1);
         self.preset_index = match command {
-            Command::NextLine => (self.preset_index + 1) % len,
-            Command::PreviousLine => (self.preset_index + len - 1) % len,
+            Command::NextLine => (current + 1) % len,
+            Command::PreviousLine => (current + len - 1) % len,
             Command::FirstLine => 0,
             Command::LastLine => len - 1,
-            _ => self.preset_index,
+            _ => current,
         };
         self.presets_scroll.scroll_to_item(self.preset_index);
         cx.notify();
@@ -2820,6 +3223,8 @@ impl Workspace {
                 self.active_pane = Pane::Results;
             }
             if self.focus.is_focused(window) {
+                let line_height = self.zoom_metrics().line_height;
+                let surrounding_lines = self.config.viewer.cursor_surrounding_lines;
                 if let Some(tab) = self.tabs.get_mut(self.active)
                     && tab.result_selection.is_empty()
                     && !tab.results.visible.is_empty()
@@ -2830,8 +3235,13 @@ impl Workspace {
                         .binary_search(&tab.selected)
                         .unwrap_or_else(|idx| idx.min(tab.results.visible.len() - 1));
                     tab.result_selection.select_single(row);
-                    tab.result_scroll
-                        .scroll_to_item(row, ScrollStrategy::Nearest);
+                    Self::reveal_results_row_in_tab(
+                        tab,
+                        row,
+                        line_height,
+                        surrounding_lines,
+                        RevealStrategy::Nearest,
+                    );
                 }
                 self.results_focus.focus(window, cx);
             }
@@ -2969,7 +3379,7 @@ impl Workspace {
         self.drag_selecting = None;
         self.text_drag = None;
         self.scrollbar_drag = None;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         if event.click_count >= 2 {
             self.reset_filter_height(window, cx);
             return;
@@ -3148,7 +3558,7 @@ impl Workspace {
         };
         self.active_pane = id.pane;
         self.show_goto = false;
-        self.show_presets = false;
+        self.dismiss_presets(cx);
         self.dismiss_path_editing(cx);
         match id.pane {
             Pane::Main => self.focus.focus(window, cx),
@@ -3169,8 +3579,16 @@ impl Workspace {
                 Pane::Results => &tab.result_scroll,
             };
             set_uniform_list_axis_offset(handle, id.axis, offset);
-            if id.pane == Pane::Main && id.axis == ScrollAxis::Vertical {
-                tab.follow = false;
+            if id.axis == ScrollAxis::Vertical {
+                match id.pane {
+                    Pane::Main => {
+                        tab.follow = false;
+                        tab.pending_main_reveal = None;
+                    }
+                    Pane::Results => {
+                        tab.pending_results_reveal = None;
+                    }
+                }
             }
         }
         cx.notify();
@@ -3195,8 +3613,16 @@ impl Workspace {
                 Pane::Results => &tab.result_scroll,
             };
             set_uniform_list_axis_offset(handle, drag.id.axis, offset);
-            if drag.id.pane == Pane::Main && drag.id.axis == ScrollAxis::Vertical {
-                tab.follow = false;
+            if drag.id.axis == ScrollAxis::Vertical {
+                match drag.id.pane {
+                    Pane::Main => {
+                        tab.follow = false;
+                        tab.pending_main_reveal = None;
+                    }
+                    Pane::Results => {
+                        tab.pending_results_reveal = None;
+                    }
+                }
             }
         }
         cx.notify();
@@ -3250,16 +3676,24 @@ impl Workspace {
                         .cursor_pointer()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, window, cx| {
+                            let line_height = this.zoom_metrics().line_height;
+                            let surrounding_lines = this.config.viewer.cursor_surrounding_lines;
                             if let Some(tab) = this.tabs.get_mut(this.active) {
                                 tab.selected = line;
                                 tab.main_selection.select_single(line);
                                 tab.main_text_selection = None;
                                 tab.follow = false;
-                                tab.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                                Self::reveal_main_row_in_tab(
+                                    tab,
+                                    line,
+                                    line_height,
+                                    surrounding_lines,
+                                    RevealStrategy::Center,
+                                );
                             }
                             this.active_pane = Pane::Main;
                             this.show_goto = false;
-                            this.show_presets = false;
+                            this.dismiss_presets(cx);
                             this.dismiss_path_editing(cx);
                             this.focus.focus(window, cx);
                             cx.notify();
@@ -4295,6 +4729,7 @@ impl Workspace {
     fn render_file_path_bar(
         &self,
         main_focused: bool,
+        main_hidden: bool,
         loading: bool,
         line_count: usize,
         window: &Window,
@@ -4408,7 +4843,7 @@ impl Workspace {
 
         div()
             .debug_selector(|| "file-path-bar".into())
-            .h(px(28.))
+            .h(px(FILE_PATH_BAR_HEIGHT))
             .px_3()
             .flex_shrink_0()
             .flex()
@@ -4416,7 +4851,7 @@ impl Workspace {
             .justify_between()
             .gap_3()
             .bg(t.background)
-            .border_b_1()
+            .when(!main_hidden || path_focused, |el| el.border_b_1())
             .border_color(if path_focused {
                 t.accent_border
             } else {
@@ -4424,7 +4859,7 @@ impl Workspace {
             })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.focus_pane(Pane::Main, window, cx)),
+                cx.listener(|this, _, window, cx| this.focus_visible_pane(Pane::Main, window, cx)),
             )
             .child(
                 div()
@@ -4888,109 +5323,228 @@ impl Workspace {
             } else {
                 0.0
             };
-            let open_upward = results_h + 30.0 + status_h < 180.0;
+            let open_upward = results_h + 30.0 + status_h < 220.0;
             let highlighted = self
                 .preset_index
-                .min(self.config.search.presets.len().saturating_sub(1));
+                .min(self.filtered_presets.len().saturating_sub(1));
+            let filter_query = self.presets_search.read(cx).as_str().to_owned();
+            let has_filter = !filter_query.is_empty();
+            let is_filtering = !filter_query.trim().is_empty();
+            let search_focused = self.presets_search_focused(window, cx);
+            let total_count = self.config.search.presets.len();
+            let count_badge = if is_filtering {
+                format!(
+                    "{}/{}",
+                    format_count(self.filtered_presets.len()),
+                    format_count(total_count)
+                )
+            } else {
+                format_count(total_count)
+            };
+
+            let search_field = div()
+                .h(px(28.))
+                .px_2()
+                .rounded_md()
+                .bg(t.background)
+                .border_1()
+                .border_color(if search_focused {
+                    t.accent_border
+                } else {
+                    t.border
+                })
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.presets_search
+                            .read(cx)
+                            .focus_handle(cx)
+                            .focus(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    Icon::Search.element(ICON_XS, if search_focused { t.accent } else { t.muted }),
+                )
+                .child(
+                    div().flex_1().min_w_0().overflow_hidden().child(
+                        text_input("presets-search")
+                            .debug_selector(|| "presets-search-input".into())
+                            .key_context(format!("{DEFAULT_INPUT_CONTEXT} Presets").as_str())
+                            .state(self.presets_search.downgrade())
+                            .placeholder("Filter patterns…")
+                            .caret_color(t.accent)
+                            .placeholder_color(t.muted)
+                            .font(t.ui_font_spec())
+                            .text_size(t.small_size)
+                            .line_height(relative(1.35))
+                            .min_w_0()
+                            .w_full()
+                            .whitespace_nowrap()
+                            .overflow_x_scroll(),
+                    ),
+                )
+                .when(has_filter, |el| {
+                    el.child(
+                        icon_button(
+                            "clear-presets-search",
+                            Icon::Close,
+                            "Clear pattern filter",
+                            None,
+                            ButtonTone::Ghost,
+                            t,
+                        )
+                        .debug_selector(|| "clear-presets-search".into())
+                        .size(px(22.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.clear_presets_search(window, cx)
+                            }),
+                        ),
+                    )
+                });
 
             let mut list = div()
                 .id("presets-list")
-                .max_h(px(260.))
+                .max_h(px(220.))
                 .overflow_y_scroll()
                 .track_scroll(&self.presets_scroll)
                 .flex()
                 .flex_col()
                 .gap_0p5();
 
-            for (index, preset) in self.config.search.presets.iter().enumerate() {
-                let item_active = active_index == Some(index);
-                let item_highlighted = highlighted == index;
-                let hover = t.hover;
-                let mode_label = match preset.mode {
-                    SearchMode::Regex => "Regex",
-                    SearchMode::Literal => "Literal",
-                };
-
+            if self.filtered_presets.is_empty() {
                 list = list.child(
                     div()
-                        .id(("preset-item", index))
-                        .debug_selector(move || format!("preset-item-{index}"))
+                        .debug_selector(|| "presets-empty".into())
                         .px_2p5()
-                        .py_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if item_highlighted {
-                            t.accent_border
-                        } else {
-                            gpui::transparent_black()
-                        })
-                        .bg(if item_highlighted {
-                            t.selection
-                        } else if item_active {
-                            t.accent_subtle.opacity(0.5)
-                        } else {
-                            gpui::transparent_black()
-                        })
-                        .cursor_pointer()
-                        .hover(move |s| if item_highlighted { s } else { s.bg(hover) })
+                        .py_4()
                         .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                            if this.preset_index != index {
-                                this.preset_index = index;
-                                cx.notify();
-                            }
-                        }))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.apply_preset(index, window, cx);
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_size(t.small_size)
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(if item_active {
-                                            t.accent
-                                        } else {
-                                            t.foreground
-                                        })
-                                        .child(preset.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .px_1p5()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .bg(t.background)
-                                        .border_1()
-                                        .border_color(t.border)
-                                        .font(t.mono_font_spec())
-                                        .text_size(px(10.))
-                                        .text_color(t.muted)
-                                        .child(mode_label),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .font(t.mono_font_spec())
-                                .text_size(t.xs_size)
-                                .text_color(t.muted)
-                                .child(preset.pattern.clone()),
-                        ),
+                        .items_center()
+                        .justify_center()
+                        .text_size(t.small_size)
+                        .text_color(t.muted)
+                        .child("No matching patterns"),
                 );
+            } else {
+                for (row_index, matched) in self.filtered_presets.iter().enumerate() {
+                    let preset_index = matched.index;
+                    let Some(preset) = self.config.search.presets.get(preset_index) else {
+                        continue;
+                    };
+                    let item_active = active_index == Some(preset_index);
+                    let item_highlighted = highlighted == row_index;
+                    let hover = t.hover;
+                    let mode_label = match preset.mode {
+                        SearchMode::Regex => "Regex",
+                        SearchMode::Literal => "Literal",
+                    };
+                    let name_element: AnyElement = if matched.ranges.is_empty() {
+                        preset.name.clone().into_any_element()
+                    } else {
+                        let highlight_style = HighlightStyle {
+                            color: Some(t.accent),
+                            font_weight: Some(FontWeight::BOLD),
+                            background_color: item_active.then_some(t.accent_subtle),
+                            ..Default::default()
+                        };
+                        let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = matched
+                            .ranges
+                            .iter()
+                            .cloned()
+                            .map(|range| (range, highlight_style))
+                            .collect();
+                        StyledText::new(preset.name.clone())
+                            .with_highlights(highlights)
+                            .into_any_element()
+                    };
+
+                    list = list.child(
+                        div()
+                            .id(("preset-item", preset_index))
+                            .debug_selector(move || format!("preset-item-{preset_index}"))
+                            .px_2p5()
+                            .py_1p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if item_highlighted {
+                                t.accent_border
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .bg(if item_highlighted {
+                                t.selection
+                            } else if item_active {
+                                t.accent_subtle.opacity(0.5)
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .cursor_pointer()
+                            .hover(move |s| if item_highlighted { s } else { s.bg(hover) })
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                if this.preset_index != row_index {
+                                    this.preset_index = row_index;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.apply_preset(preset_index, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_size(t.small_size)
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(if item_active {
+                                                t.accent
+                                            } else {
+                                                t.foreground
+                                            })
+                                            .child(name_element),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .bg(t.background)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .font(t.mono_font_spec())
+                                            .text_size(px(10.))
+                                            .text_color(t.muted)
+                                            .child(mode_label),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .font(t.mono_font_spec())
+                                    .text_size(t.xs_size)
+                                    .text_color(t.muted)
+                                    .child(preset.pattern.clone()),
+                            ),
+                    );
+                }
             }
 
             let out_trigger_bounds = self.presets_trigger_bounds.clone();
@@ -4999,6 +5553,9 @@ impl Workspace {
                 .debug_selector(|| "presets-menu".into())
                 .key_context("Presets")
                 .track_focus(&self.presets_focus)
+                .on_action(cx.listener(|this, _: &input_actions::Enter, window, cx| {
+                    this.apply_selected_preset(window, cx);
+                }))
                 .occlude()
                 .absolute()
                 .right_0()
@@ -5012,9 +5569,10 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .gap_1()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                     if !out_trigger_bounds.get().contains(&event.position) {
-                        this.show_presets = false;
+                        this.dismiss_presets(cx);
                         cx.notify();
                     }
                 }))
@@ -5047,7 +5605,7 @@ impl Workspace {
                                         .font(t.mono_font_spec())
                                         .text_size(px(10.))
                                         .text_color(t.muted)
-                                        .child(format_count(self.config.search.presets.len())),
+                                        .child(count_badge),
                                 ),
                         )
                         .child(
@@ -5058,6 +5616,7 @@ impl Workspace {
                                 .child("↑↓ ↵"),
                         ),
                 )
+                .child(search_field)
                 .child(list);
 
             menu = if open_upward {
@@ -5494,6 +6053,17 @@ impl Render for Workspace {
             self.results_hscroll_state.clear();
             self.results_row_layouts.clear();
         }
+        let needs_pending_reveal = self.tabs.get(self.active).is_some_and(|tab| {
+            (tab.pending_main_reveal.is_some() && line_count > 0 && !main_hidden)
+                || (tab.pending_results_reveal.is_some() && result_count > 0 && !results_hidden)
+        });
+        if needs_pending_reveal && !self.pending_reveal_frame_scheduled {
+            self.pending_reveal_frame_scheduled = true;
+            cx.on_next_frame(window, |this, _window, cx| {
+                this.pending_reveal_frame_scheduled = false;
+                this.flush_pending_reveals(cx);
+            });
+        }
 
         let main_area = if self.tabs.is_empty() {
             self.render_welcome(cx)
@@ -5594,24 +6164,16 @@ impl Render for Workspace {
 
             let source_pane = div()
                 .debug_selector(|| "source-pane".into())
+                .relative()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
                 .flex()
                 .flex_col()
-                .child(self.render_file_path_bar(main_focused, loading, line_count, window, cx))
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .child(source_log_area)
-                        .when(self.show_goto, |body| {
-                            body.child(self.render_goto_popover(line_count, cx))
-                        }),
-                );
+                .child(source_log_area)
+                .when(self.show_goto, |body| {
+                    body.child(self.render_goto_popover(line_count, cx))
+                });
 
             let at_max_results_h = main_hidden || effective_results_h >= max_results_h - 0.5;
             let at_min_results_h = results_hidden || effective_results_h <= min_results_h + 0.5;
@@ -5843,6 +6405,14 @@ impl Render for Workspace {
                 .min_h_0()
                 .flex()
                 .flex_col()
+                .child(self.render_file_path_bar(
+                    main_focused && !main_hidden,
+                    main_hidden,
+                    loading,
+                    line_count,
+                    window,
+                    cx,
+                ))
                 .when(!main_hidden, |area| area.child(source_pane))
                 .child(self.render_results_resize_sash(main_hidden, results_hidden, cx))
                 .child(self.render_search_bar(&options, window, cx))
@@ -6685,12 +7255,12 @@ mod tests {
             .expect("presets trigger should be rendered");
         assert!(cx.debug_bounds("presets-menu").is_none());
 
-        // Keyboard shortcut opens dropdown, focuses it, and positions it cleanly below trigger.
+        // Keyboard shortcut opens dropdown, auto-focuses its search box, and positions it cleanly below trigger.
         cx.simulate_keystrokes(presets_key);
         cx.run_until_parked();
-        view.update_in(cx, |view, window, _| {
+        view.update_in(cx, |view, window, cx| {
             assert!(view.show_presets);
-            assert!(view.presets_focus.is_focused(window));
+            assert!(view.presets_search_focused(window, cx));
             assert_eq!(view.preset_index, 0);
         });
         let menu_bounds = cx
@@ -6707,13 +7277,18 @@ mod tests {
             assert_eq!(view.preset_index, 1);
             assert_eq!(view.tabs[0].selected, 0);
         });
-        cx.simulate_keystrokes("end");
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::LastLine, window, cx);
+        });
         view.read_with(cx, |view, _| assert_eq!(view.preset_index, 2));
         cx.simulate_keystrokes("down");
         view.read_with(cx, |view, _| assert_eq!(view.preset_index, 0));
         cx.simulate_keystrokes("up");
         view.read_with(cx, |view, _| assert_eq!(view.preset_index, 2));
-        cx.simulate_keystrokes("home down");
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FirstLine, window, cx);
+        });
+        cx.simulate_keystrokes("down");
         view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
 
         // Pressing Enter applies the highlighted preset ("Warnings": literal "warn"), closes menu, and restores focus.
@@ -6881,6 +7456,249 @@ mod tests {
             assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
             assert!(view.tabs[0].options.highlight_matches);
             assert_eq!(view.active_preset_index(cx), Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn saved_patterns_fuzzy_search_live_filters_and_picks_on_enter(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "Errors".into(),
+                pattern: "error|fatal|panic".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+            },
+            config::Preset {
+                name: "Warnings".into(),
+                pattern: "warn".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+            },
+            config::Preset {
+                name: "Requests".into(),
+                pattern: "GET|POST|PUT|DELETE".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+            },
+            config::Preset {
+                name: "HTTP 5xx Errors".into(),
+                pattern: "HTTP 5\\d\\d".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+            },
+            config::Preset {
+                name: "Auth Errors".into(),
+                pattern: "401|403|unauthorized".into(),
+                mode: SearchMode::Regex,
+                highlight_match: false,
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fuzzy-presets.log");
+        std::fs::write(
+            &path,
+            "info boot\nWARN slow query\nERROR panic\nHTTP 502 bad gateway\n401 unauthorized\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let presets_key = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+
+        // Opening saved patterns focuses the fuzzy search input and keeps it single-line.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.show_presets);
+            assert!(view.presets_search_focused(window, cx));
+            assert_eq!(view.filtered_presets.len(), 5);
+            assert_eq!(view.preset_index, 0);
+        });
+        let input_bounds = cx
+            .debug_bounds("presets-search-input")
+            .expect("presets search input should render");
+        assert!(
+            input_bounds.size.height <= px(28.),
+            "presets search input should stay single-line, got {:?}",
+            input_bounds.size.height
+        );
+        for _ in 0..3 {
+            cx.refresh().unwrap();
+            let redrawn = cx
+                .debug_bounds("presets-search-input")
+                .expect("presets search input after redraw");
+            assert_eq!(redrawn.size.height, input_bounds.size.height);
+        }
+
+        // Typing a fuzzy query immediately filters by name, highlights top match, and Enter picks it.
+        cx.simulate_input("wrn");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.presets_search.read(cx).as_str(), "wrn");
+            assert_eq!(
+                view.filtered_presets
+                    .iter()
+                    .map(|m| m.index)
+                    .collect::<Vec<_>>(),
+                vec![1]
+            );
+            assert_eq!(view.preset_index, 0);
+        });
+        assert!(cx.debug_bounds("preset-item-1").is_some());
+        assert!(cx.debug_bounds("preset-item-0").is_none());
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
+            assert_eq!(view.tabs[0].query, "warn");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+        });
+
+        // Reopening starts with an empty filter and highlights the active preset ("Warnings" = 1).
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.show_presets);
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
+            assert_eq!(view.filtered_presets.len(), 5);
+            assert_eq!(view.preset_index, 1);
+        });
+
+        // Multi-word fuzzy query with space keystroke must insert space (not apply preset) and match "HTTP 5xx Errors".
+        cx.simulate_input("http");
+        cx.simulate_keystrokes("space");
+        cx.simulate_input("err");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.show_presets);
+            assert_eq!(view.presets_search.read(cx).as_str(), "http err");
+            assert_eq!(
+                view.filtered_presets
+                    .iter()
+                    .map(|m| m.index)
+                    .collect::<Vec<_>>(),
+                vec![3]
+            );
+            assert_eq!(view.preset_index, 0);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_presets);
+            assert_eq!(view.tabs[0].query, "HTTP 5\\d\\d");
+        });
+
+        // Typing "err" matches multiple presets ranked best-first; arrows pick the second match.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_input("err");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let ranked: Vec<usize> = view.filtered_presets.iter().map(|m| m.index).collect();
+            assert_eq!(ranked[0], 0, "exact prefix 'Errors' should rank first");
+            assert_eq!(ranked.len(), 3);
+            assert_eq!(view.preset_index, 0);
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        let expected_second_index = view.read_with(cx, |view, _| {
+            assert_eq!(view.preset_index, 1);
+            view.filtered_presets[1].index
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_presets);
+            assert_eq!(
+                view.tabs[0].query,
+                view.config.search.presets[expected_second_index].pattern
+            );
+        });
+
+        // Pattern body text ("panic") is NOT matched when searching by pattern name.
+        let query_before_no_match = view.read_with(cx, |view, _| view.tabs[0].query.clone());
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_input("panic");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_presets);
+            assert!(view.filtered_presets.is_empty());
+        });
+        assert!(cx.debug_bounds("presets-empty").is_some());
+
+        // Enter and navigation on empty results are safe no-ops and keep the dropdown open.
+        cx.simulate_keystrokes("down up home end enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_presets);
+            assert!(view.filtered_presets.is_empty());
+            assert_eq!(view.tabs[0].query, query_before_no_match);
+        });
+
+        // Clicking the inline clear button restores all matches and keeps focus in the search input.
+        let clear_center = cx
+            .debug_bounds("clear-presets-search")
+            .expect("clear presets search button should render")
+            .center();
+        cx.simulate_click(clear_center, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.show_presets);
+            assert!(view.presets_search_focused(window, cx));
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
+            assert_eq!(view.filtered_presets.len(), 5);
+            assert_eq!(view.preset_index, 0);
+        });
+
+        // Filtering and clicking a filtered item directly applies it and clears the filter.
+        cx.simulate_input("au");
+        cx.run_until_parked();
+        let auth_center = cx
+            .debug_bounds("preset-item-4")
+            .expect("Auth Errors item should render")
+            .center();
+        cx.simulate_click(auth_center, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
+            assert_eq!(view.tabs[0].query, "401|403|unauthorized");
+            assert!(!view.tabs[0].options.highlight_matches);
+        });
+
+        // Escape dismisses and clears any typed filter query.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_input("req");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.presets_search.read(cx).as_str(), "");
         });
     }
 
@@ -7845,8 +8663,12 @@ mod tests {
         assert!(max_h > 400.0);
         assert!(cx.debug_bounds("source-pane").is_some());
         assert!(cx.debug_bounds("results-body").is_some());
+        let file_path_before = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar should render");
 
-        // Dragging all the way to the top hides the main log pane and hands focus to the filter pane.
+        // Dragging all the way to the top hides the main log pane, stops below the file path bar,
+        // and hands focus to the filter pane.
         let sash = cx
             .debug_bounds("results-resize-sash")
             .expect("resize sash should render")
@@ -7866,6 +8688,22 @@ mod tests {
         assert!(
             cx.debug_bounds("source-pane").is_none(),
             "main source pane should be hidden at max height"
+        );
+        let file_path_at_max = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar should remain visible at max filter height");
+        let sash_at_max = cx
+            .debug_bounds("results-resize-sash")
+            .expect("resize sash should remain visible at max filter height");
+        assert_eq!(file_path_at_max.origin.y, file_path_before.origin.y);
+        assert_eq!(file_path_at_max.size.height, px(FILE_PATH_BAR_HEIGHT));
+        assert!(
+            sash_at_max.origin.y >= file_path_at_max.bottom(),
+            "resize sash ({sash_at_max:?}) should stop at or below file path bar ({file_path_at_max:?})"
+        );
+        assert!(
+            (sash_at_max.origin.y - file_path_at_max.bottom()).abs() <= px(0.5),
+            "resize sash ({sash_at_max:?}) should meet the bottom of the file path bar ({file_path_at_max:?})"
         );
         assert!(cx.debug_bounds("results-body").is_some());
 
@@ -8068,6 +8906,148 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(!view.resize_motion.is_animating());
             assert_eq!(view.results_height, view.target_results_height);
+        });
+    }
+
+    #[gpui::test]
+    fn filter_pane_max_height_stops_at_file_path_bar_and_keeps_path_bar_usable(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        std::fs::write(&first, "ERROR one\nINFO two\n").unwrap();
+        std::fs::write(&second, "ERROR alpha\nINFO beta\nERROR gamma\n").unwrap();
+        let second_canon = second.canonicalize().unwrap();
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![first], window, cx));
+        wait_for_tab_loaded(&view, 0, cx);
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+
+        let step_frame = |cx: &mut VisualTestContext, ms: u64| {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(ms));
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.run_until_parked();
+        };
+
+        let (_, max_h) = view.update_in(cx, |view, window, _| view.results_height_bounds(window));
+
+        // Near max height (10px shy), the file path bar must stay full height and unclipped.
+        view.update(cx, |view, cx| {
+            view.results_height = max_h - 10.0;
+            view.target_results_height = max_h - 10.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let path_near_max = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar near max");
+        let sash_near_max = cx
+            .debug_bounds("results-resize-sash")
+            .expect("sash near max");
+        let source_near_max = cx
+            .debug_bounds("source-pane")
+            .expect("source pane should still render 10px shy of max");
+        assert_eq!(path_near_max.size.height, px(FILE_PATH_BAR_HEIGHT));
+        assert!(source_near_max.origin.y >= path_near_max.bottom());
+        assert!(sash_near_max.origin.y >= source_near_max.bottom());
+
+        // Holding `-` glides to max_h and stops right below the file path bar without covering it.
+        let key_minus = Keystroke::parse("-").unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: key_minus.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        for i in 0..80 {
+            if i % 3 == 0 {
+                cx.simulate_event(KeyDownEvent {
+                    keystroke: key_minus.clone(),
+                    is_held: true,
+                    prefer_character_input: false,
+                });
+            }
+            step_frame(cx, 16);
+        }
+        cx.simulate_event(KeyUpEvent {
+            keystroke: key_minus,
+        });
+        for _ in 0..30 {
+            step_frame(cx, 16);
+        }
+
+        view.update_in(cx, |view, window, _| {
+            assert_eq!(view.results_height, max_h);
+            assert!(view.results_focus.is_focused(window));
+        });
+        let path_at_max = cx
+            .debug_bounds("file-path-bar")
+            .expect("file path bar must stay visible at max height");
+        let sash_at_max = cx
+            .debug_bounds("results-resize-sash")
+            .expect("resize sash at max height");
+        assert!(cx.debug_bounds("source-pane").is_none());
+        assert_eq!(path_at_max.size.height, px(FILE_PATH_BAR_HEIGHT));
+        assert!(
+            (sash_at_max.origin.y - path_at_max.bottom()).abs() <= px(0.5),
+            "sash ({sash_at_max:?}) should stop directly beneath file path bar ({path_at_max:?})"
+        );
+
+        // Focusing and submitting the file path bar at max height keeps the filter pane maximized
+        // and returns keyboard focus to the visible filter pane.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(
+                view.results_height, max_h,
+                "focusing always-visible file path bar should not shrink maximized filter pane"
+            );
+            assert!(view.path_input_focused(window, cx));
+        });
+        cx.simulate_input(&second.display().to_string());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+        view.update_in(cx, |view, window, _| {
+            assert_eq!(view.tabs[0].path, second_canon);
+            assert_eq!(view.results_height, max_h);
+            assert!(
+                view.results_focus.is_focused(window),
+                "submitting file path while main pane is hidden should focus visible filter pane"
+            );
+        });
+
+        // Clicking the non-input portion of the file path bar while main is hidden keeps focus
+        // on the visible filter pane so Log shortcuts remain active.
+        let right_edge = point(path_at_max.right() - px(8.), path_at_max.center().y);
+        cx.simulate_mouse_down(right_edge, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(right_edge, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, _| {
+            assert!(
+                view.results_focus.is_focused(window),
+                "clicking file path bar chrome while main is hidden should keep filter pane focused"
+            );
         });
     }
 
@@ -10208,5 +11188,1205 @@ mod tests {
             assert_eq!(view.zoom_percent, MIN_ZOOM_PERCENT);
             assert_eq!(view.header_zoom_count, 0);
         });
+    }
+
+    #[gpui::test]
+    fn left_and_right_arrows_scroll_active_pane_horizontally_without_affecting_inputs(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wide-keys.log");
+        let long_payload = "x".repeat(320);
+        let content = (0..120)
+            .map(|i| format!("MATCH line {i} {long_payload}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let visible: Vec<usize> = (0..120).collect();
+        let results = SearchResults {
+            matches: visible.clone(),
+            visible,
+            limited: false,
+            widest_row: 0,
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "MATCH".into();
+            view.tabs[0].results = results;
+            view.tabs[0].selected = 0;
+            view.tabs[0].follow = true;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.theme.shortcut(Command::ScrollLeft).as_deref(),
+                Some("←")
+            );
+            assert_eq!(
+                view.theme.shortcut(Command::ScrollRight).as_deref(),
+                Some("→")
+            );
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+            assert_eq!(
+                f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Pressing left at x=0 is a clean no-op.
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Scroll vertically first to verify horizontal scrolling preserves vertical position,
+        // selected line, and follow mode.
+        view.update(cx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Vertical, 120.0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let main_step_100 = view.read_with(cx, |view, _| {
+            let item = view.tabs[0]
+                .scroll
+                .0
+                .borrow()
+                .last_item_size
+                .expect("main list laid out");
+            horizontal_scroll_step(f32::from(item.item.width), 1.0)
+        });
+
+        // Pressing right in main pane scrolls only main pane horizontally and moves its scrollbar thumb.
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let offset = view.tabs[0].scroll.0.borrow().base_handle.offset();
+            assert!((f32::from(offset.x) + main_step_100).abs() < 0.5);
+            assert!((f32::from(offset.y) + 120.0).abs() < 0.5);
+            assert_eq!(view.tabs[0].selected, 0);
+            assert!(view.tabs[0].follow);
+            assert_eq!(
+                f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().x),
+                0.0,
+                "scrolling main pane must not move filter pane"
+            );
+            let hlayout = view
+                .main_hscroll_state
+                .layout()
+                .expect("main horizontal scrollbar layout");
+            assert!(hlayout.thumb.start > 0.0);
+        });
+
+        // Pressing left returns smoothly back to x=0.
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Repeated right presses clamp cleanly at max_offset without overshooting.
+        let max_main_offset = view.read_with(cx, |view, _| {
+            view.main_hscroll_state
+                .layout()
+                .expect("main horizontal scrollbar layout")
+                .max_offset
+        });
+        let presses = (max_main_offset / main_step_100).ceil() as usize + 4;
+        for _ in 0..presses {
+            cx.simulate_keystrokes("right");
+        }
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let offset_x = f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x);
+            assert!(
+                (offset_x + max_main_offset).abs() < 0.5,
+                "expected clamp at -{max_main_offset}, got {offset_x}"
+            );
+        });
+
+        // Switch to filter (results) pane with Tab: right/left scroll only the results pane.
+        let main_offset_before_results = view.read_with(cx, |view, _| {
+            f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x)
+        });
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let results_x = f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().x);
+            assert!(
+                results_x < -10.0,
+                "expected results pane to scroll right, got {results_x}"
+            );
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                main_offset_before_results,
+                "scrolling results pane must not move main pane"
+            );
+            let hlayout = view
+                .results_hscroll_state
+                .layout()
+                .expect("results horizontal scrollbar layout");
+            assert!(hlayout.thumb.start > 0.0);
+        });
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].result_scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Switch back to main pane, reset x=0, and verify horizontal step scales with zoom.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 0.0);
+            view.set_zoom_percent(200, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        let zoomed_offset_x = view.read_with(cx, |view, _| {
+            -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x)
+        });
+        assert!(
+            zoomed_offset_x > main_step_100 * 1.5,
+            "expected 200% zoom step ({zoomed_offset_x}) to exceed 100% step ({main_step_100})"
+        );
+
+        // Inside Search, FilePath, and GoTo inputs, left/right edit the text cursor and never scroll logs.
+        view.update_in(cx, |view, window, cx| {
+            view.set_zoom_percent(DEFAULT_ZOOM_PERCENT, cx);
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 0.0);
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("ab");
+        cx.simulate_keystrokes("left");
+        cx.simulate_input("X");
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "aXb");
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("right");
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("12");
+        cx.simulate_keystrokes("left");
+        cx.simulate_input("9");
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.goto.read(cx).as_str(), "192");
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn left_and_right_arrows_are_noops_when_lines_fit_without_horizontal_overflow(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("short.log");
+        std::fs::write(&path, "short line 0\nshort line 1\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("right");
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.main_hscroll_state.layout().is_none());
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+    }
+
+    fn assert_surrounding_margin(
+        handle: &UniformListScrollHandle,
+        row: usize,
+        row_count: usize,
+        row_height: f32,
+        surrounding_lines: usize,
+        label: &str,
+    ) {
+        let state = handle.0.borrow();
+        let item_size = state
+            .last_item_size
+            .expect("list should have been laid out");
+        let viewport_h = f32::from(item_size.item.height);
+        let scroll_top = -f32::from(state.base_handle.offset().y);
+        let content_h = row_count as f32 * row_height;
+        let max_scroll = (content_h - viewport_h).max(0.0);
+        let desired_margin = surrounding_lines as f32 * row_height;
+        let effective_margin = desired_margin.min(((viewport_h - row_height) * 0.5).max(0.0));
+        let row_top = row as f32 * row_height;
+        let row_bottom = row_top + row_height;
+        let above = row_top - scroll_top;
+        let below = (scroll_top + viewport_h) - row_bottom;
+
+        if scroll_top > 0.5 {
+            assert!(
+                above + 0.5 >= effective_margin,
+                "{label}: row {row} only has {above}px above (expected >= {effective_margin}px, scroll_top={scroll_top}, vp={viewport_h})"
+            );
+        }
+        if scroll_top + 0.5 < max_scroll {
+            assert!(
+                below + 0.5 >= effective_margin,
+                "{label}: row {row} only has {below}px below (expected >= {effective_margin}px, scroll_top={scroll_top}, vp={viewport_h}, max={max_scroll})"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn cursor_surrounding_lines_keeps_gap_in_main_and_filter_panes_and_preserves_zero_default(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("surrounding.log");
+        let content: String = (0..200)
+            .map(|i| {
+                let level = if i % 2 == 0 { "ERROR" } else { "INFO" };
+                format!(
+                    "2026-11-26 {level} line-{i:04} token_{i:04} {}",
+                    "x".repeat(400)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        // 1. Default (0): stepping down through all initially visible rows does not scroll.
+        let default_config = Config::load(None).unwrap();
+        assert_eq!(default_config.viewer.cursor_surrounding_lines, 0);
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&default_config).unwrap());
+        });
+        let (default_view, default_cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(default_config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        default_cx.run_until_parked();
+        let initial_full_rows = default_view.read_with(default_cx, |view, _| {
+            let vp = f32::from(
+                view.tabs[0]
+                    .scroll
+                    .0
+                    .borrow()
+                    .last_item_size
+                    .unwrap()
+                    .item
+                    .height,
+            );
+            (vp / view.zoom_metrics().line_height).floor() as usize
+        });
+        assert!(
+            initial_full_rows >= 10,
+            "expected at least 10 visible rows, got {initial_full_rows}"
+        );
+        default_view.update_in(default_cx, |view, window, cx| {
+            for _ in 0..(initial_full_rows - 1) {
+                view.command(Command::NextLine, window, cx);
+            }
+        });
+        default_cx.run_until_parked();
+        default_view.read_with(default_cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, initial_full_rows - 1);
+            let scroll_top = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                scroll_top.abs() < 0.5,
+                "default cursor_surrounding_lines=0 should not scroll on last fully visible row, got {scroll_top}"
+            );
+        });
+
+        // 2. Main pane with cursor_surrounding_lines = 4.
+        let mut config = Config::load(None).unwrap();
+        config.viewer.cursor_surrounding_lines = 4;
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        vcx.run_until_parked();
+
+        // Preserve horizontal scroll while stepping down with surrounding lines.
+        view.update(vcx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 120.0);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        let line_height = view.read_with(vcx, |view, _| view.zoom_metrics().line_height);
+        let main_vp = view.read_with(vcx, |view, _| {
+            f32::from(
+                view.tabs[0]
+                    .scroll
+                    .0
+                    .borrow()
+                    .last_item_size
+                    .unwrap()
+                    .item
+                    .height,
+            )
+        });
+        let main_full_rows = (main_vp / line_height).floor() as usize;
+        assert!(main_full_rows >= 10);
+
+        // Stepping down starts scrolling 4 rows before the bottom edge and preserves horizontal scroll.
+        let mut scrolled_early = false;
+        for step in 1..=50 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::NextLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                assert_eq!(view.tabs[0].selected, step);
+                assert_surrounding_margin(
+                    &view.tabs[0].scroll,
+                    step,
+                    200,
+                    line_height,
+                    4,
+                    "main NextLine",
+                );
+                let offset = view.tabs[0].scroll.0.borrow().base_handle.offset();
+                assert!(
+                    (f32::from(offset.x) - -120.0).abs() < 1.0,
+                    "horizontal scroll must be preserved during vertical reveal, got {:?}",
+                    offset.x
+                );
+                if step == main_full_rows - 2 && -f32::from(offset.y) > 0.5 {
+                    scrolled_early = true;
+                }
+            });
+        }
+        assert!(
+            scrolled_early,
+            "expected main pane to start scrolling before reaching the bottom edge"
+        );
+
+        // Stepping back up stays stationary inside the safe band, then scrolls with 4 rows above.
+        let scroll_before_up = view.read_with(vcx, |view, _| {
+            -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y)
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::PreviousLine, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            let after_one_up = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                (after_one_up - scroll_before_up).abs() < 0.5,
+                "stepping up inside the safe band should not scroll (before={scroll_before_up}, after={after_one_up})"
+            );
+        });
+        for _ in 0..30 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::PreviousLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                let row = view.tabs[0].selected;
+                assert_surrounding_margin(
+                    &view.tabs[0].scroll,
+                    row,
+                    200,
+                    line_height,
+                    4,
+                    "main PreviousLine",
+                );
+            });
+        }
+
+        // Shift+Down range extension and Alt+O swap anchor keep the 4-row margin.
+        view.update_in(vcx, |view, window, cx| {
+            for _ in 0..25 {
+                view.command(Command::SelectNextLine, window, cx);
+            }
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_surrounding_margin(
+                &view.tabs[0].scroll,
+                view.tabs[0].selected,
+                200,
+                line_height,
+                4,
+                "main SelectNextLine",
+            );
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::SwapSelectionAnchor, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_surrounding_margin(
+                &view.tabs[0].scroll,
+                view.tabs[0].selected,
+                200,
+                line_height,
+                4,
+                "main SwapSelectionAnchor",
+            );
+        });
+
+        // LastLine clamps cleanly to bottom; FirstLine returns cleanly to top.
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::LastLine, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 199);
+            assert_eq!(view.tabs[0].scroll.is_scrolled_to_end(), Some(true));
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::FirstLine, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 0);
+            let scroll_top = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(scroll_top.abs() < 0.5);
+        });
+
+        // GoToLine / NextBookmark on a row inside the bottom 4-row edge margin scrolls to center it.
+        let edge_row = main_full_rows - 1;
+        view.update_in(vcx, |view, window, cx| {
+            view.tabs[0].bookmarks.insert(edge_row);
+            view.command(Command::NextBookmark, window, cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].selected, edge_row);
+            let scroll_top = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                scroll_top > 0.5,
+                "NextBookmark onto edge row {edge_row} must scroll to satisfy surrounding margin"
+            );
+            assert_surrounding_margin(
+                &view.tabs[0].scroll,
+                edge_row,
+                200,
+                line_height,
+                4,
+                "main NextBookmark",
+            );
+        });
+
+        // Mouse clicking a visible row near the bottom edge does not yank it away mid-double-click.
+        view.update_in(vcx, |view, window, cx| {
+            view.command(Command::FirstLine, window, cx);
+        });
+        vcx.run_until_parked();
+        let bottom_visible_row = main_full_rows - 2;
+        let row0_bounds = vcx.debug_bounds("main-text-0").expect("row 0 text bounds");
+        let scroll_before_click = view.read_with(vcx, |view, _| {
+            -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y)
+        });
+        let click_pos = point(
+            row0_bounds.left() + px(8.0),
+            row0_bounds.center().y + px(bottom_visible_row as f32 * line_height),
+        );
+        for count in [1, 2] {
+            vcx.simulate_event(MouseDownEvent {
+                button: MouseButton::Left,
+                position: click_pos,
+                modifiers: Modifiers::none(),
+                click_count: count,
+                first_mouse: false,
+            });
+            vcx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: click_pos,
+                modifiers: Modifiers::none(),
+                click_count: count,
+            });
+            vcx.run_until_parked();
+        }
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].selected, bottom_visible_row);
+            let scroll_after_click =
+                -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                (scroll_after_click - scroll_before_click).abs() < 0.5,
+                "clicking a visible row must not yank it out from under the pointer"
+            );
+            let sel = view.tabs[0]
+                .main_text_selection
+                .expect("double-click should select a word on the clicked row");
+            assert_eq!(sel.row_range(), bottom_visible_row..=bottom_visible_row);
+        });
+
+        // 3. Filter/results pane also respects cursor_surrounding_lines when navigating filtered rows.
+        view.update_in(vcx, |view, window, cx| {
+            let matches: Vec<usize> = (0..200).filter(|i| i % 2 == 0).collect();
+            view.tabs[0].results.matches = matches.clone();
+            view.tabs[0].results.visible = matches;
+            view.tabs[0].result_selection = LineSelection::single(0);
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        vcx.run_until_parked();
+        for step in 1..=25 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::NextLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                assert_eq!(view.tabs[0].result_selection.cursor, step);
+                assert_surrounding_margin(
+                    &view.tabs[0].result_scroll,
+                    step,
+                    100,
+                    line_height,
+                    4,
+                    "results NextLine",
+                );
+                assert_surrounding_margin(
+                    &view.tabs[0].scroll,
+                    step * 2,
+                    200,
+                    line_height,
+                    4,
+                    "main synced from results NextLine",
+                );
+            });
+        }
+        for _ in 0..15 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::PreviousLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                let row = view.tabs[0].result_selection.cursor;
+                assert_surrounding_margin(
+                    &view.tabs[0].result_scroll,
+                    row,
+                    100,
+                    line_height,
+                    4,
+                    "results PreviousLine",
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn cursor_surrounding_lines_adapts_to_zoom_centers_when_large_and_handles_initial_load(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zoom_surrounding.log");
+        let content: String = (0..200)
+            .map(|i| format!("2026-11-26 INFO row-{i:04} payload\n"))
+            .collect();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        // 1. Zooming scales the surrounding margin in rows (using zoomed line_height).
+        let mut config = Config::load(None).unwrap();
+        config.viewer.cursor_surrounding_lines = 4;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        vcx.run_until_parked();
+
+        view.update_in(vcx, |view, window, cx| {
+            for _ in 0..5 {
+                view.command(Command::ZoomIn, window, cx);
+            }
+        });
+        vcx.run_until_parked();
+        let zoomed_line_height = view.read_with(vcx, |view, _| {
+            assert_eq!(view.zoom_percent, 150);
+            view.zoom_metrics().line_height
+        });
+        assert!((zoomed_line_height - 36.0).abs() < 0.5);
+
+        for _ in 0..25 {
+            view.update_in(vcx, |view, window, cx| {
+                view.command(Command::NextLine, window, cx);
+            });
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| {
+                assert_surrounding_margin(
+                    &view.tabs[0].scroll,
+                    view.tabs[0].selected,
+                    200,
+                    zoomed_line_height,
+                    4,
+                    "zoomed NextLine",
+                );
+            });
+        }
+
+        // 2. Large cursor_surrounding_lines (larger than half viewport) centers cursor vertically.
+        let mut center_config = Config::load(None).unwrap();
+        center_config.viewer.cursor_surrounding_lines = 500;
+        let (center_view, center_cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(center_config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            workspace
+        });
+        center_cx.run_until_parked();
+
+        center_view.update_in(center_cx, |view, window, cx| {
+            for _ in 0..50 {
+                view.command(Command::NextLine, window, cx);
+            }
+        });
+        center_cx.run_until_parked();
+        center_view.read_with(center_cx, |view, _| {
+            let state = view.tabs[0].scroll.0.borrow();
+            let vp = f32::from(state.last_item_size.unwrap().item.height);
+            let line_h = view.zoom_metrics().line_height;
+            let scroll_top = -f32::from(state.base_handle.offset().y);
+            let expected_center = (50.0 * line_h + line_h * 0.5) - vp * 0.5;
+            assert!(
+                (scroll_top - expected_center).abs() < 1.0,
+                "expected cursor centered at {expected_center}, got {scroll_top}"
+            );
+        });
+
+        // 3. Initial load before first layout resolves pending reveal once viewport size is known,
+        //    even when the restored line sits inside the bottom margin of the first screen.
+        let initial_edge_row = center_view.read_with(center_cx, |view, _| {
+            let vp = f32::from(
+                view.tabs[0]
+                    .scroll
+                    .0
+                    .borrow()
+                    .last_item_size
+                    .unwrap()
+                    .item
+                    .height,
+            );
+            ((vp / view.zoom_metrics().line_height).floor() as usize).saturating_sub(1)
+        });
+        assert!(initial_edge_row >= 8);
+        let mut init_config = Config::load(None).unwrap();
+        init_config.viewer.cursor_surrounding_lines = 5;
+        let (init_view, init_cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::new(init_config.clone(), Vec::new(), window, cx);
+            workspace.open(path.clone(), cx);
+            workspace.tabs[0].selected = initial_edge_row;
+            workspace.tabs[0].main_selection = LineSelection::single(initial_edge_row);
+            workspace.tabs[0].log = Some(log.clone());
+            workspace.tabs[0].loading = false;
+            let lh = workspace.zoom_metrics().line_height;
+            Workspace::reveal_main_row_in_tab(
+                &mut workspace.tabs[0],
+                initial_edge_row,
+                lh,
+                5,
+                RevealStrategy::Center,
+            );
+            workspace
+        });
+        init_cx.run_until_parked();
+        // Advance the scheduled next-frame callback (tests have no platform frame loop).
+        init_cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        init_cx.run_until_parked();
+        init_view.read_with(init_cx, |view, _| {
+            assert!(
+                view.tabs[0].pending_main_reveal.is_none(),
+                "pending reveal should have been flushed after initial layout"
+            );
+            let scroll_top = -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y);
+            assert!(
+                scroll_top > 0.5,
+                "deferred initial reveal must scroll edge row {initial_edge_row} into the safe margin"
+            );
+            assert_surrounding_margin(
+                &view.tabs[0].scroll,
+                initial_edge_row,
+                200,
+                view.zoom_metrics().line_height,
+                5,
+                "initial load deferred reveal",
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn text_navigation_line_start_and_end_work_across_all_text_inputs(cx: &mut TestAppContext) {
+        assert_eq!(
+            config::KeyContext::TextInput.predicate(),
+            DEFAULT_INPUT_CONTEXT
+        );
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nav.log");
+        std::fs::write(&path, "line 0\nline 1\nline 2\nline 3\nline 4\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].selected = 1;
+            view.tabs[0].main_selection = LineSelection::single(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let caret_range = |input: &Entity<EditableTextState>,
+                           window: &mut Window,
+                           cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // 1. Search box (`Search` / `TextInput`): cmd-left/right and home/end move caret,
+        //    clear active selection, and handle Unicode text.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("alpha beta");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        cx.simulate_input("[");
+        cx.simulate_keystrokes("cmd-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = view.input.read(cx).as_str().encode_utf16().count();
+            assert_eq!(caret_range(&view.input, window, cx), end..end);
+        });
+        cx.simulate_input("]");
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        cx.simulate_input("<");
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = view.input.read(cx).as_str().encode_utf16().count();
+            assert_eq!(caret_range(&view.input, window, cx), end..end);
+        });
+        cx.simulate_input(">");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "<[alpha beta]>");
+        });
+
+        // Collapses active selection cleanly and handles multibyte Unicode text.
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        cx.simulate_keystrokes(select_all);
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+            view.input
+                .update(cx, |state, cx| state.emplace("שלום мир", cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = "שלום мир".encode_utf16().count();
+            assert_eq!(caret_range(&view.input, window, cx), end..end);
+        });
+
+        // 2. File path editing (`FilePath` / `TextInput`): collapses the initial full selection
+        //    and moves to start/end with home/end and cmd-left/cmd-right without opening completions.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        let initial_path =
+            view.read_with(cx, |view, cx| view.path_input.read(cx).as_str().to_owned());
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.path_input, window, cx), 0..0);
+            assert_eq!(view.path_input.read(cx).as_str(), initial_path);
+            assert!(!view.show_path_completions);
+        });
+        cx.simulate_keystrokes("cmd-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = initial_path.encode_utf16().count();
+            assert_eq!(caret_range(&view.path_input, window, cx), end..end);
+        });
+        cx.simulate_input(".bak");
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.path_input, window, cx), 0..0);
+        });
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let expected = format!("!{initial_path}.bak");
+            assert_eq!(view.path_input.read(cx).as_str(), expected);
+            let end = expected.encode_utf16().count();
+            assert_eq!(caret_range(&view.path_input, window, cx), end..end);
+            assert_eq!(view.tabs[0].selected, 1);
+        });
+
+        // 3. Pattern search box (`Presets` / `TextInput`): cmd-left/right and home/end navigate
+        //    the pattern search text instead of jumping preset_index.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::TogglePresets, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
+        cx.simulate_input("err");
+        cx.run_until_parked();
+        let preset_index_after_filter = view.read_with(cx, |view, _| view.preset_index);
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 0..0);
+            assert_eq!(view.preset_index, preset_index_after_filter);
+        });
+        cx.simulate_input("^");
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = view.presets_search.read(cx).as_str().encode_utf16().count();
+            assert_eq!(caret_range(&view.presets_search, window, cx), end..end);
+            assert_eq!(view.preset_index, preset_index_after_filter);
+        });
+        cx.simulate_input("$");
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 0..0);
+            assert_eq!(view.presets_search.read(cx).as_str(), "^err$");
+        });
+        cx.simulate_keystrokes("cmd-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 5..5);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 4. Go-to-line input (`GoTo` / `TextInput`): home/end and cmd-left/right move caret.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("42");
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 0..0);
+        });
+        cx.simulate_input("1");
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 3..3);
+        });
+        cx.simulate_input("0");
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 0..0);
+            assert_eq!(view.goto.read(cx).as_str(), "1420");
+        });
+        cx.simulate_keystrokes("cmd-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 4..4);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 5. Log pane (`Log` context) retains home/end line navigation untouched.
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.tabs[0].selected, 1);
+            // Calling text navigation commands when no text input is focused is a safe no-op.
+            view.command(Command::MoveToLineStart, window, cx);
+            view.command(Command::MoveToLineEnd, window, cx);
+            assert_eq!(view.tabs[0].selected, 1);
+        });
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.tabs[0].selected, 4));
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.tabs[0].selected, 0));
+    }
+
+    #[gpui::test]
+    fn text_navigation_supports_custom_bindings_and_context_specific_overrides(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Add extra user keybindings for line start/end across all text inputs.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "ctrl-a".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::MoveToLineStart,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "ctrl-e".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::MoveToLineEnd,
+        });
+        // Intentionally register a specific `Presets` override BEFORE a `TextInput` binding
+        // for the same key to verify specificity ordering is independent of JSON order.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-home".into(),
+            context: config::KeyContext::Presets,
+            action: Command::FirstLine,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-home".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::MoveToLineStart,
+        });
+        config.validate().unwrap();
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("custom-nav.log");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let caret_range = |input: &Entity<EditableTextState>,
+                           window: &mut Window,
+                           cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // Custom ctrl-a / ctrl-e and alt-home work in Search.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("hello");
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("ctrl-e");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 5..5);
+        });
+        cx.simulate_keystrokes("alt-home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+
+        // Custom ctrl-a / ctrl-e work in FilePath.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.path_input, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("ctrl-e");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = view.path_input.read(cx).as_str().encode_utf16().count();
+            assert_eq!(caret_range(&view.path_input, window, cx), end..end);
+        });
+
+        // Custom ctrl-a / ctrl-e work in GoTo.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("99");
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("ctrl-e");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 2..2);
+        });
+
+        // In Presets, custom ctrl-a / ctrl-e move text caret, while Presets-specific alt-home
+        // overrides TextInput's alt-home regardless of binding order.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::TogglePresets, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 2));
+        cx.simulate_input("e");
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 0..0);
+            assert_eq!(view.preset_index, 1);
+        });
+        cx.simulate_keystrokes("ctrl-e");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 1..1);
+        });
+        cx.simulate_keystrokes("alt-home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.preset_index, 0);
+            assert_eq!(caret_range(&view.presets_search, window, cx), 1..1);
+        });
+
+        // Verify shortcut label formatting for cmd/home/end tokens.
+        assert_eq!(theme::format_shortcut("home"), "Home");
+        assert_eq!(theme::format_shortcut("end"), "End");
+        if cfg!(target_os = "macos") {
+            assert_eq!(theme::format_shortcut("cmd-left"), "⌘←");
+            assert_eq!(theme::format_shortcut("cmd-right"), "⌘→");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(theme::format_shortcut("cmd-left"), "Win+←");
+            assert_eq!(theme::format_shortcut("cmd-right"), "Win+→");
+        } else {
+            assert_eq!(theme::format_shortcut("cmd-left"), "Super+←");
+            assert_eq!(theme::format_shortcut("cmd-right"), "Super+→");
+        }
     }
 }

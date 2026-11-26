@@ -172,6 +172,16 @@
       "context": "Log"
     },
     {
+      "keys": "left",
+      "action": "scroll_left",
+      "context": "Log"
+    },
+    {
+      "keys": "right",
+      "action": "scroll_right",
+      "context": "Log"
+    },
+    {
       "keys": "b",
       "action": "next_bookmark",
       "context": "Log"
@@ -272,22 +282,17 @@
       "context": "Presets"
     },
     {
-      "keys": "home",
+      "keys": "secondary-up",
       "action": "first_line",
       "context": "Presets"
     },
     {
-      "keys": "end",
+      "keys": "secondary-down",
       "action": "last_line",
       "context": "Presets"
     },
     {
       "keys": "enter",
-      "action": "apply_preset",
-      "context": "Presets"
-    },
-    {
-      "keys": "space",
       "action": "apply_preset",
       "context": "Presets"
     },
@@ -330,6 +335,26 @@
       "keys": "escape",
       "action": "focus_log",
       "context": "FilePath"
+    },
+    {
+      "keys": "cmd-left",
+      "action": "move_to_line_start",
+      "context": "TextInput"
+    },
+    {
+      "keys": "cmd-right",
+      "action": "move_to_line_end",
+      "context": "TextInput"
+    },
+    {
+      "keys": "home",
+      "action": "move_to_line_start",
+      "context": "TextInput"
+    },
+    {
+      "keys": "end",
+      "action": "move_to_line_end",
+      "context": "TextInput"
     }
   ]
 }
