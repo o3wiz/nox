@@ -2155,9 +2155,15 @@ impl Workspace {
             | Command::PageUp
             | Command::PageDown => {
                 if self.path_input_focused(window, cx)
-                    && matches!(command, Command::NextLine | Command::PreviousLine)
+                    && matches!(
+                        command,
+                        Command::NextLine
+                            | Command::PreviousLine
+                            | Command::FirstLine
+                            | Command::LastLine
+                    )
                 {
-                    self.navigate_path_completions(command == Command::NextLine, cx);
+                    self.navigate_path_completions(command, cx);
                     return;
                 }
                 if self.show_presets
@@ -2936,14 +2942,16 @@ impl Workspace {
         cx.notify();
     }
 
-    fn navigate_path_completions(&mut self, forward: bool, cx: &mut Context<Self>) {
+    fn navigate_path_completions(&mut self, command: Command, cx: &mut Context<Self>) {
         if !self.show_path_completions {
             self.refresh_path_completions(true, cx);
             if !self.path_completions.items.is_empty() {
-                let idx = if forward {
-                    0
-                } else {
-                    self.path_completions.items.len() - 1
+                let idx = match command {
+                    Command::NextLine | Command::FirstLine => 0,
+                    Command::PreviousLine | Command::LastLine => {
+                        self.path_completions.items.len() - 1
+                    }
+                    _ => return,
                 };
                 self.path_completion_index = Some(idx);
                 self.path_completions_scroll.scroll_to_item(idx);
@@ -2956,11 +2964,15 @@ impl Workspace {
             self.path_completion_index = None;
             return;
         }
-        let next = match (self.path_completion_index, forward) {
-            (None, true) => 0,
-            (None, false) => len - 1,
-            (Some(i), true) => (i + 1) % len,
-            (Some(i), false) => (i + len - 1) % len,
+        let next = match (self.path_completion_index, command) {
+            (_, Command::FirstLine) => 0,
+            (_, Command::LastLine) => len - 1,
+            (None, Command::NextLine) => 0,
+            (None, Command::PreviousLine) => len - 1,
+            (Some(i), Command::NextLine) => (i + 1) % len,
+            (Some(i), Command::PreviousLine) => (i + len - 1) % len,
+            (Some(i), _) => i.min(len - 1),
+            (None, _) => return,
         };
         self.path_completion_index = Some(next);
         self.path_completions_scroll.scroll_to_item(next);
@@ -4965,7 +4977,7 @@ impl Workspace {
                     this.submit_file_path(true, window, cx);
                 } else if event.keystroke.key == "tab" && event.keystroke.modifiers.shift {
                     cx.stop_propagation();
-                    this.navigate_path_completions(false, cx);
+                    this.navigate_path_completions(Command::PreviousLine, cx);
                 }
             }))
             .child(
@@ -14016,5 +14028,358 @@ mod tests {
                 .range;
             assert_eq!(range, 5..5);
         });
+    }
+
+    #[gpui::test]
+    fn first_and_last_line_shortcuts_work_in_log_filter_presets_and_file_path_menus(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets.push(config::Preset {
+            name: "HTTP 5xx Errors".into(),
+            pattern: "HTTP 5\\d\\d".into(),
+            mode: SearchMode::Regex,
+            highlight_match: true,
+        });
+        config.search.presets.push(config::Preset {
+            name: "Auth Errors".into(),
+            pattern: "401|403".into(),
+            mode: SearchMode::Regex,
+            highlight_match: true,
+        });
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let alpha = root.join("alpha.log");
+        let beta = root.join("beta.log");
+        let gamma = root.join("gamma.log");
+        let zeta = root.join("zeta.log");
+        std::fs::write(
+            &alpha,
+            "match line 0\nplain line 1\nmatch line 2\nplain line 3\nmatch line 4\nmatch line 5\n",
+        )
+        .unwrap();
+        for file in [&beta, &gamma, &zeta] {
+            std::fs::write(file, "entry\n").unwrap();
+        }
+        let dir_prefix = ensure_trailing_separator(&root.display().to_string());
+
+        let (first_key, last_key, select_first_key, select_last_key, presets_key) =
+            if cfg!(target_os = "macos") {
+                (
+                    "cmd-up",
+                    "cmd-down",
+                    "cmd-shift-up",
+                    "cmd-shift-down",
+                    "cmd-p",
+                )
+            } else {
+                (
+                    "ctrl-up",
+                    "ctrl-down",
+                    "ctrl-shift-up",
+                    "ctrl-shift-down",
+                    "ctrl-p",
+                )
+            };
+
+        let (view, cx) = cx
+            .add_window_view(|window, cx| Workspace::new(config, vec![alpha.clone()], window, cx));
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // 1. Main log pane (`Log`): secondary-up/down jump to first/last line,
+        //    secondary-shift-up/down extend selection to first/last line (including reversal).
+        view.update(cx, |view, cx| {
+            view.tabs[0].selected = 2;
+            view.tabs[0].main_selection = LineSelection::single(2);
+            view.tabs[0].follow = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 5);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(5, 5)]);
+            assert!(!view.tabs[0].follow);
+        });
+
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 0);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(0, 0)]);
+        });
+
+        cx.simulate_keystrokes("down down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(select_last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 5);
+            assert_eq!(view.tabs[0].main_selection.anchor, 2);
+            assert_eq!(view.tabs[0].main_selection.cursor, 5);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(2, 5)]);
+        });
+
+        cx.simulate_keystrokes(select_first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 0);
+            assert_eq!(view.tabs[0].main_selection.anchor, 2);
+            assert_eq!(view.tabs[0].main_selection.cursor, 0);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(0, 2)]);
+        });
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 5);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(5, 5)]);
+        });
+
+        // Existing home/end and shift-home/shift-end remain intact in Log.
+        cx.simulate_keystrokes("home down shift-end");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(1, 5)]);
+        });
+        cx.simulate_keystrokes("shift-home");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(0, 1)]);
+        });
+
+        // 2. Filter results pane (`Log` / `FilterLog`): secondary-up/down and
+        //    secondary-shift-up/down navigate and extend selection within visible results.
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].results = SearchResults {
+                matches: vec![0, 2, 4, 5],
+                visible: vec![0, 2, 4, 5],
+                ..SearchResults::default()
+            };
+            view.tabs[0].result_selection = LineSelection::single(1);
+            view.focus_pane(Pane::Results, window, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(3, 3)]);
+            assert_eq!(view.tabs[0].result_selection.cursor, 3);
+            assert_eq!(view.tabs[0].selected, 5);
+        });
+
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(0, 0)]);
+            assert_eq!(view.tabs[0].result_selection.cursor, 0);
+            assert_eq!(view.tabs[0].selected, 0);
+        });
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(select_last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.anchor, 1);
+            assert_eq!(view.tabs[0].result_selection.cursor, 3);
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(1, 3)]);
+            assert_eq!(view.tabs[0].selected, 5);
+        });
+
+        cx.simulate_keystrokes(select_first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.anchor, 1);
+            assert_eq!(view.tabs[0].result_selection.cursor, 0);
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(0, 1)]);
+            assert_eq!(view.tabs[0].selected, 0);
+        });
+
+        // Return focus to main pane at line 2 before testing menus.
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].selected = 2;
+            view.tabs[0].main_selection = LineSelection::single(2);
+            view.focus_pane(Pane::Main, window, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // 3. Saved patterns menu (`Presets`): secondary-up/down jump to first/last preset
+        //    (both unfiltered and filtered) without moving log selection or mutating filter text.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_presets);
+            assert_eq!(view.filtered_presets.len(), 5);
+            assert_eq!(view.preset_index, 0);
+        });
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.preset_index, 4);
+            assert_eq!(view.tabs[0].selected, 2);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(2, 2)]);
+        });
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.preset_index, 0);
+            assert_eq!(view.tabs[0].selected, 2);
+        });
+
+        cx.simulate_input("err");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.filtered_presets.len(), 3);
+            assert_eq!(view.preset_index, 0);
+        });
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.preset_index, 2);
+            assert_eq!(view.presets_search.read(cx).as_str(), "err");
+            assert_eq!(view.tabs[0].selected, 2);
+        });
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.preset_index, 0);
+            assert_eq!(view.presets_search.read(cx).as_str(), "err");
+        });
+        // Log-only select-to-first/last shortcuts do not leak into the Log pane while in Presets.
+        cx.simulate_keystrokes(select_last_key);
+        cx.simulate_keystrokes(select_first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(2, 2)]);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 4. File path input & completions menu (`FilePath`): secondary-up/down jump to
+        //    first/last completion (opening the menu if closed) without touching log selection.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&dir_prefix);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completions.items.len(), 4);
+            assert_eq!(view.path_completion_index, None);
+        });
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(3));
+            assert_eq!(view.path_completions.items[3].label, "zeta.log");
+            assert_eq!(view.tabs[0].selected, 2);
+        });
+        // Repeating last_key stays clamped at the last item (does not wrap).
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(3));
+        });
+
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(0));
+            assert_eq!(view.path_completions.items[0].label, "alpha.log");
+        });
+        // Repeating first_key stays clamped at the first item (does not wrap).
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(0));
+        });
+
+        // With completions dismissed (first Escape), last_key/first_key re-open and jump directly.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.path_input_focused(window, cx));
+            assert!(!view.show_path_completions);
+        });
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completion_index, Some(3));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completion_index, Some(0));
+        });
+
+        // Log-only select-to-first/last shortcuts do not leak into the Log pane while in FilePath.
+        cx.simulate_keystrokes(select_last_key);
+        cx.simulate_keystrokes(select_first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(2, 2)]);
+        });
+
+        // Jumping to last completion and pressing Enter opens zeta.log.
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].path, zeta);
+            assert!(!view.show_path_completions);
+        });
+
+        // With no matching completions, first/last shortcuts are safe no-ops.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&format!("{dir_prefix}does_not_exist_"));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(last_key);
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_path_completions);
+            assert_eq!(view.path_completion_index, None);
+        });
+
+        // 5. Shortcut label formatting matches platform conventions.
+        if cfg!(target_os = "macos") {
+            assert_eq!(theme::format_shortcut("secondary-up"), "⌘↑");
+            assert_eq!(theme::format_shortcut("secondary-down"), "⌘↓");
+            assert_eq!(theme::format_shortcut("secondary-shift-up"), "⌘⇧↑");
+            assert_eq!(theme::format_shortcut("secondary-shift-down"), "⌘⇧↓");
+        } else {
+            assert_eq!(theme::format_shortcut("secondary-up"), "Ctrl+↑");
+            assert_eq!(theme::format_shortcut("secondary-down"), "Ctrl+↓");
+            assert_eq!(theme::format_shortcut("secondary-shift-up"), "Ctrl+Shift+↑");
+            assert_eq!(
+                theme::format_shortcut("secondary-shift-down"),
+                "Ctrl+Shift+↓"
+            );
+        }
     }
 }

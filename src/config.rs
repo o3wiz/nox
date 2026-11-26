@@ -4,7 +4,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -665,11 +665,29 @@ fn merge_missing_keyboard_bindings(existing: &mut Value, defaults: &Value) -> us
         return 0;
     };
 
-    // Snapshot originally configured `(context, action)` pairs so that multiple default
-    // bindings for the same `(context, action)` (such as FilePath `shift-tab` and `up`
-    // for `previous_line`) are all added when that action is not yet configured in that
-    // context, while never colliding with any already-used `(context, keys)` slot.
-    let mut existing_actions = HashSet::new();
+    // Index built-in default keys per `(context, action)` so an untouched subset of older
+    // defaults (e.g. `Log` having `home`/`end` before `secondary-up`/`secondary-down` were
+    // added) receives newly introduced companion shortcuts, while any user-customized
+    // `(context, action)` rebinding is preserved untouched and no `(context, keys)` slot collides.
+    let mut default_action_keys: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for default_binding in default_bindings {
+        let Some(obj) = default_binding.as_object() else {
+            continue;
+        };
+        let (Some(context), Some(action), Some(keys)) = (
+            obj.get("context").and_then(Value::as_str),
+            obj.get("action").and_then(Value::as_str),
+            obj.get("keys").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        default_action_keys
+            .entry((context.to_string(), action.to_string()))
+            .or_default()
+            .insert(normalize_key_sequence(keys));
+    }
+
+    let mut customized_actions = HashSet::new();
     let mut used_keys = HashSet::new();
     for binding in existing_bindings.iter() {
         let Some(obj) = binding.as_object() else {
@@ -678,11 +696,23 @@ fn merge_missing_keyboard_bindings(existing: &mut Value, defaults: &Value) -> us
         let Some(context) = obj.get("context").and_then(Value::as_str) else {
             continue;
         };
-        if let Some(action) = obj.get("action").and_then(Value::as_str) {
-            existing_actions.insert((context.to_string(), action.to_string()));
+        let normalized_keys = obj
+            .get("keys")
+            .and_then(Value::as_str)
+            .map(normalize_key_sequence);
+        if let Some(ref keys) = normalized_keys {
+            used_keys.insert((context.to_string(), keys.clone()));
         }
-        if let Some(keys) = obj.get("keys").and_then(Value::as_str) {
-            used_keys.insert((context.to_string(), normalize_key_sequence(keys)));
+        if let Some(action) = obj.get("action").and_then(Value::as_str) {
+            let action_slot = (context.to_string(), action.to_string());
+            let is_default_key = normalized_keys.as_ref().is_some_and(|keys| {
+                default_action_keys
+                    .get(&action_slot)
+                    .is_some_and(|default_keys| default_keys.contains(keys))
+            });
+            if !is_default_key {
+                customized_actions.insert(action_slot);
+            }
         }
     }
 
@@ -700,7 +730,7 @@ fn merge_missing_keyboard_bindings(existing: &mut Value, defaults: &Value) -> us
         };
         let action_slot = (context.to_string(), action.to_string());
         let key_slot = (context.to_string(), normalize_key_sequence(keys));
-        if existing_actions.contains(&action_slot) || used_keys.contains(&key_slot) {
+        if customized_actions.contains(&action_slot) || used_keys.contains(&key_slot) {
             continue;
         }
         existing_bindings.push(default_binding.clone());

@@ -1091,3 +1091,146 @@ fn text_editing_line_selection_and_deletion_config_defaults_and_migration() {
         Command::DeleteToLineStart
     ));
 }
+
+#[test]
+fn first_and_last_line_shortcuts_defaults_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    // Log supports both home/end and secondary-up/down for first/last line and selection extension.
+    for (keys, action) in [
+        ("home", Command::FirstLine),
+        ("secondary-up", Command::FirstLine),
+        ("end", Command::LastLine),
+        ("secondary-down", Command::LastLine),
+        ("shift-home", Command::SelectFirstLine),
+        ("secondary-shift-up", Command::SelectFirstLine),
+        ("shift-end", Command::SelectLastLine),
+        ("secondary-shift-down", Command::SelectLastLine),
+    ] {
+        assert!(
+            has_binding(&defaults, keys, KeyContext::Log, action),
+            "missing Log default binding {keys} -> {action:?}"
+        );
+    }
+
+    // Presets and FilePath menus both support secondary-up/down for first/last line.
+    for context in [KeyContext::Presets, KeyContext::FilePath] {
+        assert!(has_binding(
+            &defaults,
+            "secondary-up",
+            context,
+            Command::FirstLine
+        ));
+        assert!(has_binding(
+            &defaults,
+            "secondary-down",
+            context,
+            Command::LastLine
+        ));
+    }
+
+    // Migrating an older keyboard.json with default home/end Log bindings and basic FilePath
+    // bindings adds the newly introduced secondary-up/down and secondary-shift-up/down defaults.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "home", "context": "Log", "action": "first_line" },
+    { "keys": "end", "context": "Log", "action": "last_line" },
+    { "keys": "shift-home", "context": "Log", "action": "select_first_line" },
+    { "keys": "shift-end", "context": "Log", "action": "select_last_line" },
+    { "keys": "up", "context": "FilePath", "action": "previous_line" },
+    { "keys": "down", "context": "FilePath", "action": "next_line" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    for (keys, context, action) in [
+        ("home", KeyContext::Log, Command::FirstLine),
+        ("secondary-up", KeyContext::Log, Command::FirstLine),
+        ("end", KeyContext::Log, Command::LastLine),
+        ("secondary-down", KeyContext::Log, Command::LastLine),
+        ("shift-home", KeyContext::Log, Command::SelectFirstLine),
+        (
+            "secondary-shift-up",
+            KeyContext::Log,
+            Command::SelectFirstLine,
+        ),
+        ("shift-end", KeyContext::Log, Command::SelectLastLine),
+        (
+            "secondary-shift-down",
+            KeyContext::Log,
+            Command::SelectLastLine,
+        ),
+        ("secondary-up", KeyContext::Presets, Command::FirstLine),
+        ("secondary-down", KeyContext::Presets, Command::LastLine),
+        ("secondary-up", KeyContext::FilePath, Command::FirstLine),
+        ("secondary-down", KeyContext::FilePath, Command::LastLine),
+    ] {
+        assert!(
+            has_binding(&upgraded, keys, context, action),
+            "migrated config missing {keys} in {context:?} -> {action:?}"
+        );
+    }
+    let second = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert_eq!(second.added_bindings, 0);
+
+    // Custom rebindings and conflicting key slots remain respected during migration.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "g", "context": "Log", "action": "first_line" },
+    { "keys": "secondary-down", "context": "FilePath", "action": "next_line" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "g",
+        KeyContext::Log,
+        Command::FirstLine
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-up",
+        KeyContext::Log,
+        Command::FirstLine
+    ));
+    assert!(has_binding(
+        &custom_migrated,
+        "secondary-down",
+        KeyContext::FilePath,
+        Command::NextLine
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-down",
+        KeyContext::FilePath,
+        Command::LastLine
+    ));
+    assert!(has_binding(
+        &custom_migrated,
+        "secondary-up",
+        KeyContext::FilePath,
+        Command::FirstLine
+    ));
+}

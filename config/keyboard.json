@@ -162,7 +162,17 @@
       "context": "Log"
     },
     {
+      "keys": "secondary-up",
+      "action": "first_line",
+      "context": "Log"
+    },
+    {
       "keys": "end",
+      "action": "last_line",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-down",
       "action": "last_line",
       "context": "Log"
     },
@@ -217,7 +227,17 @@
       "context": "Log"
     },
     {
+      "keys": "secondary-shift-up",
+      "action": "select_first_line",
+      "context": "Log"
+    },
+    {
       "keys": "shift-end",
+      "action": "select_last_line",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-shift-down",
       "action": "select_last_line",
       "context": "Log"
     },
@@ -334,6 +354,16 @@
     {
       "keys": "up",
       "action": "previous_line",
+      "context": "FilePath"
+    },
+    {
+      "keys": "secondary-up",
+      "action": "first_line",
+      "context": "FilePath"
+    },
+    {
+      "keys": "secondary-down",
+      "action": "last_line",
       "context": "FilePath"
     },
     {
