@@ -893,3 +893,154 @@ fn migrate_config_rejects_missing_dir_and_corrupt_json_without_partial_writes() 
         original_window
     );
 }
+
+#[test]
+fn text_editing_line_selection_and_deletion_config_defaults_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    // Existing move bindings remain intact.
+    assert!(has_binding(
+        &defaults,
+        "cmd-left",
+        KeyContext::TextInput,
+        Command::MoveToLineStart
+    ));
+    assert!(has_binding(
+        &defaults,
+        "cmd-right",
+        KeyContext::TextInput,
+        Command::MoveToLineEnd
+    ));
+    assert!(has_binding(
+        &defaults,
+        "home",
+        KeyContext::TextInput,
+        Command::MoveToLineStart
+    ));
+    assert!(has_binding(
+        &defaults,
+        "end",
+        KeyContext::TextInput,
+        Command::MoveToLineEnd
+    ));
+
+    // New default select-to-line bindings exist in TextInput (and not shift-home/shift-end).
+    assert!(has_binding(
+        &defaults,
+        "cmd-shift-left",
+        KeyContext::TextInput,
+        Command::SelectToLineStart
+    ));
+    assert!(has_binding(
+        &defaults,
+        "shift-up",
+        KeyContext::TextInput,
+        Command::SelectToLineStart
+    ));
+    assert!(has_binding(
+        &defaults,
+        "cmd-shift-right",
+        KeyContext::TextInput,
+        Command::SelectToLineEnd
+    ));
+    assert!(has_binding(
+        &defaults,
+        "shift-down",
+        KeyContext::TextInput,
+        Command::SelectToLineEnd
+    ));
+    assert!(!defaults.keyboard.bindings.iter().any(|b| {
+        b.context == KeyContext::TextInput && matches!(b.keys.as_str(), "shift-home" | "shift-end")
+    }));
+
+    // Delete-to-line actions have no default shortcuts assigned in keyboard.json.
+    assert!(!defaults.keyboard.bindings.iter().any(|b| {
+        matches!(
+            b.action,
+            Command::DeleteToLineStart | Command::DeleteToLineEnd
+        )
+    }));
+
+    // Custom keyboard.json can configure delete_to_line_start / delete_to_line_end and custom select bindings.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "bindings": [
+    { "keys": "ctrl-u", "context": "TextInput", "action": "delete_to_line_start" },
+    { "keys": "alt-k", "context": "TextInput", "action": "delete_to_line_end" },
+    { "keys": "shift-home", "context": "TextInput", "action": "select_to_line_start" },
+    { "keys": "shift-end", "context": "TextInput", "action": "select_to_line_end" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let custom = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom,
+        "ctrl-u",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(has_binding(
+        &custom,
+        "alt-k",
+        KeyContext::TextInput,
+        Command::DeleteToLineEnd
+    ));
+
+    // Migration adds missing select_to_line_* defaults without adding delete_to_line_* shortcuts.
+    let migrate_dir = tempdir().unwrap();
+    fs::write(
+        migrate_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "cmd-left", "context": "TextInput", "action": "move_to_line_start" },
+    { "keys": "cmd-right", "context": "TextInput", "action": "move_to_line_end" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(migrate_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let migrated = Config::load(Some(migrate_dir.path())).unwrap();
+    assert!(has_binding(
+        &migrated,
+        "cmd-shift-left",
+        KeyContext::TextInput,
+        Command::SelectToLineStart
+    ));
+    assert!(has_binding(
+        &migrated,
+        "shift-up",
+        KeyContext::TextInput,
+        Command::SelectToLineStart
+    ));
+    assert!(has_binding(
+        &migrated,
+        "cmd-shift-right",
+        KeyContext::TextInput,
+        Command::SelectToLineEnd
+    ));
+    assert!(has_binding(
+        &migrated,
+        "shift-down",
+        KeyContext::TextInput,
+        Command::SelectToLineEnd
+    ));
+    assert!(!migrated.keyboard.bindings.iter().any(|b| {
+        matches!(
+            b.action,
+            Command::DeleteToLineStart | Command::DeleteToLineEnd
+        )
+    }));
+}

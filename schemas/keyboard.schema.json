@@ -114,7 +114,11 @@
         "zoom_out",
         "zoom_reset",
         "move_to_line_start",
-        "move_to_line_end"
+        "move_to_line_end",
+        "select_to_line_start",
+        "select_to_line_end",
+        "delete_to_line_start",
+        "delete_to_line_end"
       ]
     }
   }

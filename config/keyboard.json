@@ -360,6 +360,26 @@
       "keys": "end",
       "action": "move_to_line_end",
       "context": "TextInput"
+    },
+    {
+      "keys": "cmd-shift-left",
+      "action": "select_to_line_start",
+      "context": "TextInput"
+    },
+    {
+      "keys": "cmd-shift-right",
+      "action": "select_to_line_end",
+      "context": "TextInput"
+    },
+    {
+      "keys": "shift-up",
+      "action": "select_to_line_start",
+      "context": "TextInput"
+    },
+    {
+      "keys": "shift-down",
+      "action": "select_to_line_end",
+      "context": "TextInput"
     }
   ]
 }

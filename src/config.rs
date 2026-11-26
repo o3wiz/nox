@@ -199,6 +199,10 @@ pub enum Command {
     ZoomReset,
     MoveToLineStart,
     MoveToLineEnd,
+    SelectToLineStart,
+    SelectToLineEnd,
+    DeleteToLineStart,
+    DeleteToLineEnd,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 pub enum KeyContext {
