@@ -23,6 +23,8 @@ Download the latest release package for your platform from [GitHub Releases](htt
 - **Linux (`x86_64`)**: Extract `nox-v<version>-x86_64-unknown-linux-gnu.tar.gz`, copy `nox` onto your `PATH` (e.g. `~/.local/bin/nox`), and optionally install `nox.desktop` into `~/.local/share/applications/` and `nox.svg` into `~/.local/share/icons/hicolor/scalable/apps/`.
 - **Windows (`x86_64`)**: Extract `nox-v<version>-x86_64-pc-windows-msvc.zip` and run `nox.exe` (or add its folder to `PATH`).
 
+When upgrading an existing installation with a custom configuration directory, run `nox --migrate-config` (or `nox --migrate-config DIR`) to add newly introduced files, fields, and default keybindings and refresh `schemas/` without removing any existing or deprecated fields. `make install-macos` runs this migration step automatically.
+
 ### Build from source
 
 Requires Rust `1.95+` (edition 2024) and the native build prerequisites for [GPUI CE](https://github.com/gpui-ce/gpui-ce/blob/main/SETUP.md):
@@ -104,6 +106,10 @@ Configuration is grouped by responsibility. The checked-in files in `config/` ar
 cargo run -- --version
 # Create editable defaults and local JSON schemas in a NEW directory.
 cargo run -- --init-config ./my-config
+# Migrate an existing configuration directory (adds missing files/fields/keybindings and updates schemas).
+cargo run -- --migrate-config ./my-config
+# Or migrate the default directory ($NOX_CONFIG_DIR, ~/.config/nox, or %APPDATA%/nox) if it exists.
+cargo run -- --migrate-config
 # Use that configuration.
 cargo run -- --config-dir ./my-config fixtures/demo.log
 # Validate without opening a window.
@@ -114,7 +120,7 @@ cargo run -- --write-schemas schemas
 
 `--config-dir` takes precedence over `NOX_CONFIG_DIR`. Without either, Nox uses embedded defaults. To edit and run the repository defaults directly, use `--config-dir config`. Restart Nox after editing configuration.
 
-Files and individual fields may be omitted. Objects overlay defaults; arrays replace the entire default array. Unknown fields, invalid types, out-of-range values, invalid colors/regexes, duplicate bindings in one context, and invalid key sequences produce an error. Explicitly selecting a nonexistent directory also produces an error. `--init-config` refuses to overwrite existing configuration files.
+Files and individual fields may be omitted. Objects overlay defaults; arrays replace the entire default array. Unknown fields, invalid types, out-of-range values, invalid colors/regexes, duplicate bindings in one context, and invalid key sequences produce an error. Explicitly selecting a nonexistent directory also produces an error. `--init-config` refuses to overwrite existing configuration files. `--migrate-config` updates an existing configuration directory non-destructively: it creates missing section files, adds missing object fields (including defaulted fields on existing `search.json` presets), appends missing default `keyboard.json` bindings whose `(context, action)` and `(context, keys)` are not already configured, refreshes all `schemas/*.schema.json` files, and never deletes existing or deprecated fields.
 
 | File | Settings |
 | --- | --- |
@@ -193,7 +199,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Core tests cover indexing, CRLF/UTF-8 handling, file replacement/truncation, search modes/context/limits/cancellation, safe export, configuration overlays/validation, and session persistence. UI regression tests exercise keyboard focus, text/line selection, zooming, path completion, and binding validation. CLI integration tests verify `--help`, `--version`, `--init-config`, `--write-schemas`, and `--check-config`.
+Core tests cover indexing, CRLF/UTF-8 handling, file replacement/truncation, search modes/context/limits/cancellation, safe export, configuration overlays/migration/validation, and session persistence. UI regression tests exercise keyboard focus, text/line selection, zooming, path completion, and binding validation. CLI integration tests verify `--help`, `--version`, `--init-config`, `--migrate-config`, `--write-schemas`, and `--check-config`.
 
 ### Building local deliverables
 
@@ -201,7 +207,7 @@ Core tests cover indexing, CRLF/UTF-8 handling, file replacement/truncation, sea
 # macOS: build Nox.app, drag-to-Applications .dmg, .app.zip, CLI .tar.gz, and SHA256SUMS.txt in dist/
 make package-macos
 
-# macOS: build and install directly to /Applications/Nox.app
+# macOS: build and install directly to /Applications/Nox.app (and migrate existing config if present)
 make install-macos
 
 # Linux: build release .tar.gz with desktop entry, icon, and SHA256SUMS.txt in dist/

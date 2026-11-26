@@ -561,3 +561,332 @@ fn committed_schemas_match_the_rust_types() {
         );
     }
 }
+
+#[test]
+fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates_schemas() {
+    let dir = tempdir().unwrap();
+
+    // Partial window.json without `$schema` and with a deprecated field.
+    fs::write(
+        dir.path().join("window.json"),
+        r#"{
+  "width": 1600,
+  "legacy_opacity": 0.85
+}
+"#,
+    )
+    .unwrap();
+
+    // Partial appearance.json missing newer color/selection fields and keeping a deprecated field.
+    fs::write(
+        dir.path().join("appearance.json"),
+        r##"{
+  "$schema": "schemas/appearance.schema.json",
+  "accent": "#FF00FF",
+  "old_theme": "solarized"
+}
+"##,
+    )
+    .unwrap();
+
+    // Partial viewer.json missing newer fields.
+    fs::write(
+        dir.path().join("viewer.json"),
+        r#"{
+  "$schema": "schemas/viewer.schema.json",
+  "tab_width": 8
+}
+"#,
+    )
+    .unwrap();
+
+    // Partial search.json with custom presets: one missing `highlight_match` + deprecated key,
+    // one explicitly disabling `highlight_match`.
+    fs::write(
+        dir.path().join("search.json"),
+        r#"{
+  "$schema": "schemas/search.schema.json",
+  "mode": "literal",
+  "presets": [
+    {
+      "name": "Custom",
+      "pattern": "timeout",
+      "mode": "literal",
+      "deprecated_priority": 3
+    },
+    {
+      "name": "NoHighlight",
+      "pattern": "debug",
+      "mode": "regex",
+      "highlight_match": false
+    }
+  ]
+}
+"#,
+    )
+    .unwrap();
+
+    // Partial keyboard.json with:
+    // - customized key for `open` (default `secondary-o` must NOT be re-added),
+    // - conflicting key `secondary-=` bound to `next_tab` (default `zoom_in` must NOT collide),
+    // - a deprecated binding with an extra field (must be preserved verbatim),
+    // - missing `zoom_out`, `zoom_reset`, and all `FilePath` bindings (including both
+    //   `shift-tab` and `up` for `previous_line`).
+    fs::write(
+        dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    {
+      "keys": "ctrl-alt-o",
+      "context": "Workspace",
+      "action": "open"
+    },
+    {
+      "keys": "secondary-=",
+      "context": "Workspace",
+      "action": "next_tab"
+    },
+    {
+      "keys": "ctrl-shift-z",
+      "context": "Log",
+      "action": "legacy_action",
+      "deprecated_note": "keep"
+    }
+  ]
+}
+"#,
+    )
+    .unwrap();
+
+    // Omit `highlighting.json` and `files.json` so migration creates them.
+    // Seed an outdated schema and an unrelated file that must stay untouched.
+    fs::create_dir_all(dir.path().join("schemas")).unwrap();
+    fs::write(
+        dir.path().join("schemas/window.schema.json"),
+        r#"{"outdated":true}"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("notes.txt"), "keep me\n").unwrap();
+
+    let report = config::migrate_config(dir.path()).unwrap();
+    assert_eq!(
+        report.created_files,
+        vec!["highlighting.json".to_string(), "files.json".to_string()]
+    );
+    assert_eq!(
+        report.updated_files,
+        vec![
+            "window.json".to_string(),
+            "appearance.json".to_string(),
+            "viewer.json".to_string(),
+            "search.json".to_string(),
+            "keyboard.json".to_string(),
+        ]
+    );
+    assert!(report.added_fields > 0);
+    assert!(report.added_bindings > 0);
+    assert_eq!(report.schemas_updated, config::DEFAULTS.len() + 1);
+
+    // Check window.json: `$schema` inserted first, existing + deprecated fields kept, missing added.
+    let window: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("window.json")).unwrap()).unwrap();
+    let window_obj = window.as_object().unwrap();
+    assert_eq!(
+        window_obj.keys().next().map(String::as_str),
+        Some("$schema")
+    );
+    assert_eq!(window["$schema"], "schemas/window.schema.json");
+    assert_eq!(window["width"], 1600);
+    assert_eq!(window["legacy_opacity"], 0.85);
+    assert_eq!(window["height"], 850);
+    assert_eq!(window["maximized"], false);
+    assert_eq!(window["results_height"], 250);
+    assert_eq!(window["show_status_bar"], true);
+
+    // Check appearance.json: custom + deprecated preserved, newer fields added.
+    let appearance: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("appearance.json")).unwrap())
+            .unwrap();
+    assert_eq!(appearance["accent"], "#FF00FF");
+    assert_eq!(appearance["old_theme"], "solarized");
+    assert_eq!(appearance["text_selection_color"], "#38BDF8");
+    assert_eq!(appearance["text_selection_opacity"], 0.35);
+    assert_eq!(appearance["match_foreground"], "#0B1016");
+    assert_eq!(appearance["match_background"], "#E0AF4B");
+
+    // Check viewer.json.
+    let viewer: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("viewer.json")).unwrap()).unwrap();
+    assert_eq!(viewer["tab_width"], 8);
+    assert_eq!(viewer["cursor_surrounding_lines"], 0);
+    assert_eq!(viewer["overview_width"], 16);
+
+    // Check search.json: user presets preserved, missing preset field defaulted, deprecated kept.
+    let search: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("search.json")).unwrap()).unwrap();
+    assert_eq!(search["mode"], "literal");
+    assert_eq!(search["highlight_matches"], true);
+    let presets = search["presets"].as_array().unwrap();
+    assert_eq!(presets.len(), 2);
+    assert_eq!(presets[0]["name"], "Custom");
+    assert_eq!(presets[0]["highlight_match"], true);
+    assert_eq!(presets[0]["deprecated_priority"], 3);
+    assert_eq!(presets[1]["name"], "NoHighlight");
+    assert_eq!(presets[1]["highlight_match"], false);
+
+    // Check keyboard.json: custom & deprecated preserved, conflicts skipped, missing added.
+    let keyboard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("keyboard.json")).unwrap())
+            .unwrap();
+    let bindings = keyboard["bindings"].as_array().unwrap();
+    assert!(bindings.iter().any(|b| {
+        b["keys"] == "ctrl-alt-o" && b["context"] == "Workspace" && b["action"] == "open"
+    }));
+    assert!(!bindings.iter().any(|b| {
+        b["keys"] == "secondary-o" && b["context"] == "Workspace" && b["action"] == "open"
+    }));
+    assert!(bindings.iter().any(|b| {
+        b["keys"] == "secondary-=" && b["context"] == "Workspace" && b["action"] == "next_tab"
+    }));
+    assert!(!bindings.iter().any(|b| {
+        b["keys"] == "secondary-=" && b["context"] == "Workspace" && b["action"] == "zoom_in"
+    }));
+    assert!(bindings.iter().any(|b| {
+        b["keys"] == "ctrl-shift-z"
+            && b["context"] == "Log"
+            && b["action"] == "legacy_action"
+            && b["deprecated_note"] == "keep"
+    }));
+    assert!(bindings.iter().any(|b| {
+        b["keys"] == "secondary--" && b["context"] == "Workspace" && b["action"] == "zoom_out"
+    }));
+    assert!(bindings.iter().any(|b| {
+        b["keys"] == "shift-tab" && b["context"] == "FilePath" && b["action"] == "previous_line"
+    }));
+    assert!(bindings.iter().any(|b| {
+        b["keys"] == "up" && b["context"] == "FilePath" && b["action"] == "previous_line"
+    }));
+
+    // Created missing files should point to local `schemas/`.
+    let files_cfg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("files.json")).unwrap()).unwrap();
+    assert_eq!(files_cfg["$schema"], "schemas/files.schema.json");
+    let highlighting: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("highlighting.json")).unwrap())
+            .unwrap();
+    assert_eq!(highlighting["$schema"], "schemas/highlighting.schema.json");
+
+    // Schemas should all be refreshed and match fresh schema generation.
+    let fresh_schemas = tempdir().unwrap();
+    config::write_schemas(fresh_schemas.path()).unwrap();
+    for entry in fs::read_dir(fresh_schemas.path()).unwrap() {
+        let entry = entry.unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap();
+        let migrated: serde_json::Value = serde_json::from_slice(
+            &fs::read(dir.path().join("schemas").join(entry.file_name())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(migrated, expected);
+    }
+
+    // Unrelated user files are preserved.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "keep me\n"
+    );
+
+    // Re-running migration is idempotent (no further file or field changes).
+    let second = config::migrate_config(dir.path()).unwrap();
+    assert!(!second.has_config_changes());
+    assert!(second.created_files.is_empty());
+    assert!(second.updated_files.is_empty());
+    assert_eq!(second.added_fields, 0);
+    assert_eq!(second.added_bindings, 0);
+    assert_eq!(second.schemas_updated, config::DEFAULTS.len() + 1);
+}
+
+#[test]
+fn migrate_config_preserves_deprecated_fields_while_load_remains_strict() {
+    let dir = tempdir().unwrap();
+    config::write_defaults(dir.path()).unwrap();
+
+    // Remove one current field and add a deprecated field.
+    let window_path = dir.path().join("window.json");
+    let mut window: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&window_path).unwrap()).unwrap();
+    window.as_object_mut().unwrap().remove("show_status_bar");
+    window
+        .as_object_mut()
+        .unwrap()
+        .insert("deprecated_flag".into(), serde_json::json!(true));
+    fs::write(&window_path, serde_json::to_string_pretty(&window).unwrap()).unwrap();
+
+    let report = config::migrate_config(dir.path()).unwrap();
+    assert_eq!(report.updated_files, vec!["window.json".to_string()]);
+    assert_eq!(report.added_fields, 1);
+
+    let migrated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&window_path).unwrap()).unwrap();
+    assert_eq!(migrated["show_status_bar"], true);
+    assert_eq!(migrated["deprecated_flag"], true);
+
+    // Runtime loading keeps strict `deny_unknown_fields` validation.
+    assert!(Config::load(Some(dir.path())).is_err());
+
+    // Once the user removes the deprecated key, the migrated configuration loads cleanly.
+    let mut cleaned = migrated;
+    cleaned.as_object_mut().unwrap().remove("deprecated_flag");
+    fs::write(
+        &window_path,
+        serde_json::to_string_pretty(&cleaned).unwrap(),
+    )
+    .unwrap();
+    let loaded = Config::load(Some(dir.path())).unwrap();
+    assert!(loaded.window.show_status_bar);
+}
+
+#[test]
+fn migrate_config_rejects_missing_dir_and_corrupt_json_without_partial_writes() {
+    let dir = tempdir().unwrap();
+
+    // Nonexistent directory fails.
+    assert!(config::migrate_config(&dir.path().join("missing")).is_err());
+
+    // Regular file instead of directory fails.
+    let file_path = dir.path().join("not-a-dir");
+    fs::write(&file_path, "{}").unwrap();
+    assert!(config::migrate_config(&file_path).is_err());
+
+    // Corrupt JSON in one file prevents modifying any earlier files or creating missing ones.
+    let broken_dir = dir.path().join("broken");
+    fs::create_dir_all(&broken_dir).unwrap();
+    let original_window = r#"{"width":1500}"#;
+    fs::write(broken_dir.join("window.json"), original_window).unwrap();
+    fs::write(broken_dir.join("viewer.json"), "{ invalid").unwrap();
+    assert!(config::migrate_config(&broken_dir).is_err());
+    assert_eq!(
+        fs::read_to_string(broken_dir.join("window.json")).unwrap(),
+        original_window
+    );
+    assert!(!broken_dir.join("files.json").exists());
+    assert!(!broken_dir.join("schemas").exists());
+
+    // Non-object root JSON also fails without partial writes.
+    fs::write(broken_dir.join("viewer.json"), "[]").unwrap();
+    assert!(config::migrate_config(&broken_dir).is_err());
+    assert_eq!(
+        fs::read_to_string(broken_dir.join("window.json")).unwrap(),
+        original_window
+    );
+
+    // A regular file occupying `schemas` also fails cleanly before touching config files.
+    fs::remove_file(broken_dir.join("viewer.json")).unwrap();
+    fs::write(broken_dir.join("schemas"), "not a directory").unwrap();
+    assert!(config::migrate_config(&broken_dir).is_err());
+    assert_eq!(
+        fs::read_to_string(broken_dir.join("window.json")).unwrap(),
+        original_window
+    );
+}
