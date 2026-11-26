@@ -3,6 +3,7 @@ mod icons;
 mod resize;
 mod scrollbar;
 mod selectable_text;
+mod sticky_row;
 mod theme;
 
 use components::{
@@ -59,6 +60,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use sticky_row::StickyRowContent;
 use theme::{ICON_HERO, ICON_MD, ICON_SM, ICON_XS, Theme};
 
 #[derive(Clone, PartialEq, Deserialize, schemars::JsonSchema, Action)]
@@ -2134,6 +2136,40 @@ impl Workspace {
         }
     }
 
+    fn reset_horizontal_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.active_pane_for(window);
+        self.active_pane = pane;
+        let (min_h, max_h) = self.results_height_bounds(window);
+        let eff = self.results_height.clamp(min_h, max_h);
+        if (pane == Pane::Main && is_main_hidden(eff, max_h))
+            || (pane == Pane::Results && is_results_hidden(eff))
+        {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let handle = match pane {
+            Pane::Main => {
+                if tab.log.as_ref().is_none_or(|log| log.is_empty()) {
+                    return;
+                }
+                &tab.scroll
+            }
+            Pane::Results => {
+                if tab.results.visible.is_empty() {
+                    return;
+                }
+                &tab.result_scroll
+            }
+        };
+        let current_x = f32::from(handle.0.borrow().base_handle.offset().x);
+        if current_x.abs() > 0.01 {
+            set_uniform_list_axis_offset(handle, ScrollAxis::Horizontal, 0.0);
+            cx.notify();
+        }
+    }
+
     fn command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
             Command::ShowFiles => {
@@ -2193,6 +2229,10 @@ impl Workspace {
             }
             Command::ScrollLeft | Command::ScrollRight => {
                 self.scroll_horizontal(command == Command::ScrollRight, window, cx);
+                return;
+            }
+            Command::ResetHorizontalScroll => {
+                self.reset_horizontal_scroll(window, cx);
                 return;
             }
             Command::SelectAll => {
@@ -3912,6 +3952,7 @@ impl Workspace {
             .child(scrollbar_canvas(
                 scroll,
                 ScrollAxis::Vertical,
+                0.0,
                 track_state,
                 dragging,
                 t.clone(),
@@ -3936,18 +3977,22 @@ impl Workspace {
         };
         let track_state = self.scrollbar_state(id).clone();
         let dragging = self.scrollbar_drag.is_some_and(|drag| drag.id == id);
+        let gutter_width = self
+            .zoom_metrics()
+            .sticky_gutter_width(self.config.viewer.line_numbers);
         let view = cx.entity().downgrade();
 
         div()
             .debug_selector(move || debug_name.into())
             .absolute()
             .bottom_0()
-            .left_0()
+            .left(px(gutter_width))
             .right_0()
             .h(px(HORIZONTAL_BAR_HEIGHT))
             .child(scrollbar_canvas(
                 scroll,
                 ScrollAxis::Horizontal,
+                gutter_width,
                 track_state,
                 dragging,
                 self.theme.clone(),
@@ -3985,6 +4030,15 @@ impl Workspace {
         let tab_width = self.config.viewer.tab_width;
         let metrics = self.zoom_metrics();
         let row_height = px(metrics.line_height);
+        let show_line_numbers = self.config.viewer.line_numbers;
+        let scrolled_horizontally = {
+            let handle = if results {
+                &tab.result_scroll
+            } else {
+                &tab.scroll
+            };
+            f32::from(handle.0.borrow().base_handle.offset().x) < -0.5
+        };
         let frame = self.render_frame;
         let cache = self.row_layouts(pane).clone();
         let text_selection = tab.text_selection(pane);
@@ -4084,6 +4138,99 @@ impl Workspace {
                     gpui::transparent_black()
                 };
 
+                let mark_border_color = if !show_line_numbers && scrolled_horizontally {
+                    t.border.opacity(0.8)
+                } else {
+                    gpui::transparent_black()
+                };
+                let line_number_border_color = if scrolled_horizontally {
+                    t.border
+                } else {
+                    t.border.opacity(0.6)
+                };
+                let sticky_gutter = div()
+                    .debug_selector(move || {
+                        format!("{}-gutter-{row}", if results { "result" } else { "main" })
+                    })
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_l_2()
+                    .border_color(border_color)
+                    .child(
+                        div()
+                            .id((if results { "rmark" } else { "mark" }, line))
+                            .debug_selector(move || {
+                                format!("{}-mark-{row}", if results { "result" } else { "main" })
+                            })
+                            .w(px(metrics.mark_gutter_width))
+                            .h_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(!show_line_numbers, |g| {
+                                g.border_r_1().border_color(mark_border_color)
+                            })
+                            .when(marked, |g| {
+                                g.child(
+                                    Icon::BookmarkFilled
+                                        .element(px(metrics.bookmark_icon_size), t.warning),
+                                )
+                            })
+                            .when(!marked && matched, |g| {
+                                g.child(
+                                    Icon::MatchDot.element(px(metrics.match_dot_size), t.accent),
+                                )
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _window, cx| {
+                                    this.toggle_bookmark_line(line, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .when(show_line_numbers, |gutter| {
+                        gutter.child(
+                            div()
+                                .debug_selector(move || {
+                                    format!(
+                                        "{}-linenum-{row}",
+                                        if results { "result" } else { "main" }
+                                    )
+                                })
+                                .w(px(metrics.line_number_width))
+                                .h_full()
+                                .pr(px(metrics.line_number_padding))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .border_r_1()
+                                .border_color(line_number_border_color)
+                                .text_size(px(metrics.line_number_size))
+                                .text_color(if selected { t.foreground } else { t.muted })
+                                .child(format!("{}", line + 1)),
+                        )
+                    })
+                    .into_any_element();
+                let text_cell = div()
+                    .flex_shrink_0()
+                    .when(show_line_numbers, |cell| {
+                        cell.pl(px(metrics.line_number_padding))
+                    })
+                    .pr_4()
+                    .child(
+                        div()
+                            .debug_selector(move || {
+                                format!("{}-text-{row}", if results { "result" } else { "main" })
+                            })
+                            .child(line_content),
+                    )
+                    .into_any_element();
+
                 Some(
                     div()
                         .id((if results { "result" } else { "line" }, line))
@@ -4099,69 +4246,9 @@ impl Workspace {
                         .text_size(px(metrics.font_size))
                         .bg(row_bg)
                         .hover(move |s| s.bg(hover_bg))
-                        .border_l_2()
-                        .border_color(border_color)
                         .text_color(text_color)
                         .cursor_pointer()
-                        .child(
-                            div()
-                                .id((if results { "rmark" } else { "mark" }, line))
-                                .w(px(metrics.mark_gutter_width))
-                                .h_full()
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(marked, |g| {
-                                    g.child(
-                                        Icon::BookmarkFilled
-                                            .element(px(metrics.bookmark_icon_size), t.warning),
-                                    )
-                                })
-                                .when(!marked && matched, |g| {
-                                    g.child(
-                                        Icon::MatchDot
-                                            .element(px(metrics.match_dot_size), t.accent),
-                                    )
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _window, cx| {
-                                        this.toggle_bookmark_line(line, cx);
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        )
-                        .when(self.config.viewer.line_numbers, |row| {
-                            row.child(
-                                div()
-                                    .w(px(metrics.line_number_width))
-                                    .h_full()
-                                    .pr(px(metrics.line_number_padding))
-                                    .mr(px(metrics.line_number_padding))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .border_r_1()
-                                    .border_color(t.border.opacity(0.6))
-                                    .text_size(px(metrics.line_number_size))
-                                    .text_color(if selected { t.foreground } else { t.muted })
-                                    .child(format!("{}", line + 1)),
-                            )
-                        })
-                        .child(
-                            div().pr_4().child(
-                                div()
-                                    .debug_selector(move || {
-                                        format!(
-                                            "{}-text-{row}",
-                                            if results { "result" } else { "main" }
-                                        )
-                                    })
-                                    .child(line_content),
-                            ),
-                        )
+                        .child(StickyRowContent::new(sticky_gutter, text_cell, row_height))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -12015,11 +12102,14 @@ mod tests {
         vcx.run_until_parked();
         let bottom_visible_row = main_full_rows - 2;
         let row0_bounds = vcx.debug_bounds("main-text-0").expect("row 0 text bounds");
+        let gutter0_bounds = vcx
+            .debug_bounds("main-gutter-0")
+            .expect("row 0 gutter bounds");
         let scroll_before_click = view.read_with(vcx, |view, _| {
             -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y)
         });
         let click_pos = point(
-            row0_bounds.left() + px(8.0),
+            row0_bounds.left().max(gutter0_bounds.right()) + px(8.0),
             row0_bounds.center().y + px(bottom_visible_row as f32 * line_height),
         );
         for count in [1, 2] {
@@ -14381,5 +14471,553 @@ mod tests {
                 "Ctrl+Shift+↓"
             );
         }
+    }
+
+    #[gpui::test]
+    fn sticky_gutter_stays_pinned_and_interactive_across_horizontal_scroll_in_both_panes(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.line_numbers = true;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sticky-gutter.log");
+        let wide_body = (0..40)
+            .map(|chunk| format!("TOKEN_{chunk:02}_PAYLOAD "))
+            .collect::<String>();
+        let mut content = String::new();
+        for i in 0..80 {
+            if i == 1 {
+                content.push_str("short line\n");
+            } else {
+                content.push_str(&format!("MATCH line_{i:02} START_PREFIX {wide_body}END\n"));
+            }
+        }
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let visible: Vec<usize> = (0..80).filter(|&i| i != 1).collect();
+        let results = SearchResults {
+            matches: visible.clone(),
+            visible,
+            limited: false,
+            widest_row: 0,
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "MATCH".into();
+            view.tabs[0].sync_highlight_regex();
+            view.tabs[0].results = results;
+            view.tabs[0].selected = 0;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let expected_gutter_w =
+            view.read_with(cx, |view, _| view.zoom_metrics().sticky_gutter_width(true));
+        let main_gutter0_before = cx
+            .debug_bounds("main-gutter-0")
+            .expect("main gutter 0 bounds");
+        let main_mark0_before = cx.debug_bounds("main-mark-0").expect("main mark 0 bounds");
+        let main_num0_before = cx
+            .debug_bounds("main-linenum-0")
+            .expect("main line number 0 bounds");
+        let main_text0_before = cx.debug_bounds("main-text-0").expect("main text 0 bounds");
+        let main_hscroll_before = cx
+            .debug_bounds("main-hscroll")
+            .expect("main horizontal scrollbar bounds");
+        let res_gutter0_before = cx
+            .debug_bounds("result-gutter-0")
+            .expect("result gutter 0 bounds");
+        let res_mark0_before = cx
+            .debug_bounds("result-mark-0")
+            .expect("result mark 0 bounds");
+        let res_num0_before = cx
+            .debug_bounds("result-linenum-0")
+            .expect("result line number 0 bounds");
+        let res_text0_before = cx
+            .debug_bounds("result-text-0")
+            .expect("result text 0 bounds");
+        let res_hscroll_before = cx
+            .debug_bounds("results-hscroll")
+            .expect("results horizontal scrollbar bounds");
+
+        assert!(
+            (f32::from(main_gutter0_before.size.width) - expected_gutter_w).abs() < 0.5,
+            "expected gutter width {expected_gutter_w}, got {:?}",
+            main_gutter0_before.size.width
+        );
+        assert!(
+            (f32::from(main_hscroll_before.origin.x) - f32::from(main_gutter0_before.right()))
+                .abs()
+                < 0.5,
+            "main horizontal scrollbar should begin flush with sticky gutter right edge"
+        );
+        assert!(
+            (f32::from(res_hscroll_before.origin.x) - f32::from(res_gutter0_before.right())).abs()
+                < 0.5,
+            "results horizontal scrollbar should begin flush with sticky gutter right edge"
+        );
+
+        // 1. Scroll horizontally via Right arrow keys in Main pane: text moves left, gutter stays pinned.
+        for _ in 0..5 {
+            cx.simulate_keystrokes("right");
+        }
+        cx.run_until_parked();
+
+        let main_offset_after_keys = view.read_with(cx, |view, _| {
+            f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x)
+        });
+        assert!(
+            main_offset_after_keys < -150.0,
+            "expected horizontal scroll via right arrow, got {main_offset_after_keys}"
+        );
+        let main_gutter0_scrolled = cx.debug_bounds("main-gutter-0").unwrap();
+        let main_gutter1_scrolled = cx.debug_bounds("main-gutter-1").unwrap();
+        let main_mark0_scrolled = cx.debug_bounds("main-mark-0").unwrap();
+        let main_num0_scrolled = cx.debug_bounds("main-linenum-0").unwrap();
+        let main_text0_scrolled = cx.debug_bounds("main-text-0").unwrap();
+
+        assert!(
+            (f32::from(main_gutter0_scrolled.origin.x) - f32::from(main_gutter0_before.origin.x))
+                .abs()
+                < 0.5,
+            "main gutter 0 must remain pinned during horizontal scroll"
+        );
+        assert!(
+            (f32::from(main_gutter1_scrolled.origin.x) - f32::from(main_gutter0_before.origin.x))
+                .abs()
+                < 0.5,
+            "short row gutter must remain pinned during horizontal scroll"
+        );
+        assert!(
+            (f32::from(main_mark0_scrolled.origin.x) - f32::from(main_mark0_before.origin.x)).abs()
+                < 0.5,
+            "main marker/match column must remain pinned during horizontal scroll"
+        );
+        assert!(
+            (f32::from(main_num0_scrolled.origin.x) - f32::from(main_num0_before.origin.x)).abs()
+                < 0.5,
+            "main line number column must remain pinned during horizontal scroll"
+        );
+        assert!(
+            f32::from(main_text0_scrolled.origin.x) < f32::from(main_text0_before.origin.x) - 100.0,
+            "log text should scroll left behind the sticky gutter"
+        );
+
+        // 2. Scroll wheel horizontal & vertical input directly over the sticky gutter works and keeps gutter pinned.
+        cx.simulate_event(ScrollWheelEvent {
+            position: main_num0_scrolled.center(),
+            delta: ScrollDelta::Pixels(point(px(-96.0), px(0.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let main_offset_after_wheel_x = view.read_with(cx, |view, _| {
+            f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x)
+        });
+        assert!(
+            main_offset_after_wheel_x < main_offset_after_keys - 50.0,
+            "horizontal wheel scrolling over sticky gutter should scroll the pane"
+        );
+        assert!(
+            (f32::from(cx.debug_bounds("main-gutter-0").unwrap().origin.x)
+                - f32::from(main_gutter0_before.origin.x))
+            .abs()
+                < 0.5
+        );
+
+        // 3. Clicking the sticky mark gutter while text is scrolled behind it toggles bookmark without selecting text.
+        let mark2_pos = cx.debug_bounds("main-mark-2").unwrap().center();
+        cx.simulate_click(mark2_pos, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.tabs[0].bookmarks.contains(&2),
+                "clicking pinned mark gutter should bookmark line 2"
+            );
+            assert!(
+                !view.tabs[0].has_text_selection(Pane::Main),
+                "clicking pinned mark gutter must not select scrolled-behind text"
+            );
+        });
+        cx.simulate_click(mark2_pos, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].bookmarks.contains(&2));
+        });
+
+        // 4. Clicking and Shift+clicking sticky line numbers selects rows without triggering text selection.
+        let num3_pos = cx.debug_bounds("main-linenum-3").unwrap().center();
+        let num5_pos = cx.debug_bounds("main-linenum-5").unwrap().center();
+        cx.simulate_click(num3_pos, Modifiers::none());
+        cx.simulate_click(num5_pos, Modifiers::shift());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].main_selection.iter().collect::<Vec<_>>(),
+                vec![3, 4, 5],
+                "clicking sticky line numbers must support single and Shift+click row selection"
+            );
+            assert!(
+                !view.tabs[0].has_text_selection(Pane::Main),
+                "clicking sticky line numbers must not trigger hidden text selection"
+            );
+        });
+
+        // 5. Dragging text selection from visible text leftward into the sticky gutter clamps to the visible text edge.
+        let gutter0_right = cx.debug_bounds("main-gutter-0").unwrap().right();
+        let row0_y = cx.debug_bounds("main-gutter-0").unwrap().center().y;
+        let drag_start = point(gutter0_right + px(90.0), row0_y);
+        let drag_into_gutter = point(main_num0_scrolled.center().x, row0_y);
+        cx.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(drag_into_gutter, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(drag_into_gutter, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        let copy_key = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+        cx.simulate_keystrokes(copy_key);
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain visible selected substring");
+        assert!(
+            !copied.is_empty() && !copied.contains("START_PREFIX"),
+            "dragging into sticky gutter must clamp to visible text and not copy scrolled-off prefix, got {copied:?}"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 6. Vertical scroll while horizontally scrolled keeps newly revealed rows' gutters pinned.
+        let vertical_wheel_pos = cx.debug_bounds("main-linenum-0").unwrap().center();
+        cx.simulate_event(ScrollWheelEvent {
+            position: vertical_wheel_pos,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-240.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let scrolled_in_gutter = cx
+            .debug_bounds("main-gutter-12")
+            .expect("row 12 should be visible after vertical wheel scroll over sticky gutter");
+        assert!(
+            (f32::from(scrolled_in_gutter.origin.x) - f32::from(main_gutter0_before.origin.x))
+                .abs()
+                < 0.5,
+            "newly scrolled-in row gutter must also remain pinned horizontally"
+        );
+
+        // 7. Clicking horizontal scrollbar moves further right while keeping gutter pinned.
+        let hbounds = cx.debug_bounds("main-hscroll").unwrap();
+        let hclick = point(
+            hbounds.origin.x + hbounds.size.width * 0.85,
+            hbounds.center().y,
+        );
+        cx.simulate_click(hclick, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            (f32::from(cx.debug_bounds("main-gutter-12").unwrap().origin.x)
+                - f32::from(main_gutter0_before.origin.x))
+            .abs()
+                < 0.5,
+            "gutter must remain pinned after horizontal scrollbar click"
+        );
+
+        // 8. Results (filter) pane: scrolling horizontally keeps its marker + line-number gutter pinned & clickable.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        for _ in 0..5 {
+            cx.simulate_keystrokes("right");
+        }
+        cx.run_until_parked();
+
+        let res_gutter0_scrolled = cx.debug_bounds("result-gutter-0").unwrap();
+        let res_mark0_scrolled = cx.debug_bounds("result-mark-0").unwrap();
+        let res_num0_scrolled = cx.debug_bounds("result-linenum-0").unwrap();
+        let res_text0_scrolled = cx.debug_bounds("result-text-0").unwrap();
+        assert!(
+            (f32::from(res_gutter0_scrolled.origin.x) - f32::from(res_gutter0_before.origin.x))
+                .abs()
+                < 0.5,
+            "results gutter must remain pinned during horizontal scroll"
+        );
+        assert!(
+            (f32::from(res_mark0_scrolled.origin.x) - f32::from(res_mark0_before.origin.x)).abs()
+                < 0.5
+        );
+        assert!(
+            (f32::from(res_num0_scrolled.origin.x) - f32::from(res_num0_before.origin.x)).abs()
+                < 0.5
+        );
+        assert!(
+            f32::from(res_text0_scrolled.origin.x) < f32::from(res_text0_before.origin.x) - 100.0
+        );
+
+        cx.simulate_click(res_mark0_scrolled.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.contains(&0));
+            assert!(!view.tabs[0].has_text_selection(Pane::Results));
+        });
+
+        let res_num1 = cx.debug_bounds("result-linenum-1").unwrap().center();
+        cx.simulate_click(res_num1, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.cursor, 1);
+            assert!(!view.tabs[0].has_text_selection(Pane::Results));
+        });
+
+        // 9. Zooming while horizontally scrolled scales gutter width and keeps gutter + scrollbar aligned.
+        let zoom_in_key = if cfg!(target_os = "macos") {
+            "cmd-="
+        } else {
+            "ctrl-="
+        };
+        cx.simulate_keystrokes(zoom_in_key);
+        cx.simulate_keystrokes(zoom_in_key);
+        cx.run_until_parked();
+        let zoomed_expected_w =
+            view.read_with(cx, |view, _| view.zoom_metrics().sticky_gutter_width(true));
+        let zoomed_res_gutter = cx.debug_bounds("result-gutter-0").unwrap();
+        let zoomed_res_hscroll = cx.debug_bounds("results-hscroll").unwrap();
+        assert!(
+            (f32::from(zoomed_res_gutter.origin.x) - f32::from(res_gutter0_before.origin.x)).abs()
+                < 0.5
+        );
+        assert!(
+            (f32::from(zoomed_res_gutter.size.width) - zoomed_expected_w).abs() < 0.5,
+            "zoomed gutter width should match sticky_gutter_width"
+        );
+        assert!(
+            (f32::from(zoomed_res_hscroll.origin.x) - f32::from(zoomed_res_gutter.right())).abs()
+                < 0.5,
+            "zoomed horizontal scrollbar should remain flush with zoomed sticky gutter"
+        );
+    }
+
+    #[gpui::test]
+    fn sticky_mark_gutter_stays_pinned_when_line_numbers_hidden(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.line_numbers = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("no-linenum.log");
+        let wide_payload = "x".repeat(320);
+        std::fs::write(
+            &path,
+            format!("MATCH row0 {wide_payload}\nMATCH row1 {wide_payload}\n"),
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("main-linenum-0").is_none());
+        let gutter_before = cx.debug_bounds("main-gutter-0").unwrap();
+        let mark_before = cx.debug_bounds("main-mark-0").unwrap();
+        let text_before = cx.debug_bounds("main-text-0").unwrap();
+        let hscroll = cx.debug_bounds("main-hscroll").unwrap();
+        let expected_w =
+            view.read_with(cx, |view, _| view.zoom_metrics().sticky_gutter_width(false));
+        assert!((f32::from(gutter_before.size.width) - expected_w).abs() < 0.5);
+        assert!((f32::from(hscroll.origin.x) - f32::from(gutter_before.right())).abs() < 0.5);
+
+        for _ in 0..4 {
+            cx.simulate_keystrokes("right");
+        }
+        cx.run_until_parked();
+
+        let gutter_after = cx.debug_bounds("main-gutter-0").unwrap();
+        let mark_after = cx.debug_bounds("main-mark-0").unwrap();
+        let text_after = cx.debug_bounds("main-text-0").unwrap();
+        assert!((f32::from(gutter_after.origin.x) - f32::from(gutter_before.origin.x)).abs() < 0.5);
+        assert!((f32::from(mark_after.origin.x) - f32::from(mark_before.origin.x)).abs() < 0.5);
+        assert!(f32::from(text_after.origin.x) < f32::from(text_before.origin.x) - 100.0);
+
+        // Clicking the pinned bookmark column while text is scrolled underneath toggles bookmark cleanly.
+        cx.simulate_click(mark_after.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.contains(&0));
+            assert!(!view.tabs[0].has_text_selection(Pane::Main));
+        });
+    }
+
+    #[gpui::test]
+    fn secondary_left_resets_horizontal_scroll_in_active_log_pane_only(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reset-hscroll.log");
+        let long_payload = "x".repeat(320);
+        let content = (0..80)
+            .map(|i| format!("MATCH line {i} {long_payload}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let visible: Vec<usize> = (0..80).collect();
+        let results = SearchResults {
+            matches: visible.clone(),
+            visible,
+            limited: false,
+            widest_row: 0,
+        };
+
+        let reset_key = if cfg!(target_os = "macos") {
+            "cmd-left"
+        } else {
+            "ctrl-left"
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "MATCH".into();
+            view.tabs[0].results = results;
+            view.tabs[0].selected = 2;
+            view.tabs[0].follow = true;
+            view.tabs[0].main_selection = LineSelection::single(2);
+            view.tabs[0].result_selection = LineSelection::single(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let expected_label = if cfg!(target_os = "macos") {
+                "⌘←"
+            } else {
+                "Ctrl+←"
+            };
+            assert_eq!(
+                view.theme
+                    .shortcut(Command::ResetHorizontalScroll)
+                    .as_deref(),
+                Some(expected_label)
+            );
+        });
+
+        // No-op when already at horizontal offset 0.
+        cx.simulate_keystrokes(reset_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Scroll both panes horizontally and vertically so we can verify active-pane isolation
+        // and vertical scroll / selection / follow preservation.
+        view.update(cx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Vertical, 120.0);
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 300.0);
+            set_uniform_list_axis_offset(&view.tabs[0].result_scroll, ScrollAxis::Vertical, 72.0);
+            set_uniform_list_axis_offset(
+                &view.tabs[0].result_scroll,
+                ScrollAxis::Horizontal,
+                220.0,
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // In Main pane: secondary-left resets only main horizontal scroll back to 0.
+        cx.simulate_keystrokes(reset_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let main_offset = view.tabs[0].scroll.0.borrow().base_handle.offset();
+            let res_offset = view.tabs[0].result_scroll.0.borrow().base_handle.offset();
+            assert_eq!(f32::from(main_offset.x), 0.0);
+            assert!((f32::from(main_offset.y) + 120.0).abs() < 0.5);
+            assert_eq!(view.tabs[0].selected, 2);
+            assert!(view.tabs[0].follow);
+            assert!(
+                (f32::from(res_offset.x) + 220.0).abs() < 0.5,
+                "resetting main pane must not move results pane"
+            );
+            let main_hlayout = view
+                .main_hscroll_state
+                .layout()
+                .expect("main horizontal scrollbar layout");
+            assert_eq!(main_hlayout.thumb.start, 0.0);
+        });
+
+        // Re-scroll main pane, switch to Results pane, and verify secondary-left resets only results.
+        view.update(cx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 180.0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(reset_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let main_offset = view.tabs[0].scroll.0.borrow().base_handle.offset();
+            let res_offset = view.tabs[0].result_scroll.0.borrow().base_handle.offset();
+            assert_eq!(f32::from(res_offset.x), 0.0);
+            assert!((f32::from(res_offset.y) + 72.0).abs() < 0.5);
+            assert!(
+                (f32::from(main_offset.x) + 180.0).abs() < 0.5,
+                "resetting results pane must not move main pane"
+            );
+            let res_hlayout = view
+                .results_hscroll_state
+                .layout()
+                .expect("results horizontal scrollbar layout");
+            assert_eq!(res_hlayout.thumb.start, 0.0);
+        });
+
+        // In Search input, cmd-left moves the text caret to line start and never resets log scroll.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("abc");
+        cx.simulate_keystrokes("cmd-left");
+        cx.simulate_input("Z");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "Zabc");
+            assert!(
+                (f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x) + 180.0).abs()
+                    < 0.5,
+                "cmd-left in Search input must not reset log horizontal scroll"
+            );
+        });
     }
 }

@@ -70,7 +70,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | Workspace | F3 / shift-F3 | Next / previous match |
 | Workspace | secondary-q | Quit |
 | Log | up/down, home/end, secondary-up/down, pageup/pagedown | Navigate lines (in active pane) |
-| Log | left / right | Scroll horizontally (in active pane) |
+| Log | left / right, secondary-left | Scroll horizontally / reset horizontal scroll to start (in active pane) |
 | Log | shift-up/down, shift-home/end, secondary-shift-up/down, shift-pageup/pagedown | Extend selection (in active pane) |
 | Log | secondary-a / escape | Select all / collapse selection |
 | Log | tab | Switch focus between main and filter pane |

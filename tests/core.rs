@@ -1234,3 +1234,73 @@ fn first_and_last_line_shortcuts_defaults_and_migration() {
         Command::FirstLine
     ));
 }
+
+#[test]
+fn reset_horizontal_scroll_default_binding_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    assert!(has_binding(
+        &defaults,
+        "secondary-left",
+        KeyContext::Log,
+        Command::ResetHorizontalScroll
+    ));
+
+    // Migrating an older keyboard.json with left/right scroll bindings adds secondary-left.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "left", "context": "Log", "action": "scroll_left" },
+    { "keys": "right", "context": "Log", "action": "scroll_right" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    assert!(has_binding(
+        &upgraded,
+        "secondary-left",
+        KeyContext::Log,
+        Command::ResetHorizontalScroll
+    ));
+
+    // Custom rebindings for reset_horizontal_scroll are preserved without adding secondary-left.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "0", "context": "Log", "action": "reset_horizontal_scroll" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "0",
+        KeyContext::Log,
+        Command::ResetHorizontalScroll
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-left",
+        KeyContext::Log,
+        Command::ResetHorizontalScroll
+    ));
+}

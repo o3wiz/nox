@@ -176,6 +176,7 @@ pub enum Command {
     PageDown,
     ScrollLeft,
     ScrollRight,
+    ResetHorizontalScroll,
     NextBookmark,
     PreviousBookmark,
     ShowFiles,

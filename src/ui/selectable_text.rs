@@ -14,6 +14,7 @@ pub struct VisibleRowLayout {
     pub text: SharedString,
     pub selectable_len: usize,
     pub bounds: Bounds<Pixels>,
+    pub clip_left: Pixels,
     pub row_top: Pixels,
     pub row_bottom: Pixels,
     pub line_height: Pixels,
@@ -23,6 +24,7 @@ pub struct VisibleRowLayout {
 impl VisibleRowLayout {
     /// Maps a window X coordinate to the closest UTF-8 character boundary within selectable text.
     pub fn closest_byte_offset(&self, x: Pixels) -> usize {
+        let x = x.max(self.clip_left);
         if self.selectable_len == 0 || x <= self.bounds.left() {
             return 0;
         }
@@ -41,6 +43,7 @@ impl VisibleRowLayout {
 
     /// Maps a window X coordinate to the UTF-8 byte index of the character under the pointer.
     pub fn hit_byte_offset(&self, x: Pixels) -> usize {
+        let x = x.max(self.clip_left);
         if self.selectable_len == 0 || x <= self.bounds.left() {
             return 0;
         }
@@ -241,6 +244,7 @@ impl Element for SelectableRowText {
         self.styled
             .prepaint(id, inspector_id, bounds, state, window, cx);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let clip_left = window.content_mask().bounds.left();
         let layout = self.styled.layout();
         let text_bounds = layout.bounds();
         let line_height = layout.line_height();
@@ -252,6 +256,7 @@ impl Element for SelectableRowText {
             text: self.raw_text.clone(),
             selectable_len: self.selectable_len,
             bounds: text_bounds,
+            clip_left,
             row_top: center_y - half_row,
             row_bottom: center_y + half_row,
             line_height,

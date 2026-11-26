@@ -92,6 +92,7 @@
         "page_down",
         "scroll_left",
         "scroll_right",
+        "reset_horizontal_scroll",
         "next_bookmark",
         "previous_bookmark",
         "show_files",

@@ -7,6 +7,7 @@ pub const ZOOM_STEP_PERCENT: u16 = 10;
 
 pub const MIN_SCALED_FONT_SIZE: f32 = 6.0;
 pub const MIN_SCALED_LINE_HEIGHT: f32 = 8.0;
+pub const ROW_ACCENT_BORDER_WIDTH: f32 = 2.0;
 
 const BASE_LINE_NUMBER_WIDTH: f32 = 72.0;
 const BASE_LINE_NUMBER_PADDING: f32 = 12.0;
@@ -87,6 +88,18 @@ impl ZoomMetrics {
             match_dot_size: (BASE_MATCH_DOT_SIZE * scale).round().max(5.0),
         }
     }
+
+    /// Total horizontal width of the sticky row gutter (left selection accent border,
+    /// bookmark/match indicator lane, and optional line-number column).
+    pub fn sticky_gutter_width(self, show_line_numbers: bool) -> f32 {
+        ROW_ACCENT_BORDER_WIDTH
+            + self.mark_gutter_width
+            + if show_line_numbers {
+                self.line_number_width
+            } else {
+                0.0
+            }
+    }
 }
 
 /// Scales a GPUI scroll offset `(x, y)` (where negative values represent scrolled distance)
@@ -162,6 +175,8 @@ mod tests {
         assert_eq!(base.mark_gutter_width, 28.0);
         assert_eq!(base.bookmark_icon_size, 12.0);
         assert_eq!(base.match_dot_size, 9.0);
+        assert_eq!(base.sticky_gutter_width(true), 102.0);
+        assert_eq!(base.sticky_gutter_width(false), 30.0);
 
         let mut prev = ZoomMetrics::compute(13.0, 24.0, 11.5, MIN_ZOOM_PERCENT);
         let mut p = MIN_ZOOM_PERCENT + ZOOM_STEP_PERCENT;

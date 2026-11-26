@@ -197,6 +197,11 @@
       "context": "Log"
     },
     {
+      "keys": "secondary-left",
+      "action": "reset_horizontal_scroll",
+      "context": "Log"
+    },
+    {
       "keys": "b",
       "action": "next_bookmark",
       "context": "Log"
