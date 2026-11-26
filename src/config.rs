@@ -94,6 +94,37 @@ pub struct Preset {
     pub mode: SearchMode,
     #[serde(default = "default_highlight_matches")]
     pub highlight_match: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub select_text: Option<String>,
+}
+
+impl Preset {
+    /// Returns the UTF-8 byte range of the first occurrence of `select_text` within `pattern`
+    /// when `select_text` is configured, non-empty, and contained in `pattern`.
+    pub fn select_text_range(&self) -> Option<std::ops::Range<usize>> {
+        let select_text = self.select_text.as_deref()?;
+        if select_text.is_empty() {
+            return None;
+        }
+        let start = self.pattern.find(select_text)?;
+        Some(start..start + select_text.len())
+    }
+
+    /// Returns a non-fatal validation warning when `select_text` is specified but empty or not
+    /// contained in `pattern`.
+    pub fn select_text_warning(&self) -> Option<String> {
+        let select_text = self.select_text.as_deref()?;
+        if select_text.is_empty() {
+            Some(format!("Preset {:?}: select_text is empty", self.name))
+        } else if !self.pattern.contains(select_text) {
+            Some(format!(
+                "Preset {:?}: select_text {:?} is not contained in pattern {:?}",
+                self.name, select_text, self.pattern
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -448,6 +479,16 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Returns non-fatal configuration validation warnings (for example, search presets whose
+    /// `select_text` is empty or does not appear in `pattern`).
+    pub fn warnings(&self) -> Vec<String> {
+        self.search
+            .presets
+            .iter()
+            .filter_map(Preset::select_text_warning)
+            .collect()
     }
 }
 /// Returns the default configuration directory: `$NOX_CONFIG_DIR` if set and non-empty,

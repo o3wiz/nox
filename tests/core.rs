@@ -233,6 +233,92 @@ fn presets_parse_highlight_match_default_true_and_reject_non_booleans() {
 }
 
 #[test]
+fn presets_parse_select_text_and_report_validation_warnings() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search.json");
+    fs::write(
+        &path,
+        r#"{
+            "presets": [
+                { "name": "Immediate", "pattern": "err", "mode": "literal" },
+                { "name": "NullSelect", "pattern": "warn", "mode": "literal", "select_text": null },
+                { "name": "Port", "pattern": "GET .* port PORT_NUMBER", "mode": "regex", "select_text": "PORT_NUMBER" },
+                { "name": "Unicode", "pattern": "user=שלום_ID!", "mode": "literal", "select_text": "שלום_ID" },
+                { "name": "Repeated", "pattern": "HOST -> HOST", "mode": "literal", "select_text": "HOST" },
+                { "name": "Missing", "pattern": "GET .* port 8080", "mode": "regex", "select_text": "PORT_NUMBER" },
+                { "name": "Empty", "pattern": "GET .*", "mode": "regex", "select_text": "" }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    // Mismatched or empty `select_text` produces warnings, not fatal load/validation errors.
+    let config = Config::load(Some(dir.path())).unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.search.presets.len(), 7);
+    assert_eq!(config.search.presets[0].select_text, None);
+    assert_eq!(config.search.presets[0].select_text_range(), None);
+    assert_eq!(config.search.presets[0].select_text_warning(), None);
+
+    assert_eq!(config.search.presets[1].select_text, None);
+    assert_eq!(config.search.presets[1].select_text_range(), None);
+    assert_eq!(config.search.presets[1].select_text_warning(), None);
+
+    assert_eq!(
+        config.search.presets[2].select_text.as_deref(),
+        Some("PORT_NUMBER")
+    );
+    let port_range = config.search.presets[2].select_text_range().unwrap();
+    assert_eq!(&config.search.presets[2].pattern[port_range], "PORT_NUMBER");
+    assert_eq!(config.search.presets[2].select_text_warning(), None);
+
+    let unicode_range = config.search.presets[3].select_text_range().unwrap();
+    assert_eq!(&config.search.presets[3].pattern[unicode_range], "שלום_ID");
+    assert_eq!(config.search.presets[3].select_text_warning(), None);
+
+    assert_eq!(config.search.presets[4].select_text_range(), Some(0..4));
+    assert_eq!(config.search.presets[4].select_text_warning(), None);
+
+    assert_eq!(config.search.presets[5].select_text_range(), None);
+    let missing_warning = config.search.presets[5]
+        .select_text_warning()
+        .expect("missing select_text should warn");
+    assert!(missing_warning.contains("Missing"));
+    assert!(missing_warning.contains("PORT_NUMBER"));
+
+    assert_eq!(config.search.presets[6].select_text_range(), None);
+    let empty_warning = config.search.presets[6]
+        .select_text_warning()
+        .expect("empty select_text should warn");
+    assert!(empty_warning.contains("Empty"));
+    assert!(empty_warning.contains("empty"));
+
+    let warnings = config.warnings();
+    assert_eq!(warnings.len(), 2);
+    assert_eq!(warnings[0], missing_warning);
+    assert_eq!(warnings[1], empty_warning);
+
+    // Session serialization omits `select_text` when `None` and preserves it when `Some`.
+    let serialized = serde_json::to_value(&config.search.presets).unwrap();
+    assert!(serialized[0].get("select_text").is_none());
+    assert_eq!(serialized[2]["select_text"], "PORT_NUMBER");
+
+    // Non-string values for `select_text` are rejected.
+    for invalid in [
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","select_text":123}]}"#,
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","select_text":true}]}"#,
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","select_text":[]}]}"#,
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","select_text":{}}]}"#,
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert!(
+            Config::load(Some(dir.path())).is_err(),
+            "accepted invalid preset select_text {invalid}"
+        );
+    }
+}
+
+#[test]
 fn appearance_overlays_configurable_match_foreground_and_background_colors() {
     let defaults = Config::load(None).unwrap();
     assert_eq!(defaults.appearance.match_foreground, "#0B1016");
@@ -732,8 +818,10 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert_eq!(presets[0]["name"], "Custom");
     assert_eq!(presets[0]["highlight_match"], true);
     assert_eq!(presets[0]["deprecated_priority"], 3);
+    assert!(presets[0].get("select_text").is_none());
     assert_eq!(presets[1]["name"], "NoHighlight");
     assert_eq!(presets[1]["highlight_match"], false);
+    assert!(presets[1].get("select_text").is_none());
 
     // Check keyboard.json: custom & deprecated preserved, conflicts skipped, missing added.
     let keyboard: serde_json::Value =

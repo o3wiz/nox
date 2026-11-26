@@ -161,6 +161,12 @@
         "highlight_match": {
           "type": "boolean",
           "default": true
+        },
+        "select_text": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,

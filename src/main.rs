@@ -129,8 +129,19 @@ fn start() -> Result<()> {
     }
     let config = Config::load(directory.as_deref())?;
     ui::keybindings(&config).context("Invalid keyboard.json")?;
+    let warnings = config.warnings();
+    for warning in &warnings {
+        eprintln!("nox: warning: {warning}");
+    }
     if validate {
-        println!("Configuration valid (7 sections)");
+        if warnings.is_empty() {
+            println!("Configuration valid (7 sections)");
+        } else {
+            println!(
+                "Configuration valid (7 sections, {} warning(s))",
+                warnings.len()
+            );
+        }
         return Ok(());
     }
     if files.is_empty() {

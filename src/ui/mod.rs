@@ -172,6 +172,12 @@ fn append_regex_alternative(existing: &str, selected: &str) -> String {
     }
 }
 
+fn utf16_range_for_utf8(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let start = text[..range.start].encode_utf16().count();
+    let end = start + text[range.start..range.end].encode_utf16().count();
+    start..end
+}
+
 const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BULK_BOOKMARK_LINES: usize = 100_000;
 const SEARCH_INDICATOR_DELAY: Duration = Duration::from_millis(150);
@@ -609,6 +615,17 @@ impl Workspace {
             this.status = Some(StatusMessage::error(format!(
                 "{error} · session saving disabled"
             )));
+        } else {
+            let warnings = this.config.warnings();
+            if warnings.len() == 1 {
+                this.status = Some(StatusMessage::warning(warnings[0].clone()));
+            } else if !warnings.is_empty() {
+                this.status = Some(StatusMessage::warning(format!(
+                    "{} config warnings: {}",
+                    warnings.len(),
+                    warnings[0]
+                )));
+            }
         }
         this
     }
@@ -3315,14 +3332,57 @@ impl Workspace {
         let Some(preset) = self.config.search.presets.get(index).cloned() else {
             return;
         };
-        self.input
-            .update(cx, |input, cx| input.emplace(&preset.pattern, cx));
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.options.mode = preset.mode;
             tab.options.highlight_matches = preset.highlight_match;
         }
+        self.show_goto = false;
         self.dismiss_presets(cx);
         self.preset_index = index;
+        if preset.select_text.is_some() {
+            if let Some(range) = preset.select_text_range() {
+                let version = self.input.update(cx, |input, cx| {
+                    input.emplace(&preset.pattern, cx);
+                    input.move_to(range.start, cx);
+                    input.select_to(range.end, cx);
+                    input.version()
+                });
+                self.input.read(cx).focus_handle(cx).focus(window, cx);
+                let expected_utf16 = utf16_range_for_utf8(&preset.pattern, range.clone());
+                cx.on_next_frame(window, move |this, window, cx| {
+                    if !this.input.read(cx).focus_handle(cx).is_focused(window) {
+                        return;
+                    }
+                    let unchanged = this.input.update(cx, |input, cx| {
+                        if input.version() != version {
+                            return false;
+                        }
+                        input
+                            .selected_text_range(false, window, cx)
+                            .is_some_and(|sel| sel.range == expected_utf16)
+                    });
+                    if unchanged {
+                        this.input.update(cx, |input, cx| {
+                            input.move_to(range.start, cx);
+                            input.select_to(range.end, cx);
+                        });
+                    }
+                });
+            } else {
+                self.input.update(cx, |input, cx| {
+                    input.emplace(&preset.pattern, cx);
+                    input.move_to(preset.pattern.len(), cx);
+                });
+                self.input.read(cx).focus_handle(cx).focus(window, cx);
+                if let Some(warning) = preset.select_text_warning() {
+                    self.status = Some(StatusMessage::warning(warning));
+                }
+            }
+            cx.notify();
+            return;
+        }
+        self.input
+            .update(cx, |input, cx| input.emplace(&preset.pattern, cx));
         self.start_search(self.active, cx);
         self.focus_visible_pane(self.active_pane, window, cx);
     }
@@ -5753,6 +5813,22 @@ impl Workspace {
                             .into_any_element()
                     };
 
+                    let pattern_element: AnyElement =
+                        if let Some(select_range) = preset.select_text_range() {
+                            let select_style = HighlightStyle {
+                                color: Some(t.accent),
+                                background_color: Some(t.accent_subtle),
+                                ..Default::default()
+                            };
+                            StyledText::new(preset.pattern.clone())
+                                .with_highlights(vec![(select_range, select_style)])
+                                .into_any_element()
+                        } else {
+                            preset.pattern.clone().into_any_element()
+                        };
+                    let select_warning = preset.select_text_warning();
+                    let warning_tip_theme = t.clone();
+
                     list = list.child(
                         div()
                             .id(("preset-item", preset_index))
@@ -5812,16 +5888,46 @@ impl Workspace {
                                     .child(
                                         div()
                                             .flex_shrink_0()
-                                            .px_1p5()
-                                            .py_0p5()
-                                            .rounded_sm()
-                                            .bg(t.background)
-                                            .border_1()
-                                            .border_color(t.border)
-                                            .font(t.mono_font_spec())
-                                            .text_size(px(10.))
-                                            .text_color(t.muted)
-                                            .child(mode_label),
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .when_some(select_warning, |el, warning| {
+                                                el.child(
+                                                    div()
+                                                        .id(("preset-warning", preset_index))
+                                                        .debug_selector(move || {
+                                                            format!("preset-warning-{preset_index}")
+                                                        })
+                                                        .flex()
+                                                        .items_center()
+                                                        .child(
+                                                            Icon::AlertTriangle
+                                                                .element(px(12.), t.warning),
+                                                        )
+                                                        .tooltip_show_delay(TOOLTIP_DELAY)
+                                                        .tooltip(move |_window, cx| {
+                                                            Tooltip::view(
+                                                                warning.clone(),
+                                                                None,
+                                                                warning_tip_theme.clone(),
+                                                                cx,
+                                                            )
+                                                        }),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(t.background)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .font(t.mono_font_spec())
+                                                    .text_size(px(10.))
+                                                    .text_color(t.muted)
+                                                    .child(mode_label),
+                                            ),
                                     ),
                             )
                             .child(
@@ -5831,7 +5937,7 @@ impl Workspace {
                                     .font(t.mono_font_spec())
                                     .text_size(t.xs_size)
                                     .text_color(t.muted)
-                                    .child(preset.pattern.clone()),
+                                    .child(pattern_element),
                             ),
                     );
                 }
@@ -7810,30 +7916,35 @@ mod tests {
                 pattern: "error|fatal|panic".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                select_text: None,
             },
             config::Preset {
                 name: "Warnings".into(),
                 pattern: "warn".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                select_text: None,
             },
             config::Preset {
                 name: "Requests".into(),
                 pattern: "GET|POST|PUT|DELETE".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                select_text: None,
             },
             config::Preset {
                 name: "HTTP 5xx Errors".into(),
                 pattern: "HTTP 5\\d\\d".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                select_text: None,
             },
             config::Preset {
                 name: "Auth Errors".into(),
                 pattern: "401|403|unauthorized".into(),
                 mode: SearchMode::Regex,
                 highlight_match: false,
+                select_text: None,
             },
         ];
         cx.update(|cx| {
@@ -8039,6 +8150,253 @@ mod tests {
             assert!(!view.show_presets);
             assert!(view.focus.is_focused(window));
             assert_eq!(view.presets_search.read(cx).as_str(), "");
+        });
+    }
+
+    #[gpui::test]
+    fn applying_selectable_preset_focuses_search_selects_text_and_defers_search(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "Errors".into(),
+                pattern: "ERROR".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                select_text: None,
+            },
+            config::Preset {
+                name: "Port request".into(),
+                pattern: "GET .* port PORT_NUMBER".into(),
+                mode: SearchMode::Regex,
+                highlight_match: false,
+                select_text: Some("PORT_NUMBER".into()),
+            },
+            config::Preset {
+                name: "Unicode user".into(),
+                pattern: "user=שלום_NAME!".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                select_text: Some("שלום_NAME".into()),
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selectable-presets.log");
+        std::fs::write(
+            &path,
+            "ERROR initial failure\nGET /api port 8080\nGET /api port 9090\nuser=alice!\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let selected_range = |input: &Entity<EditableTextState>,
+                              window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // Valid presets produce no startup warning.
+        view.read_with(cx, |view, _| assert_eq!(view.status, None));
+
+        // Seed an active search via the non-selectable preset.
+        view.update_in(cx, |view, window, cx| view.apply_preset(0, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+
+        let presets_key = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+
+        // Open patterns dropdown, pick "Port request" with Enter: copies pattern, focuses search,
+        // selects "PORT_NUMBER", updates mode/highlight options, and does NOT search yet.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "GET .* port PORT_NUMBER");
+            assert_eq!(selected_range(&view.input, window, cx), 12..23);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(!view.tabs[0].options.highlight_matches);
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert!(!view.tabs[0].searching);
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert_eq!(view.status, None);
+        });
+
+        // Typing replaces only the selected placeholder, and pressing Enter executes the search.
+        cx.simulate_input("8080");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "GET .* port 8080");
+            assert_eq!(view.tabs[0].query, "ERROR");
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].query, "GET .* port 8080");
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+        });
+
+        // Clicking a Unicode selectable preset also focuses search, selects the UTF-16 span,
+        // defers searching, and allows replacing the placeholder directly.
+        let trigger_center = cx
+            .debug_bounds("presets-trigger")
+            .expect("presets trigger")
+            .center();
+        cx.simulate_click(trigger_center, Modifiers::none());
+        cx.run_until_parked();
+        let unicode_item_center = cx
+            .debug_bounds("preset-item-2")
+            .expect("unicode preset item")
+            .center();
+        cx.simulate_click(unicode_item_center, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "user=שלום_NAME!");
+            let expected =
+                utf16_range_for_utf8("user=שלום_NAME!", "user=".len().."user=שלום_NAME".len());
+            assert_eq!(selected_range(&view.input, window, cx), expected);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.highlight_matches);
+            assert_eq!(view.tabs[0].query, "GET .* port 8080");
+            assert!(!view.tabs[0].searching);
+        });
+        cx.simulate_input("alice");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "user=alice!");
+            assert_eq!(view.tabs[0].query, "user=alice!");
+            assert_eq!(view.tabs[0].results.matches, vec![3]);
+        });
+    }
+
+    #[gpui::test]
+    fn selectable_preset_with_missing_select_text_warns_and_focuses_search_without_searching(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "Port request".into(),
+                pattern: "GET .* port 8080".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+                select_text: Some("PORT_NUMBER".into()),
+            },
+            config::Preset {
+                name: "Empty select".into(),
+                pattern: "warn".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                select_text: Some(String::new()),
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("warn-presets.log");
+        std::fs::write(&path, "GET /api port 8080\nwarn slow query\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let selected_range = |input: &Entity<EditableTextState>,
+                              window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // Startup surfaces a warning status for misconfigured select_text presets.
+        view.read_with(cx, |view, _| {
+            let status = view.status.as_ref().expect("startup warning status");
+            assert_eq!(status.tone, StatusTone::Warning);
+            assert!(status.text.contains("2 config warnings"));
+            assert!(status.text.contains("PORT_NUMBER"));
+        });
+
+        // Opening the patterns dropdown renders warning badges on both affected presets.
+        view.update_in(cx, |view, window, cx| view.toggle_presets(window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("preset-warning-0").is_some());
+        assert!(cx.debug_bounds("preset-warning-1").is_some());
+
+        // Applying preset 0 warns, focuses search with caret at end, and does not search.
+        view.update(cx, |view, _| view.status = None);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "GET .* port 8080");
+            assert_eq!(selected_range(&view.input, window, cx), 16..16);
+            assert_eq!(view.tabs[0].query, "");
+            assert!(!view.tabs[0].searching);
+            let status = view.status.as_ref().expect("apply warning status");
+            assert_eq!(status.tone, StatusTone::Warning);
+            assert!(status.text.contains("Port request"));
+            assert!(status.text.contains("PORT_NUMBER"));
+        });
+
+        // Applying preset 1 (empty select_text) warns, focuses search at end, and does not search.
+        view.update_in(cx, |view, window, cx| {
+            view.status = None;
+            view.apply_preset(1, window, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "warn");
+            assert_eq!(selected_range(&view.input, window, cx), 4..4);
+            assert_eq!(view.tabs[0].query, "");
+            assert!(!view.tabs[0].searching);
+            let status = view.status.as_ref().expect("empty select_text warning");
+            assert_eq!(status.tone, StatusTone::Warning);
+            assert!(status.text.contains("Empty select"));
+            assert!(status.text.contains("empty"));
         });
     }
 
@@ -14132,12 +14490,14 @@ mod tests {
             pattern: "HTTP 5\\d\\d".into(),
             mode: SearchMode::Regex,
             highlight_match: true,
+            select_text: None,
         });
         config.search.presets.push(config::Preset {
             name: "Auth Errors".into(),
             pattern: "401|403".into(),
             mode: SearchMode::Regex,
             highlight_match: true,
+            select_text: None,
         });
         cx.update(|cx| {
             cx.bind_keys(text_input_default_bindings());
