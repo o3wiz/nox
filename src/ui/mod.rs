@@ -3576,6 +3576,7 @@ impl Workspace {
             self.results_height,
             &mut self.target_results_height,
             bounds,
+            self.config.window.filter_resize_sensitivity,
             now,
         );
         if cx.reduce_motion() {
@@ -9747,6 +9748,130 @@ mod tests {
                 "clicking file path bar chrome while main is hidden should keep filter pane focused"
             );
         });
+    }
+
+    #[gpui::test]
+    fn filter_pane_keyboard_resize_sensitivity_scales_tap_and_hold_but_not_buttons(
+        cx: &mut TestAppContext,
+    ) {
+        use resize::BASE_RESIZE_STEP;
+
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("sample.log");
+        std::fs::write(&file, "ERROR alpha\nINFO beta\nERROR gamma\n").unwrap();
+
+        let measure = |cx: &mut TestAppContext, sensitivity: f32| -> (f32, f32, f32, f32) {
+            let mut config = Config::load(None).unwrap();
+            config.files.save_session = false;
+            config.files.restore_session = false;
+            config.window.filter_resize_sensitivity = sensitivity;
+            cx.update(|cx| {
+                cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+                cx.bind_keys(keybindings(&config).unwrap());
+            });
+
+            let (view, vcx) = cx.add_window_view(|window, cx| {
+                Workspace::new(config, vec![file.clone()], window, cx)
+            });
+            wait_for_tab_loaded(&view, 0, vcx);
+
+            let step_frame = |vcx: &mut VisualTestContext, ms: u64| {
+                vcx.background_executor
+                    .advance_clock(Duration::from_millis(ms));
+                vcx.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                });
+                vcx.run_until_parked();
+            };
+            let settle = |vcx: &mut VisualTestContext| {
+                for _ in 0..45 {
+                    step_frame(vcx, 16);
+                }
+            };
+
+            let key_minus = Keystroke::parse("-").unwrap();
+            let key_shift_minus = Keystroke::parse("shift--").unwrap();
+
+            // Single tap `-` grows by BASE_RESIZE_STEP * sensitivity.
+            vcx.simulate_keystrokes("-");
+            vcx.simulate_event(KeyUpEvent {
+                keystroke: key_minus.clone(),
+            });
+            settle(vcx);
+            let after_grow_tap = view.read_with(vcx, |view, _| view.results_height);
+
+            // Single tap `shift--` shrinks back by the same sensitivity-scaled step.
+            vcx.simulate_keystrokes("shift--");
+            vcx.simulate_event(KeyUpEvent {
+                keystroke: key_shift_minus,
+            });
+            settle(vcx);
+            let after_shrink_tap = view.read_with(vcx, |view, _| view.results_height);
+
+            // Clicking the header grow button still uses the fixed BASE_RESIZE_STEP.
+            let grow_btn = vcx
+                .debug_bounds("results-grow")
+                .expect("grow button")
+                .center();
+            vcx.simulate_click(grow_btn, Modifiers::none());
+            vcx.run_until_parked();
+            settle(vcx);
+            let button_delta = view.read_with(vcx, |view, _| view.results_height - 250.0);
+
+            // Reset height back to 100px to leave plenty of room for a long-press glide comparison.
+            view.update(vcx, |view, cx| {
+                view.resize_motion.cancel();
+                view.results_height = 100.0;
+                view.target_results_height = 100.0;
+                cx.notify();
+            });
+            vcx.run_until_parked();
+
+            // Sustained hold of `-` for ~450ms glides faster with higher sensitivity.
+            vcx.simulate_event(KeyDownEvent {
+                keystroke: key_minus.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            for i in 0..28 {
+                if i >= 14 && i % 3 == 0 {
+                    vcx.simulate_event(KeyDownEvent {
+                        keystroke: key_minus.clone(),
+                        is_held: true,
+                        prefer_character_input: false,
+                    });
+                }
+                step_frame(vcx, 16);
+            }
+            vcx.simulate_event(KeyUpEvent {
+                keystroke: key_minus,
+            });
+            settle(vcx);
+            let hold_displacement = view.read_with(vcx, |view, _| view.results_height - 100.0);
+
+            (
+                after_grow_tap - 250.0,
+                after_shrink_tap,
+                button_delta,
+                hold_displacement,
+            )
+        };
+
+        let (tap_low, reset_low, btn_low, hold_low) = measure(cx, 0.5);
+        let (tap_high, reset_high, btn_high, hold_high) = measure(cx, 2.5);
+
+        assert_eq!(tap_low, BASE_RESIZE_STEP * 0.5);
+        assert_eq!(reset_low, 250.0);
+        assert_eq!(btn_low, BASE_RESIZE_STEP);
+
+        assert_eq!(tap_high, BASE_RESIZE_STEP * 2.5);
+        assert_eq!(reset_high, 250.0);
+        assert_eq!(btn_high, BASE_RESIZE_STEP);
+
+        assert!(
+            hold_high > hold_low * 3.5,
+            "2.5x sensitivity hold should glide much further than 0.5x (low={hold_low}, high={hold_high})"
+        );
     }
 
     #[test]

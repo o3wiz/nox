@@ -164,6 +164,18 @@ fn overlays_defaults_but_rejects_typos_wrong_types_and_invalid_values() {
 #[test]
 fn validates_highlights_colors_presets_and_duplicate_shortcuts() {
     let mut config = Config::load(None).unwrap();
+    config.window.filter_resize_sensitivity = 0.05;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.window.filter_resize_sensitivity = 10.5;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.window.filter_resize_sensitivity = f32::NAN;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.window.filter_resize_sensitivity = f32::INFINITY;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
     config.appearance.accent = "red".into();
     assert!(config.validate().is_err());
     let mut config = Config::load(None).unwrap();
@@ -403,6 +415,41 @@ fn appearance_overlays_configurable_text_selection_color_and_opacity() {
         assert!(
             Config::load(Some(dir.path())).is_err(),
             "accepted invalid text selection appearance {invalid}"
+        );
+    }
+}
+
+#[test]
+fn window_overlays_and_validates_filter_resize_sensitivity() {
+    let defaults = Config::load(None).unwrap();
+    assert_eq!(defaults.window.filter_resize_sensitivity, 1.0);
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("window.json");
+    fs::write(&path, r#"{"filter_resize_sensitivity": 2.5}"#).unwrap();
+    let custom = Config::load(Some(dir.path())).unwrap();
+    assert!((custom.window.filter_resize_sensitivity - 2.5).abs() < 1e-6);
+    assert_eq!(custom.window.results_height, defaults.window.results_height);
+
+    // Boundary values 0.1 and 10.0 are accepted.
+    for valid in [0.1f32, 10.0] {
+        fs::write(&path, format!(r#"{{"filter_resize_sensitivity":{valid}}}"#)).unwrap();
+        let loaded = Config::load(Some(dir.path())).unwrap();
+        assert!((loaded.window.filter_resize_sensitivity - valid).abs() < 1e-6);
+    }
+
+    for invalid in [
+        r#"{"filter_resize_sensitivity":0}"#,
+        r#"{"filter_resize_sensitivity":0.09}"#,
+        r#"{"filter_resize_sensitivity":-1.0}"#,
+        r#"{"filter_resize_sensitivity":10.1}"#,
+        r#"{"filter_resize_sensitivity":"2.0"}"#,
+        r#"{"filter_resize_sensitivity":null}"#,
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert!(
+            Config::load(Some(dir.path())).is_err(),
+            "accepted invalid filter_resize_sensitivity {invalid}"
         );
     }
 }
@@ -788,6 +835,7 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert_eq!(window["height"], 850);
     assert_eq!(window["maximized"], false);
     assert_eq!(window["results_height"], 250);
+    assert_eq!(window["filter_resize_sensitivity"], 1.0);
     assert_eq!(window["show_status_bar"], true);
 
     // Check appearance.json: custom + deprecated preserved, newer fields added.

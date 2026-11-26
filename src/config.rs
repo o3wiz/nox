@@ -10,6 +10,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const DEFAULT_FILTER_RESIZE_SENSITIVITY: f32 = 1.0;
+pub const MIN_FILTER_RESIZE_SENSITIVITY: f32 = 0.1;
+pub const MAX_FILTER_RESIZE_SENSITIVITY: f32 = 10.0;
+
+fn default_filter_resize_sensitivity() -> f32 {
+    DEFAULT_FILTER_RESIZE_SENSITIVITY
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WindowConfig {
@@ -21,6 +29,9 @@ pub struct WindowConfig {
     pub maximized: bool,
     #[schemars(range(min = 100, max = 1200))]
     pub results_height: f32,
+    #[serde(default = "default_filter_resize_sensitivity")]
+    #[schemars(range(min = 0.1, max = 10.0))]
+    pub filter_resize_sensitivity: f32,
     pub show_status_bar: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -402,6 +413,12 @@ impl Config {
         ensure!(
             (100.0..=1200.0).contains(&w.results_height),
             "window.results_height must be 100..1200"
+        );
+        ensure!(
+            w.filter_resize_sensitivity.is_finite()
+                && (MIN_FILTER_RESIZE_SENSITIVITY..=MAX_FILTER_RESIZE_SENSITIVITY)
+                    .contains(&w.filter_resize_sensitivity),
+            "window.filter_resize_sensitivity must be 0.1..=10.0"
         );
         ensure!(
             (8.0..=32.0).contains(&a.ui_font_size),

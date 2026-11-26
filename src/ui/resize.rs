@@ -1,4 +1,7 @@
 //! Pure filter-pane resize geometry, full-collapse bounds, and smooth frame-paced motion.
+use nox::config::{
+    DEFAULT_FILTER_RESIZE_SENSITIVITY, MAX_FILTER_RESIZE_SENSITIVITY, MIN_FILTER_RESIZE_SENSITIVITY,
+};
 use std::time::{Duration, Instant};
 
 /// Height of the editable file path strip pinned above the source log pane.
@@ -106,9 +109,18 @@ pub fn height_for_drag(drag: ResultsResizeDrag, pointer_y: f32, bounds: (f32, f3
         .clamp(bounds.0, bounds.1)
 }
 
+fn sanitize_sensitivity(sensitivity: f32) -> f32 {
+    if sensitivity.is_finite() {
+        sensitivity.clamp(MIN_FILTER_RESIZE_SENSITIVITY, MAX_FILTER_RESIZE_SENSITIVITY)
+    } else {
+        DEFAULT_FILTER_RESIZE_SENSITIVITY
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HoldState {
     direction: ResizeDirection,
+    sensitivity: f32,
     started_at: Instant,
     glide_started_at: Option<Instant>,
     last_heartbeat: Instant,
@@ -122,6 +134,7 @@ impl HoldState {
         };
         let secs = now.saturating_duration_since(glide_start).as_secs_f32();
         (MIN_HOLD_VELOCITY * (HOLD_ACCEL_RATE * secs).exp()).min(MAX_HOLD_VELOCITY)
+            * self.sensitivity
     }
 
     fn heartbeat_expired(&self, now: Instant) -> bool {
@@ -152,7 +165,8 @@ pub struct ResizeMotion {
 impl ResizeMotion {
     /// Handles a keyboard resize command trigger.
     ///
-    /// - Initial press (or direction reversal): bumps `target` by `BASE_RESIZE_STEP` and arms hold detection.
+    /// - Initial press (or direction reversal): bumps `target` by `BASE_RESIZE_STEP * sensitivity`
+    ///   and arms hold detection with the same sensitivity multiplier for continuous glide speed.
     /// - Subsequent OS repeats while still held: refreshes the hold heartbeat and engages continuous
     ///   smooth glide immediately (without injecting discrete stepped jumps).
     pub fn on_key_trigger(
@@ -161,12 +175,15 @@ impl ResizeMotion {
         current: f32,
         target: &mut f32,
         bounds: (f32, f32),
+        sensitivity: f32,
         now: Instant,
     ) -> bool {
+        let sensitivity = sanitize_sensitivity(sensitivity);
         if let Some(hold) = &mut self.hold
             && hold.direction == direction
             && !hold.heartbeat_expired(now)
         {
+            hold.sensitivity = sensitivity;
             hold.last_heartbeat = now;
             hold.saw_repeat = true;
             hold.glide_started_at.get_or_insert(now);
@@ -180,9 +197,11 @@ impl ResizeMotion {
         } else {
             current.clamp(bounds.0, bounds.1)
         };
-        *target = (base + direction.sign() * BASE_RESIZE_STEP).clamp(bounds.0, bounds.1);
+        *target =
+            (base + direction.sign() * BASE_RESIZE_STEP * sensitivity).clamp(bounds.0, bounds.1);
         self.hold = Some(HoldState {
             direction,
+            sensitivity,
             started_at: now,
             glide_started_at: None,
             last_heartbeat: now,
@@ -281,8 +300,8 @@ impl ResizeMotion {
                         (*target + hold.direction.sign() * speed * dt).clamp(bounds.0, bounds.1);
                 }
                 let at_limit = match hold.direction {
-                    ResizeDirection::Grow => *target >= bounds.1 - SETTLE_EPSILON,
-                    ResizeDirection::Shrink => *target <= bounds.0 + SETTLE_EPSILON,
+                    ResizeDirection::Grow => *target >= bounds.1,
+                    ResizeDirection::Shrink => *target <= bounds.0,
                 };
                 holding_with_room = !at_limit;
                 self.hold = Some(hold);
@@ -363,7 +382,14 @@ mod tests {
         let mut current = 250.0;
         let mut target = 250.0;
 
-        motion.on_key_trigger(ResizeDirection::Grow, current, &mut target, bounds, t0);
+        motion.on_key_trigger(
+            ResizeDirection::Grow,
+            current,
+            &mut target,
+            bounds,
+            DEFAULT_FILTER_RESIZE_SENSITIVITY,
+            t0,
+        );
         assert_eq!(target, 250.0 + BASE_RESIZE_STEP);
         assert!(!motion.is_long_pressing());
 
@@ -403,7 +429,14 @@ mod tests {
         let mut current = 100.0;
         let mut target = 100.0;
 
-        motion.on_key_trigger(ResizeDirection::Grow, current, &mut target, bounds, t0);
+        motion.on_key_trigger(
+            ResizeDirection::Grow,
+            current,
+            &mut target,
+            bounds,
+            DEFAULT_FILTER_RESIZE_SENSITIVITY,
+            t0,
+        );
 
         // Advance past LONG_PRESS_DELAY at 60Hz while keeping hold alive (no release).
         let mut t = t0;
@@ -427,7 +460,14 @@ mod tests {
         for i in 0..30 {
             t += Duration::from_millis(16);
             if i % 3 == 0 {
-                motion.on_key_trigger(ResizeDirection::Grow, current, &mut target, bounds, t);
+                motion.on_key_trigger(
+                    ResizeDirection::Grow,
+                    current,
+                    &mut target,
+                    bounds,
+                    DEFAULT_FILTER_RESIZE_SENSITIVITY,
+                    t,
+                );
             }
             motion.advance_frame(&mut current, &mut target, bounds, t, false);
         }
@@ -453,5 +493,123 @@ mod tests {
         }
         assert_eq!(current, stopped_target);
         assert!(!motion.is_animating());
+    }
+
+    #[test]
+    fn keyboard_sensitivity_scales_single_tap_and_long_press_velocity_proportionally() {
+        let bounds = (0.0, 2000.0);
+        let t0 = Instant::now();
+
+        let simulate_hold = |sensitivity: f32| -> (f32, f32) {
+            let mut motion = ResizeMotion::default();
+            let mut current = 250.0;
+            let mut target = 250.0;
+            motion.on_key_trigger(
+                ResizeDirection::Grow,
+                current,
+                &mut target,
+                bounds,
+                sensitivity,
+                t0,
+            );
+            let tap_target = target - 250.0;
+
+            let mut t = t0;
+            // Advance past LONG_PRESS_DELAY and glide for ~320ms.
+            for i in 0..35 {
+                t += Duration::from_millis(16);
+                if i >= 14 && i % 3 == 0 {
+                    motion.on_key_trigger(
+                        ResizeDirection::Grow,
+                        current,
+                        &mut target,
+                        bounds,
+                        sensitivity,
+                        t,
+                    );
+                }
+                motion.advance_frame(&mut current, &mut target, bounds, t, false);
+            }
+            let glide_displacement = target - (250.0 + tap_target);
+            (tap_target, glide_displacement)
+        };
+
+        let (tap_half, glide_half) = simulate_hold(0.5);
+        let (tap_one, glide_one) = simulate_hold(1.0);
+        let (tap_double, glide_double) = simulate_hold(2.0);
+
+        assert_eq!(tap_half, BASE_RESIZE_STEP * 0.5);
+        assert_eq!(tap_one, BASE_RESIZE_STEP);
+        assert_eq!(tap_double, BASE_RESIZE_STEP * 2.0);
+
+        assert!(
+            ((glide_half / glide_one) - 0.5).abs() < 1e-4,
+            "0.5x sensitivity glide should be half of 1.0x (half={glide_half}, one={glide_one})"
+        );
+        assert!(
+            ((glide_double / glide_one) - 2.0).abs() < 1e-4,
+            "2.0x sensitivity glide should be double 1.0x (double={glide_double}, one={glide_one})"
+        );
+
+        // Minimum sensitivity (0.1) still steps cleanly and holds all the way to exact bounds.
+        let mut motion = ResizeMotion::default();
+        let tight_bounds = (0.0, 260.0);
+        let mut current = 250.0;
+        let mut target = 250.0;
+        motion.on_key_trigger(
+            ResizeDirection::Grow,
+            current,
+            &mut target,
+            tight_bounds,
+            MIN_FILTER_RESIZE_SENSITIVITY,
+            t0,
+        );
+        assert!((target - (250.0 + BASE_RESIZE_STEP * 0.1)).abs() < 1e-4);
+        let mut t = t0;
+        for i in 0..60 {
+            t += Duration::from_millis(16);
+            if i % 3 == 0 {
+                motion.on_key_trigger(
+                    ResizeDirection::Grow,
+                    current,
+                    &mut target,
+                    tight_bounds,
+                    MIN_FILTER_RESIZE_SENSITIVITY,
+                    t,
+                );
+            }
+            let step = motion.advance_frame(&mut current, &mut target, tight_bounds, t, false);
+            if !step.keep_animating {
+                break;
+            }
+        }
+        assert_eq!(target, tight_bounds.1);
+        assert_eq!(current, tight_bounds.1);
+
+        // Non-finite or out-of-range sensitivity values are defensively sanitized.
+        let mut motion = ResizeMotion::default();
+        let mut target = 250.0;
+        motion.on_key_trigger(
+            ResizeDirection::Grow,
+            250.0,
+            &mut target,
+            bounds,
+            f32::NAN,
+            t0,
+        );
+        assert_eq!(target, 250.0 + BASE_RESIZE_STEP);
+        motion.cancel();
+        let mut target = 250.0;
+        motion.on_key_trigger(ResizeDirection::Grow, 250.0, &mut target, bounds, 99.0, t0);
+        assert_eq!(
+            target,
+            250.0 + BASE_RESIZE_STEP * MAX_FILTER_RESIZE_SENSITIVITY
+        );
+
+        // Button clicks (`step_once`) always apply the fixed base step.
+        motion.cancel();
+        let mut target = 250.0;
+        motion.step_once(ResizeDirection::Grow, 250.0, &mut target, bounds, t0);
+        assert_eq!(target, 250.0 + BASE_RESIZE_STEP);
     }
 }

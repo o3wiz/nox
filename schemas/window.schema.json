@@ -27,6 +27,13 @@
       "minimum": 100,
       "maximum": 1200
     },
+    "filter_resize_sensitivity": {
+      "type": "number",
+      "format": "float",
+      "minimum": 0.1,
+      "maximum": 10.0,
+      "default": 1.0
+    },
     "show_status_bar": {
       "type": "boolean"
     },
