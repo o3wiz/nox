@@ -44,6 +44,7 @@
         "TextSelected",
         "TextSelected && RegexMode",
         "RegexMode",
+        "TextInput",
         "Search",
         "FilePath",
         "GoTo",
@@ -109,7 +110,9 @@
         "decrease_filter_height",
         "zoom_in",
         "zoom_out",
-        "zoom_reset"
+        "zoom_reset",
+        "move_to_line_start",
+        "move_to_line_end"
       ]
     }
   }

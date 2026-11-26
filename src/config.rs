@@ -191,6 +191,8 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    MoveToLineStart,
+    MoveToLineEnd,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 pub enum KeyContext {
@@ -201,6 +203,7 @@ pub enum KeyContext {
     #[serde(rename = "TextSelected && RegexMode")]
     TextSelectedRegexMode,
     RegexMode,
+    TextInput,
     Search,
     FilePath,
     GoTo,
@@ -215,6 +218,7 @@ impl KeyContext {
             Self::TextSelected => "TextSelected",
             Self::TextSelectedRegexMode => "TextSelected && RegexMode",
             Self::RegexMode => "RegexMode",
+            Self::TextInput => "TextInput",
             Self::Search => "Search",
             Self::FilePath => "FilePath",
             Self::GoTo => "GoTo",
@@ -225,6 +229,7 @@ impl KeyContext {
     pub fn predicate(self) -> &'static str {
         match self {
             Self::TextSelectedRegexMode => "RegexMode > TextSelected",
+            Self::TextInput => "EditableText",
             other => other.as_str(),
         }
     }
@@ -233,7 +238,8 @@ impl KeyContext {
         match self {
             Self::Workspace => 0,
             Self::RegexMode => 1,
-            Self::Log | Self::Search | Self::FilePath | Self::GoTo | Self::Presets => 0,
+            Self::Log | Self::TextInput => 0,
+            Self::Search | Self::FilePath | Self::GoTo | Self::Presets => 1,
             Self::Selection | Self::TextSelected => 1,
             Self::TextSelectedRegexMode => 2,
         }

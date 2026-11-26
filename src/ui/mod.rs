@@ -12,7 +12,9 @@ use components::{
 use gpui::{prelude::*, *};
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
-    actions::{self as input_actions, DEFAULT_INPUT_CONTEXT, default_bindings},
+    actions::{
+        self as input_actions, DEFAULT_INPUT_CONTEXT, EditableTextActionHandler, default_bindings,
+    },
     text_input,
 };
 use icons::Icon;
@@ -2602,6 +2604,20 @@ impl Workspace {
                 self.set_zoom_percent(DEFAULT_ZOOM_PERCENT, cx);
                 return;
             }
+            Command::MoveToLineStart | Command::MoveToLineEnd => {
+                if let Some(input) = self.focused_text_input(window, cx) {
+                    input.update(cx, |state, cx| match command {
+                        Command::MoveToLineStart => {
+                            state.nav_line_start(&input_actions::NavLineStart, window, cx);
+                        }
+                        Command::MoveToLineEnd => {
+                            state.nav_line_end(&input_actions::NavLineEnd, window, cx);
+                        }
+                        _ => unreachable!(),
+                    });
+                }
+                return;
+            }
         }
         cx.notify();
     }
@@ -2673,6 +2689,18 @@ impl Workspace {
         } else {
             self.command(Command::GoToLine, window, cx);
         }
+    }
+
+    fn focused_text_input(&self, window: &Window, cx: &App) -> Option<Entity<EditableTextState>> {
+        [
+            &self.input,
+            &self.path_input,
+            &self.goto,
+            &self.presets_search,
+        ]
+        .into_iter()
+        .find(|input| input.read(cx).focus_handle(cx).is_focused(window))
+        .cloned()
     }
 
     fn path_input_focused(&self, window: &Window, cx: &App) -> bool {
@@ -7249,13 +7277,18 @@ mod tests {
             assert_eq!(view.preset_index, 1);
             assert_eq!(view.tabs[0].selected, 0);
         });
-        cx.simulate_keystrokes("end");
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::LastLine, window, cx);
+        });
         view.read_with(cx, |view, _| assert_eq!(view.preset_index, 2));
         cx.simulate_keystrokes("down");
         view.read_with(cx, |view, _| assert_eq!(view.preset_index, 0));
         cx.simulate_keystrokes("up");
         view.read_with(cx, |view, _| assert_eq!(view.preset_index, 2));
-        cx.simulate_keystrokes("home down");
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FirstLine, window, cx);
+        });
+        cx.simulate_keystrokes("down");
         view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
 
         // Pressing Enter applies the highlighted preset ("Warnings": literal "warn"), closes menu, and restores focus.
@@ -11962,5 +11995,398 @@ mod tests {
                 "initial load deferred reveal",
             );
         });
+    }
+
+    #[gpui::test]
+    fn text_navigation_line_start_and_end_work_across_all_text_inputs(cx: &mut TestAppContext) {
+        assert_eq!(
+            config::KeyContext::TextInput.predicate(),
+            DEFAULT_INPUT_CONTEXT
+        );
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nav.log");
+        std::fs::write(&path, "line 0\nline 1\nline 2\nline 3\nline 4\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].selected = 1;
+            view.tabs[0].main_selection = LineSelection::single(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let caret_range = |input: &Entity<EditableTextState>,
+                           window: &mut Window,
+                           cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // 1. Search box (`Search` / `TextInput`): cmd-left/right and home/end move caret,
+        //    clear active selection, and handle Unicode text.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("alpha beta");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        cx.simulate_input("[");
+        cx.simulate_keystrokes("cmd-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = view.input.read(cx).as_str().encode_utf16().count();
+            assert_eq!(caret_range(&view.input, window, cx), end..end);
+        });
+        cx.simulate_input("]");
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        cx.simulate_input("<");
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = view.input.read(cx).as_str().encode_utf16().count();
+            assert_eq!(caret_range(&view.input, window, cx), end..end);
+        });
+        cx.simulate_input(">");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "<[alpha beta]>");
+        });
+
+        // Collapses active selection cleanly and handles multibyte Unicode text.
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        cx.simulate_keystrokes(select_all);
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+            view.input
+                .update(cx, |state, cx| state.emplace("שלום мир", cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = "שלום мир".encode_utf16().count();
+            assert_eq!(caret_range(&view.input, window, cx), end..end);
+        });
+
+        // 2. File path editing (`FilePath` / `TextInput`): collapses the initial full selection
+        //    and moves to start/end with home/end and cmd-left/cmd-right without opening completions.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        let initial_path =
+            view.read_with(cx, |view, cx| view.path_input.read(cx).as_str().to_owned());
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.path_input, window, cx), 0..0);
+            assert_eq!(view.path_input.read(cx).as_str(), initial_path);
+            assert!(!view.show_path_completions);
+        });
+        cx.simulate_keystrokes("cmd-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = initial_path.encode_utf16().count();
+            assert_eq!(caret_range(&view.path_input, window, cx), end..end);
+        });
+        cx.simulate_input(".bak");
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.path_input, window, cx), 0..0);
+        });
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let expected = format!("!{initial_path}.bak");
+            assert_eq!(view.path_input.read(cx).as_str(), expected);
+            let end = expected.encode_utf16().count();
+            assert_eq!(caret_range(&view.path_input, window, cx), end..end);
+            assert_eq!(view.tabs[0].selected, 1);
+        });
+
+        // 3. Pattern search box (`Presets` / `TextInput`): cmd-left/right and home/end navigate
+        //    the pattern search text instead of jumping preset_index.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::TogglePresets, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
+        cx.simulate_input("err");
+        cx.run_until_parked();
+        let preset_index_after_filter = view.read_with(cx, |view, _| view.preset_index);
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 0..0);
+            assert_eq!(view.preset_index, preset_index_after_filter);
+        });
+        cx.simulate_input("^");
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = view.presets_search.read(cx).as_str().encode_utf16().count();
+            assert_eq!(caret_range(&view.presets_search, window, cx), end..end);
+            assert_eq!(view.preset_index, preset_index_after_filter);
+        });
+        cx.simulate_input("$");
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 0..0);
+            assert_eq!(view.presets_search.read(cx).as_str(), "^err$");
+        });
+        cx.simulate_keystrokes("cmd-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 5..5);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 4. Go-to-line input (`GoTo` / `TextInput`): home/end and cmd-left/right move caret.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("42");
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 0..0);
+        });
+        cx.simulate_input("1");
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 3..3);
+        });
+        cx.simulate_input("0");
+        cx.simulate_keystrokes("cmd-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 0..0);
+            assert_eq!(view.goto.read(cx).as_str(), "1420");
+        });
+        cx.simulate_keystrokes("cmd-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 4..4);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 5. Log pane (`Log` context) retains home/end line navigation untouched.
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.tabs[0].selected, 1);
+            // Calling text navigation commands when no text input is focused is a safe no-op.
+            view.command(Command::MoveToLineStart, window, cx);
+            view.command(Command::MoveToLineEnd, window, cx);
+            assert_eq!(view.tabs[0].selected, 1);
+        });
+        cx.simulate_keystrokes("end");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.tabs[0].selected, 4));
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.tabs[0].selected, 0));
+    }
+
+    #[gpui::test]
+    fn text_navigation_supports_custom_bindings_and_context_specific_overrides(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Add extra user keybindings for line start/end across all text inputs.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "ctrl-a".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::MoveToLineStart,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "ctrl-e".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::MoveToLineEnd,
+        });
+        // Intentionally register a specific `Presets` override BEFORE a `TextInput` binding
+        // for the same key to verify specificity ordering is independent of JSON order.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-home".into(),
+            context: config::KeyContext::Presets,
+            action: Command::FirstLine,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-home".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::MoveToLineStart,
+        });
+        config.validate().unwrap();
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("custom-nav.log");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let caret_range = |input: &Entity<EditableTextState>,
+                           window: &mut Window,
+                           cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // Custom ctrl-a / ctrl-e and alt-home work in Search.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("hello");
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("ctrl-e");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 5..5);
+        });
+        cx.simulate_keystrokes("alt-home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+
+        // Custom ctrl-a / ctrl-e work in FilePath.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.path_input, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("ctrl-e");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let end = view.path_input.read(cx).as_str().encode_utf16().count();
+            assert_eq!(caret_range(&view.path_input, window, cx), end..end);
+        });
+
+        // Custom ctrl-a / ctrl-e work in GoTo.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("99");
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("ctrl-e");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.goto, window, cx), 2..2);
+        });
+
+        // In Presets, custom ctrl-a / ctrl-e move text caret, while Presets-specific alt-home
+        // overrides TextInput's alt-home regardless of binding order.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::TogglePresets, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 2));
+        cx.simulate_input("e");
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
+        cx.simulate_keystrokes("ctrl-a");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 0..0);
+            assert_eq!(view.preset_index, 1);
+        });
+        cx.simulate_keystrokes("ctrl-e");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(caret_range(&view.presets_search, window, cx), 1..1);
+        });
+        cx.simulate_keystrokes("alt-home");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.preset_index, 0);
+            assert_eq!(caret_range(&view.presets_search, window, cx), 1..1);
+        });
+
+        // Verify shortcut label formatting for cmd/home/end tokens.
+        assert_eq!(theme::format_shortcut("home"), "Home");
+        assert_eq!(theme::format_shortcut("end"), "End");
+        if cfg!(target_os = "macos") {
+            assert_eq!(theme::format_shortcut("cmd-left"), "⌘←");
+            assert_eq!(theme::format_shortcut("cmd-right"), "⌘→");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(theme::format_shortcut("cmd-left"), "Win+←");
+            assert_eq!(theme::format_shortcut("cmd-right"), "Win+→");
+        } else {
+            assert_eq!(theme::format_shortcut("cmd-left"), "Super+←");
+            assert_eq!(theme::format_shortcut("cmd-right"), "Super+→");
+        }
     }
 }
