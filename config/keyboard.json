@@ -102,6 +102,11 @@
       "context": "Log"
     },
     {
+      "keys": "c",
+      "action": "copy_match_results",
+      "context": "FilterLog"
+    },
+    {
       "keys": "enter",
       "action": "search",
       "context": "Search"

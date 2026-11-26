@@ -272,6 +272,114 @@ pub fn expand_tabs_with_highlights(
     (expanded, mapped)
 }
 
+/// Outcome of collecting match results for clipboard copying.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MatchCopyResult {
+    /// Formatted clipboard text and number of matched lines included.
+    Copied { text: String, count: usize },
+    /// No matched lines or no non-empty highlightable match text to copy.
+    Empty,
+    /// Formatted output would exceed the configured byte limit.
+    LimitExceeded,
+}
+
+/// Collects text to copy for all matched source lines in `matches`.
+///
+/// - In `SearchMode::Regex` (when `options.invert` is false and `regex` is `Some`),
+///   extracts only the spans that match highlighting would highlight
+///   ([`highlight_ranges`]: capturing groups when defined, otherwise full matches),
+///   regardless of `options.highlight_matches`. Multiple spans on the same line are
+///   separated by a single space (`' '`), and lines are separated by `'\n'`. Matched
+///   lines with no non-empty highlight ranges are skipped.
+/// - In `SearchMode::Literal` (or when `options.invert` is true), copies the full
+///   matched lines separated by `'\n'`.
+pub fn extract_match_results(
+    log: &LogFile,
+    matches: &[usize],
+    regex: Option<&Regex>,
+    options: &SearchConfig,
+    max_bytes: u64,
+) -> Result<MatchCopyResult> {
+    if matches.is_empty() {
+        return Ok(MatchCopyResult::Empty);
+    }
+
+    let mut copied = String::new();
+    let mut copied_count = 0usize;
+
+    if options.mode == SearchMode::Regex && !options.invert {
+        let Some(regex) = regex else {
+            return Ok(MatchCopyResult::Empty);
+        };
+        for &line in matches {
+            let text = log.line(line, usize::MAX)?;
+            let ranges = highlight_ranges(&text, regex, SearchMode::Regex);
+            if ranges.is_empty() {
+                continue;
+            }
+            let line_len = ranges
+                .iter()
+                .map(|r| r.len() as u64)
+                .fold(0u64, u64::saturating_add)
+                .saturating_add((ranges.len() - 1) as u64);
+            let sep = u64::from(copied_count > 0);
+            if (copied.len() as u64)
+                .saturating_add(sep)
+                .saturating_add(line_len)
+                > max_bytes
+            {
+                return Ok(MatchCopyResult::LimitExceeded);
+            }
+            if copied_count > 0 {
+                copied.push('\n');
+            }
+            for (idx, range) in ranges.into_iter().enumerate() {
+                if idx > 0 {
+                    copied.push(' ');
+                }
+                copied.push_str(&text[range]);
+            }
+            copied_count += 1;
+        }
+    } else {
+        for &line in matches {
+            let sep = u64::from(copied_count > 0);
+            // Fast pre-check before reading an oversized single line from disk.
+            // Raw disk bytes may include up to 2 line-ending bytes (`\r\n`).
+            let min_line_bytes = log.line_bytes(line).saturating_sub(2);
+            if (copied.len() as u64)
+                .saturating_add(sep)
+                .saturating_add(min_line_bytes)
+                > max_bytes
+            {
+                return Ok(MatchCopyResult::LimitExceeded);
+            }
+            let text = log.line(line, usize::MAX)?;
+            if (copied.len() as u64)
+                .saturating_add(sep)
+                .saturating_add(text.len() as u64)
+                > max_bytes
+            {
+                return Ok(MatchCopyResult::LimitExceeded);
+            }
+            if copied_count > 0 {
+                copied.push('\n');
+            }
+            copied.push_str(&text);
+            copied_count += 1;
+        }
+    }
+
+    if copied_count == 0 {
+        Ok(MatchCopyResult::Empty)
+    } else {
+        Ok(MatchCopyResult::Copied {
+            text: copied,
+            count: copied_count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +542,131 @@ mod tests {
         let (expanded, mapped) = expand_tabs_with_highlights("a\tb", &single_tab, 1);
         assert_eq!(expanded, "a b");
         assert_eq!(mapped, vec![2..3]);
+    }
+
+    #[test]
+    fn extract_match_results_handles_regex_groups_full_matches_literals_invert_and_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matches.log");
+        std::fs::write(
+            &path,
+            concat!(
+                "INFO boot\n",
+                "WARN user=alice\tstatus=200 code=ok\n",
+                "DEBUG middle\n",
+                "ERROR user=bob\tstatus=503 status=504\n",
+                "INFO שלום world\n",
+            ),
+        )
+        .unwrap();
+        let log = LogFile::open(&path, &AtomicBool::new(false)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let bookmarks = BTreeSet::from([0]);
+
+        // Regex mode with capturing groups: multiple groups on one line are space-separated,
+        // even when `highlight_matches` is disabled. Context and bookmark rows are excluded.
+        let mut opts = Config::load(None).unwrap().search;
+        opts.mode = SearchMode::Regex;
+        opts.highlight_matches = false;
+        opts.context_lines = 1;
+        let pattern = r"user=(\w+).*?status=(\d{3})";
+        let res = search(&log, pattern, &opts, &bookmarks, &cancel).unwrap();
+        assert_eq!(res.matches, vec![1, 3]);
+        assert_eq!(res.visible, vec![0, 1, 2, 3, 4]);
+        let re = compile(pattern, &opts).unwrap();
+        assert_eq!(
+            extract_match_results(&log, &res.matches, Some(&re), &opts, 64 * 1024).unwrap(),
+            MatchCopyResult::Copied {
+                text: "alice 200\nbob 503".to_owned(),
+                count: 2,
+            }
+        );
+
+        // Regex mode without capturing groups copies full matches, space-separated per line.
+        let ungrouped = r"status=\d{3}";
+        let res = search(&log, ungrouped, &opts, &bookmarks, &cancel).unwrap();
+        let re = compile(ungrouped, &opts).unwrap();
+        assert_eq!(
+            extract_match_results(&log, &res.matches, Some(&re), &opts, 64 * 1024).unwrap(),
+            MatchCopyResult::Copied {
+                text: "status=200\nstatus=503 status=504".to_owned(),
+                count: 2,
+            }
+        );
+
+        // Regex mode skips matched lines whose optional capture group did not participate.
+        let optional = r"INFO (שלום)?";
+        let res = search(&log, optional, &opts, &bookmarks, &cancel).unwrap();
+        assert_eq!(res.matches, vec![0, 4]);
+        let re = compile(optional, &opts).unwrap();
+        assert_eq!(
+            extract_match_results(&log, &res.matches, Some(&re), &opts, 64 * 1024).unwrap(),
+            MatchCopyResult::Copied {
+                text: "שלום".to_owned(),
+                count: 1,
+            }
+        );
+
+        // Regex mode where no matched line has any non-empty highlightable text returns Empty.
+        let zero_len = r"^";
+        let res = search(&log, zero_len, &opts, &bookmarks, &cancel).unwrap();
+        let re = compile(zero_len, &opts).unwrap();
+        assert_eq!(
+            extract_match_results(&log, &res.matches, Some(&re), &opts, 64 * 1024).unwrap(),
+            MatchCopyResult::Empty
+        );
+
+        // Literal mode copies full matched lines verbatim (including raw tabs), ignoring bookmarks/context.
+        opts.mode = SearchMode::Literal;
+        opts.highlight_matches = true;
+        let res = search(&log, "status=", &opts, &bookmarks, &cancel).unwrap();
+        assert_eq!(res.matches, vec![1, 3]);
+        assert_eq!(
+            extract_match_results(&log, &res.matches, None, &opts, 64 * 1024).unwrap(),
+            MatchCopyResult::Copied {
+                text: "WARN user=alice\tstatus=200 code=ok\nERROR user=bob\tstatus=503 status=504"
+                    .to_owned(),
+                count: 2,
+            }
+        );
+
+        // Inverted regex mode copies full matched (non-excluded) lines.
+        opts.mode = SearchMode::Regex;
+        opts.invert = true;
+        let res = search(&log, r"status=\d{3}", &opts, &bookmarks, &cancel).unwrap();
+        assert_eq!(res.matches, vec![0, 2, 4]);
+        assert_eq!(
+            extract_match_results(&log, &res.matches, None, &opts, 64 * 1024).unwrap(),
+            MatchCopyResult::Copied {
+                text: "INFO boot\nDEBUG middle\nINFO שלום world".to_owned(),
+                count: 3,
+            }
+        );
+
+        // Byte limit enforcement for both literal and regex modes, while allowing small
+        // regex captures extracted from longer source lines.
+        opts.invert = false;
+        opts.mode = SearchMode::Literal;
+        assert_eq!(
+            extract_match_results(&log, &[1, 3], None, &opts, 20).unwrap(),
+            MatchCopyResult::LimitExceeded
+        );
+        opts.mode = SearchMode::Regex;
+        let re = compile(r"user=(\w+)", &opts).unwrap();
+        assert_eq!(
+            extract_match_results(&log, &[1, 3], Some(&re), &opts, 9).unwrap(),
+            MatchCopyResult::Copied {
+                text: "alice\nbob".to_owned(),
+                count: 2,
+            }
+        );
+        assert_eq!(
+            extract_match_results(&log, &[1, 3], Some(&re), &opts, 8).unwrap(),
+            MatchCopyResult::LimitExceeded
+        );
+        assert_eq!(
+            extract_match_results(&log, &[], Some(&re), &opts, 64).unwrap(),
+            MatchCopyResult::Empty
+        );
     }
 }

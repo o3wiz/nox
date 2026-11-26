@@ -767,6 +767,9 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert!(bindings.iter().any(|b| {
         b["keys"] == "up" && b["context"] == "FilePath" && b["action"] == "previous_line"
     }));
+    assert!(bindings.iter().any(|b| {
+        b["keys"] == "c" && b["context"] == "FilterLog" && b["action"] == "copy_match_results"
+    }));
 
     // Created missing files should point to local `schemas/`.
     let files_cfg: serde_json::Value =

@@ -26,7 +26,7 @@ use nox::{
         CompletionResult, PathCompletion, complete_path, ensure_trailing_separator, home_dir,
         resolve_input_path,
     },
-    search::{self, SearchResults},
+    search::{self, MatchCopyResult, SearchResults},
     selection::{LineSelection, TextPosition, TextSelection, word_range_at},
     session::{self, SavedTab, Session},
     zoom::{
@@ -1749,6 +1749,59 @@ impl Workspace {
         }));
     }
 
+    fn copy_match_results(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(log) = &tab.log else {
+            return;
+        };
+        if tab.results.matches.is_empty() {
+            self.status = Some(StatusMessage::warning("No match results to copy"));
+            return;
+        }
+        let compiled_fallback;
+        let regex = if tab.options.mode == SearchMode::Regex && !tab.options.invert {
+            if let Some(re) = tab.highlight_regex.as_ref() {
+                Some(re)
+            } else if !tab.query.is_empty() {
+                compiled_fallback = search::compile(&tab.query, &tab.options).ok();
+                compiled_fallback.as_ref()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match search::extract_match_results(
+            log,
+            &tab.results.matches,
+            regex,
+            &tab.options,
+            MAX_COPY_BYTES,
+        ) {
+            Ok(MatchCopyResult::Copied { text, count }) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.status = Some(StatusMessage::success(if count == 1 {
+                    "Copied 1 match result".to_owned()
+                } else {
+                    format!("Copied {} match results", format_count(count))
+                }));
+            }
+            Ok(MatchCopyResult::Empty) => {
+                self.status = Some(StatusMessage::warning("No highlighted match text to copy"));
+            }
+            Ok(MatchCopyResult::LimitExceeded) => {
+                self.status = Some(StatusMessage::warning(
+                    "Match results too large to copy (limit 64 MB)",
+                ));
+            }
+            Err(error) => {
+                self.status = Some(StatusMessage::error(error.to_string()));
+            }
+        }
+    }
+
     fn search_selected_text(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         let Some(result) = self.extract_selected_text(pane) else {
             return;
@@ -2485,6 +2538,7 @@ impl Workspace {
                 self.active_pane = pane;
                 self.copy_selected_text(pane, cx);
             }
+            Command::CopyMatchResults => self.copy_match_results(cx),
             Command::SearchSelectedText => {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
@@ -4426,24 +4480,30 @@ impl Workspace {
                                     cx.listener(|this, _, window, cx| this.toggle_goto(window, cx)),
                                 ),
                             )
-                            .child(self.cmd_icon(
-                                "copy",
-                                Icon::Copy,
-                                if has_text_selection {
-                                    "Copy selected text".to_owned()
-                                } else if selected_count > 1 {
-                                    format!("Copy {} selected lines", format_count(selected_count))
-                                } else {
-                                    "Copy selected line".to_owned()
-                                },
-                                if has_text_selection {
-                                    Command::CopySelectedText
-                                } else {
-                                    Command::CopyLine
-                                },
-                                ButtonTone::Ghost,
-                                cx,
-                            ))
+                            .child(
+                                self.cmd_icon(
+                                    "copy",
+                                    Icon::Copy,
+                                    if has_text_selection {
+                                        "Copy selected text".to_owned()
+                                    } else if selected_count > 1 {
+                                        format!(
+                                            "Copy {} selected lines",
+                                            format_count(selected_count)
+                                        )
+                                    } else {
+                                        "Copy selected line".to_owned()
+                                    },
+                                    if has_text_selection {
+                                        Command::CopySelectedText
+                                    } else {
+                                        Command::CopyLine
+                                    },
+                                    ButtonTone::Ghost,
+                                    cx,
+                                )
+                                .debug_selector(|| "copy".into()),
+                            )
                             .child(toolbar_divider(t))
                             .child(self.render_zoom_button(
                                 "zoom-out",
@@ -5802,6 +5862,11 @@ impl Workspace {
             ButtonTone::Ghost
         };
 
+        let match_count = self
+            .tabs
+            .get(self.active)
+            .map_or(0, |tab| tab.results.matches.len());
+
         let mut bar = div()
             .h(px(44.))
             .flex_shrink_0()
@@ -5822,30 +5887,57 @@ impl Workspace {
                 .debug_selector(|| "highlight-matches".into()),
             )
             .child(search_box)
-            .child(self.cmd_icon(
-                "prev-match",
-                Icon::ChevronUp,
-                "Previous match",
-                Command::PreviousMatch,
-                ButtonTone::Ghost,
-                cx,
-            ))
-            .child(self.cmd_icon(
-                "next-match",
-                Icon::ChevronDown,
-                "Next match",
-                Command::NextMatch,
-                ButtonTone::Ghost,
-                cx,
-            ))
-            .child(self.cmd_icon(
-                "search",
-                Icon::ArrowRight,
-                "Apply search",
-                Command::Search,
-                ButtonTone::Primary,
-                cx,
-            ));
+            .child(
+                self.cmd_icon(
+                    "prev-match",
+                    Icon::ChevronUp,
+                    "Previous match",
+                    Command::PreviousMatch,
+                    ButtonTone::Ghost,
+                    cx,
+                )
+                .debug_selector(|| "prev-match".into()),
+            )
+            .child(
+                self.cmd_icon(
+                    "next-match",
+                    Icon::ChevronDown,
+                    "Next match",
+                    Command::NextMatch,
+                    ButtonTone::Ghost,
+                    cx,
+                )
+                .debug_selector(|| "next-match".into()),
+            )
+            .child(
+                self.cmd_icon(
+                    "search",
+                    Icon::ArrowRight,
+                    "Apply search",
+                    Command::Search,
+                    ButtonTone::Primary,
+                    cx,
+                )
+                .debug_selector(|| "search-apply".into()),
+            )
+            .child(toolbar_divider(t))
+            .child(
+                self.cmd_icon(
+                    "copy-matches",
+                    Icon::CopyMatches,
+                    if match_count == 1 {
+                        "Copy 1 match result".to_owned()
+                    } else if match_count > 1 {
+                        format!("Copy {} match results", format_count(match_count))
+                    } else {
+                        "Copy match results".to_owned()
+                    },
+                    Command::CopyMatchResults,
+                    ButtonTone::Ghost,
+                    cx,
+                )
+                .debug_selector(|| "copy-matches".into()),
+            );
 
         if !self.config.search.presets.is_empty() {
             bar = bar
@@ -6354,7 +6446,7 @@ impl Render for Workspace {
                 .flex_col()
                 .child(
                     div()
-                        .when(results_multi_selected, |body| body.key_context("Selection"))
+                        .key_context("FilterLog")
                         .flex_1()
                         .w_full()
                         .min_h_0()
@@ -6362,10 +6454,18 @@ impl Render for Workspace {
                         .flex_col()
                         .child(
                             div()
-                                .when(results_text_selected, |body| {
-                                    body.key_context("TextSelected")
-                                })
-                                .track_focus(&self.results_focus)
+                                .when(results_multi_selected, |body| body.key_context("Selection"))
+                                .flex_1()
+                                .w_full()
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .when(results_text_selected, |body| {
+                                            body.key_context("TextSelected")
+                                        })
+                                        .track_focus(&self.results_focus)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, window, cx| {
@@ -6439,6 +6539,7 @@ impl Render for Workspace {
                                     )
                                 }),
                         ),
+                    ),
                 );
 
             div()
@@ -6891,6 +6992,23 @@ mod tests {
                     "Icon::{icon:?} rasterized completely transparent"
                 );
             }
+
+            let visible_pixel_count = |icon: Icon| -> usize {
+                cx.svg_renderer()
+                    .render_single_frame(icon.svg_bytes(), 2.0)
+                    .unwrap()
+                    .as_bytes(0)
+                    .expect("icon frame bytes")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|px| px[3] > 0)
+                    .count()
+            };
+            assert!(
+                visible_pixel_count(Icon::CopyMatches) > visible_pixel_count(Icon::Copy),
+                "Icon::CopyMatches should fill the front square with more opaque pixels than Icon::Copy"
+            );
         });
     }
 
@@ -12720,6 +12838,302 @@ mod tests {
             assert!(view.tabs.is_empty());
             assert!(view.focus.is_focused(window));
             assert_eq!(view.quit_count, expected_quits);
+        });
+    }
+
+    #[gpui::test]
+    fn copy_match_results_button_and_shortcut_copy_regex_highlights_and_literal_lines(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.context_lines = 1;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("copy_matches.log");
+        std::fs::write(
+            &path,
+            concat!(
+                "INFO boot\n",
+                "WARN user=alice status=200 extra=ok\n",
+                "DEBUG middle\n",
+                "ERROR user=bob status=503 status=504\n",
+                "INFO tail\n",
+            ),
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, Vec::new(), window, cx));
+        cx.run_until_parked();
+
+        // Both copy buttons are hidden on the welcome screen, and default shortcut formats as "C".
+        assert!(cx.debug_bounds("copy").is_none());
+        assert!(cx.debug_bounds("copy-matches").is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.theme.shortcut(Command::CopyMatchResults).as_deref(),
+                Some("C")
+            );
+        });
+
+        // Open a tab and attach indexed log.
+        view.update(cx, |view, cx| {
+            view.open(path.clone(), cx);
+            view.tabs[0].log = Some(log);
+            view.tabs[0].loading = false;
+            view.tabs[0].bookmarks.insert(0);
+            view.refresh_bookmarks(0, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let copy_bounds = cx.debug_bounds("copy").expect("copy button bounds");
+        let search_apply_bounds = cx
+            .debug_bounds("search-apply")
+            .expect("search-apply button bounds");
+        let copy_matches_bounds = cx
+            .debug_bounds("copy-matches")
+            .expect("copy-matches button bounds");
+        let presets_bounds = cx
+            .debug_bounds("presets-trigger")
+            .expect("presets-trigger bounds");
+        assert!(
+            copy_bounds.bottom() < copy_matches_bounds.top(),
+            "copy-matches button should live in the filter bar below the header toolbar"
+        );
+        assert!(
+            search_apply_bounds.right() < copy_matches_bounds.left()
+                && copy_matches_bounds.right() < presets_bounds.left(),
+            "copy-matches button should sit between search navigation/apply buttons and Patterns"
+        );
+
+        // Pressing `c` in the Main pane (Log context only, not FilterLog) does nothing.
+        cx.simulate_keystrokes("c");
+        assert!(cx.read_from_clipboard().is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.status, None);
+        });
+
+        // Focusing the Filter pane (Log + FilterLog) and pressing `c` with no matches warns
+        // without writing to the clipboard.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert!(cx.read_from_clipboard().is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No match results to copy"))
+            );
+        });
+
+        // Typing `c` in the search input inserts text normally instead of triggering FilterLog.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.simulate_input("case");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "case");
+        });
+        assert!(cx.read_from_clipboard().is_none());
+
+        // Search in Regex mode with capturing groups and context/bookmarks present.
+        view.update_in(cx, |view, window, cx| {
+            view.input.update(cx, |input, cx| {
+                input.emplace(r"user=(\w+).*?status=(\d{3})", cx);
+            });
+            view.command(Command::Search, window, cx);
+            view.focus_pane(Pane::Main, window, cx);
+            view.status = None;
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].results.matches, vec![1, 3]);
+            assert_eq!(view.tabs[0].results.visible, vec![0, 1, 2, 3, 4]);
+        });
+
+        // Pressing `c` while focused in the Main pane does NOT fire the FilterLog binding.
+        cx.simulate_keystrokes("c");
+        assert!(cx.read_from_clipboard().is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.status, None);
+        });
+
+        // Focusing the Filter pane and pressing `c` copies only capturing groups, space-separated
+        // per line, while `Log` shortcuts like `m` (bookmark) continue working in Filter pane.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200\nbob 503".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::success("Copied 2 match results"))
+            );
+        });
+        cx.simulate_keystrokes("down m");
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.tabs[0].bookmarks.contains(&1),
+                "Log context shortcuts must remain active in the Filter pane"
+            );
+        });
+        cx.simulate_keystrokes("m");
+
+        // Turning off highlight_matches in Regex mode still copies what would be highlighted
+        // when clicking the copy-matches button, even while the Main pane is focused.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleHighlightMatches, window, cx);
+            assert!(!view.tabs[0].options.highlight_matches);
+            view.focus_pane(Pane::Main, window, cx);
+        });
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("sentinel".to_owned()))
+        });
+        let copy_matches_bounds = cx
+            .debug_bounds("copy-matches")
+            .expect("copy-matches button bounds after search");
+        cx.simulate_click(copy_matches_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200\nbob 503".to_owned())
+        );
+
+        // Regex without capturing groups copies full regex matches, space-separated per line,
+        // when pressing `c` in the Filter pane.
+        view.update_in(cx, |view, window, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace(r"status=\d{3}", cx));
+            view.command(Command::Search, window, cx);
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("status=200\nstatus=503 status=504".to_owned())
+        );
+
+        // Switching to Literal mode copies full matched lines (excluding context and bookmarks).
+        view.update_in(cx, |view, window, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("status=", cx));
+            view.command(Command::ToggleRegex, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert_eq!(view.tabs[0].results.matches, vec![1, 3]);
+            assert_eq!(view.tabs[0].results.visible, vec![0, 1, 2, 3, 4]);
+        });
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(
+                "WARN user=alice status=200 extra=ok\nERROR user=bob status=503 status=504"
+                    .to_owned()
+            )
+        );
+
+        // Regex mode with a non-participating optional capture group warns and keeps clipboard intact.
+        view.update_in(cx, |view, window, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace(r"INFO (missing)?", cx));
+            view.command(Command::ToggleRegex, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(
+                "WARN user=alice status=200 extra=ok\nERROR user=bob status=503 status=504"
+                    .to_owned()
+            )
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No highlighted match text to copy"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn filter_log_context_overrides_log_in_filter_pane_regardless_of_binding_order(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Put FilterLog BEFORE Log for the same key to verify specificity + DOM depth precedence.
+        config.keyboard.bindings = vec![
+            config::Binding {
+                keys: "x".to_owned(),
+                context: config::KeyContext::FilterLog,
+                action: Command::CopyMatchResults,
+            },
+            config::Binding {
+                keys: "x".to_owned(),
+                context: config::KeyContext::Log,
+                action: Command::ToggleBookmark,
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("filter_context.log");
+        std::fs::write(&path, "INFO alpha\nERROR beta\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].loading = false;
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR (\\w+)", cx));
+            view.command(Command::Search, window, cx);
+            view.focus_pane(Pane::Main, window, cx);
+        });
+        cx.run_until_parked();
+
+        // In Main pane, `x` runs the `Log` binding (ToggleBookmark), not `FilterLog`.
+        cx.simulate_keystrokes("x");
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.contains(&0));
+        });
+        assert!(cx.read_from_clipboard().is_none());
+
+        // In Filter pane, `x` runs the more specific `FilterLog` binding (CopyMatchResults).
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("beta".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
         });
     }
 }

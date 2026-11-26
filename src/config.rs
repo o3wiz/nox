@@ -161,6 +161,7 @@ pub enum Command {
     PreviousMatch,
     CopyLine,
     CopySelectedText,
+    CopyMatchResults,
     SearchSelectedText,
     AppendSelectedTextToSearch,
     Reload,
@@ -203,6 +204,7 @@ pub enum Command {
 pub enum KeyContext {
     Workspace,
     Log,
+    FilterLog,
     Selection,
     TextSelected,
     #[serde(rename = "TextSelected && RegexMode")]
@@ -219,6 +221,7 @@ impl KeyContext {
         match self {
             Self::Workspace => "Workspace",
             Self::Log => "Log",
+            Self::FilterLog => "FilterLog",
             Self::Selection => "Selection",
             Self::TextSelected => "TextSelected",
             Self::TextSelectedRegexMode => "TextSelected && RegexMode",
@@ -244,6 +247,7 @@ impl KeyContext {
             Self::Workspace => 0,
             Self::RegexMode => 1,
             Self::Log | Self::TextInput => 0,
+            Self::FilterLog => 1,
             Self::Search | Self::FilePath | Self::GoTo | Self::Presets => 1,
             Self::Selection | Self::TextSelected => 1,
             Self::TextSelectedRegexMode => 2,

@@ -40,6 +40,7 @@
       "enum": [
         "Workspace",
         "Log",
+        "FilterLog",
         "Selection",
         "TextSelected",
         "TextSelected && RegexMode",
@@ -76,6 +77,7 @@
         "previous_match",
         "copy_line",
         "copy_selected_text",
+        "copy_match_results",
         "search_selected_text",
         "append_selected_text_to_search",
         "reload",
