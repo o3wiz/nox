@@ -333,6 +333,13 @@ pub fn format_shortcut(keys: &str) -> String {
                     "enter" => "↵".to_owned(),
                     "escape" => "Esc".to_owned(),
                     "tab" => "⇥".to_owned(),
+                    "backspace" => {
+                        if mac {
+                            "⌫".to_owned()
+                        } else {
+                            "Backspace".to_owned()
+                        }
+                    }
                     "up" => "↑".to_owned(),
                     "down" => "↓".to_owned(),
                     "left" => "←".to_owned(),

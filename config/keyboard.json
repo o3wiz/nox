@@ -380,6 +380,11 @@
       "keys": "shift-down",
       "action": "select_to_line_end",
       "context": "TextInput"
+    },
+    {
+      "keys": "cmd-backspace",
+      "action": "delete_to_line_start",
+      "context": "TextInput"
     }
   ]
 }

@@ -961,15 +961,22 @@ fn text_editing_line_selection_and_deletion_config_defaults_and_migration() {
         b.context == KeyContext::TextInput && matches!(b.keys.as_str(), "shift-home" | "shift-end")
     }));
 
-    // Delete-to-line actions have no default shortcuts assigned in keyboard.json.
-    assert!(!defaults.keyboard.bindings.iter().any(|b| {
-        matches!(
-            b.action,
-            Command::DeleteToLineStart | Command::DeleteToLineEnd
-        )
-    }));
+    // Delete-to-line-start defaults to cmd-backspace in TextInput; delete-to-line-end has no default.
+    assert!(has_binding(
+        &defaults,
+        "cmd-backspace",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(
+        !defaults
+            .keyboard
+            .bindings
+            .iter()
+            .any(|b| b.action == Command::DeleteToLineEnd)
+    );
 
-    // Custom keyboard.json can configure delete_to_line_start / delete_to_line_end and custom select bindings.
+    // Custom keyboard.json can override delete_to_line_start and configure delete_to_line_end and custom select bindings.
     let custom_dir = tempdir().unwrap();
     fs::write(
         custom_dir.path().join("keyboard.json"),
@@ -990,6 +997,12 @@ fn text_editing_line_selection_and_deletion_config_defaults_and_migration() {
         KeyContext::TextInput,
         Command::DeleteToLineStart
     ));
+    assert!(!has_binding(
+        &custom,
+        "cmd-backspace",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
     assert!(has_binding(
         &custom,
         "alt-k",
@@ -997,7 +1010,7 @@ fn text_editing_line_selection_and_deletion_config_defaults_and_migration() {
         Command::DeleteToLineEnd
     ));
 
-    // Migration adds missing select_to_line_* defaults without adding delete_to_line_* shortcuts.
+    // Migration adds missing select_to_line_* and delete_to_line_start defaults without adding delete_to_line_end.
     let migrate_dir = tempdir().unwrap();
     fs::write(
         migrate_dir.path().join("keyboard.json"),
@@ -1037,10 +1050,44 @@ fn text_editing_line_selection_and_deletion_config_defaults_and_migration() {
         KeyContext::TextInput,
         Command::SelectToLineEnd
     ));
-    assert!(!migrated.keyboard.bindings.iter().any(|b| {
-        matches!(
-            b.action,
-            Command::DeleteToLineStart | Command::DeleteToLineEnd
-        )
-    }));
+    assert!(has_binding(
+        &migrated,
+        "cmd-backspace",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(
+        !migrated
+            .keyboard
+            .bindings
+            .iter()
+            .any(|b| b.action == Command::DeleteToLineEnd)
+    );
+
+    // Migration preserves an existing custom delete_to_line_start binding instead of adding cmd-backspace.
+    let custom_migrate_dir = tempdir().unwrap();
+    fs::write(
+        custom_migrate_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "ctrl-u", "context": "TextInput", "action": "delete_to_line_start" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_migrate_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_migrate_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "ctrl-u",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "cmd-backspace",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
 }

@@ -87,6 +87,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | TextSelected | escape | Clear text selection |
 | TextInput | cmd-left / home, cmd-right / end | Move cursor to start / end of line in any text input (Search, FilePath, GoTo, Presets) |
 | TextInput | cmd-shift-left / shift-up, cmd-shift-right / shift-down | Select to start / end of line in any text input (Search, FilePath, GoTo, Presets) |
+| TextInput | cmd-backspace | Delete to start of line in any text input (Search, FilePath, GoTo, Presets) |
 | Search | Enter / Escape | Apply search / focus log |
 | Search | secondary-alt-r | Toggle regular expression |
 | Search | secondary-alt-c | Toggle match case |
@@ -97,7 +98,7 @@ Default shortcuts (`secondary` is Command on macOS and Control elsewhere):
 | FilePath | Tab / shift-tab, up/down, Escape | Complete filesystem path / navigate suggestions / cancel |
 | Presets | type to filter, up/down, Enter, Escape | Fuzzy-filter / navigate / apply / close saved patterns |
 
-Text editing uses GPUI CE's native editable-text element, including clipboard operations, selection, undo, and IME support. Configurable `TextInput` actions also include `delete_to_line_start` and `delete_to_line_end`, which have no default shortcuts assigned until bound in `keyboard.json`.
+Text editing uses GPUI CE's native editable-text element, including clipboard operations, selection, undo, and IME support. Configurable `TextInput` actions also include `delete_to_line_end`, which has no default shortcut assigned until bound in `keyboard.json`.
 
 ## Configuration
 

@@ -13638,20 +13638,26 @@ mod tests {
     }
 
     #[gpui::test]
-    fn text_delete_to_line_start_and_end_support_custom_bindings_across_all_text_inputs(
+    fn text_delete_to_line_start_and_end_work_with_default_and_custom_bindings_across_all_text_inputs(
         cx: &mut TestAppContext,
     ) {
         let mut config = Config::load(None).unwrap();
-        assert!(!config.keyboard.bindings.iter().any(|b| {
-            matches!(
-                b.action,
-                Command::DeleteToLineStart | Command::DeleteToLineEnd
-            )
+        assert!(config.keyboard.bindings.iter().any(|b| {
+            b.keys == "cmd-backspace"
+                && b.context == config::KeyContext::TextInput
+                && b.action == Command::DeleteToLineStart
         }));
+        assert!(
+            !config
+                .keyboard
+                .bindings
+                .iter()
+                .any(|b| b.action == Command::DeleteToLineEnd)
+        );
         config.files.save_session = false;
         config.files.restore_session = false;
 
-        // Configure custom TextInput bindings for delete_to_line_start / delete_to_line_end.
+        // Add custom TextInput bindings alongside the default `cmd-backspace` for delete_to_line_start.
         config.keyboard.bindings.push(config::Binding {
             keys: "ctrl-u".into(),
             context: config::KeyContext::TextInput,
@@ -13704,8 +13710,9 @@ mod tests {
                 .range
         };
 
-        // 1. Search box (`Search` / `TextInput`): mid-line delete to start/end, boundary no-ops,
-        //    undo, active selection deletion, and multibyte Unicode.
+        // 1. Search box (`Search` / `TextInput`): default cmd-backspace and custom bindings for
+        //    mid-line delete to start/end, boundary no-ops, undo, active selection deletion, and
+        //    multibyte Unicode.
         view.update_in(cx, |view, window, cx| {
             view.command(Command::FocusSearch, window, cx);
         });
@@ -13713,14 +13720,14 @@ mod tests {
         cx.simulate_input("alpha beta gamma");
         cx.simulate_keystrokes("left left left left left left left left left left");
         cx.run_until_parked();
-        cx.simulate_keystrokes("ctrl-u");
+        cx.simulate_keystrokes("cmd-backspace");
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.input.read(cx).as_str(), "beta gamma");
             assert_eq!(caret_range(&view.input, window, cx), 0..0);
         });
         // At start of line, delete_to_line_start is a safe no-op.
-        cx.simulate_keystrokes("ctrl-u");
+        cx.simulate_keystrokes("cmd-backspace");
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.input.read(cx).as_str(), "beta gamma");
@@ -13776,7 +13783,7 @@ mod tests {
             let end = "שלום ".encode_utf16().count();
             assert_eq!(caret_range(&view.input, window, cx), end..end);
         });
-        cx.simulate_keystrokes("ctrl-u");
+        cx.simulate_keystrokes("cmd-backspace");
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.input.read(cx).as_str(), "");
@@ -13792,7 +13799,7 @@ mod tests {
             view.read_with(cx, |view, cx| view.path_input.read(cx).as_str().to_owned());
         cx.simulate_keystrokes("home");
         cx.simulate_input("prefix_");
-        cx.simulate_keystrokes("ctrl-u");
+        cx.simulate_keystrokes("cmd-backspace");
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.path_input.read(cx).as_str(), initial_path);
@@ -13825,7 +13832,7 @@ mod tests {
             assert_eq!(view.presets_search.read(cx).as_str(), "err");
             assert!(!view.filtered_presets.is_empty());
         });
-        cx.simulate_keystrokes("left ctrl-u");
+        cx.simulate_keystrokes("left cmd-backspace");
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.presets_search.read(cx).as_str(), "r");
@@ -13860,7 +13867,7 @@ mod tests {
             assert_eq!(view.goto.read(cx).as_str(), "123");
             assert_eq!(caret_range(&view.goto, window, cx), 3..3);
         });
-        cx.simulate_keystrokes("left ctrl-u");
+        cx.simulate_keystrokes("left cmd-backspace");
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.goto.read(cx).as_str(), "3");
@@ -13877,12 +13884,19 @@ mod tests {
             assert_eq!(view.tabs[0].selected, 1);
             assert_eq!(view.goto.read(cx).as_str(), "3");
         });
+
+        // Verify shortcut label formatting for the default delete_to_line_start shortcut.
+        if cfg!(target_os = "macos") {
+            assert_eq!(theme::format_shortcut("cmd-backspace"), "⌘⌫");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(theme::format_shortcut("cmd-backspace"), "Win+Backspace");
+        } else {
+            assert_eq!(theme::format_shortcut("cmd-backspace"), "Super+Backspace");
+        }
     }
 
     #[gpui::test]
-    fn text_delete_to_line_start_and_end_have_no_default_shortcuts_until_configured(
-        cx: &mut TestAppContext,
-    ) {
+    fn text_delete_to_line_shortcuts_come_only_from_keyboard_config(cx: &mut TestAppContext) {
         let filtered_defaults = text_input_default_bindings();
         assert!(!filtered_defaults.iter().any(|binding| {
             binding
@@ -13906,19 +13920,20 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(filtered_defaults);
+            cx.bind_keys(filtered_defaults.clone());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("no-default-delete.log");
+        let path = directory.path().join("default-delete.log");
         std::fs::write(&path, "line 0\n").unwrap();
         let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
 
-        let (view, cx) =
-            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(config.clone(), vec![path.clone()], window, cx)
+        });
         view.update(cx, |view, cx| {
-            view.tabs[0].log = Some(log);
+            view.tabs[0].log = Some(log.clone());
             cx.notify();
         });
         cx.run_until_parked();
@@ -13931,11 +13946,9 @@ mod tests {
         cx.simulate_keystrokes("left left left left left");
         cx.run_until_parked();
 
-        // Neither GPUI's built-in line-delete shortcuts nor ctrl-u should mutate the text
-        // unless explicitly configured in keyboard.json.
+        // Unconfigured GPUI built-in line-delete shortcuts and ctrl-u should not mutate text.
         for stroke in [
             "ctrl-k",
-            "cmd-backspace",
             "ctrl-shift-backspace",
             "ctrl-shift-delete",
             "ctrl-u",
@@ -13960,5 +13973,48 @@ mod tests {
                 );
             });
         }
+
+        // The default `cmd-backspace` binding in keyboard.json deletes to line start.
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), " beta");
+            let range = view
+                .input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range;
+            assert_eq!(range, 0..0);
+        });
+
+        // Removing `delete_to_line_start` from keyboard.json disables `cmd-backspace` too.
+        let mut unbound_config = config;
+        unbound_config
+            .keyboard
+            .bindings
+            .retain(|b| b.action != Command::DeleteToLineStart);
+        cx.update(|_window, cx| {
+            cx.clear_key_bindings();
+            cx.bind_keys(filtered_defaults);
+            cx.bind_keys(keybindings(&unbound_config).unwrap());
+        });
+        view.update_in(cx, |view, _window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.emplace("alpha beta", cx);
+                state.move_to(5, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "alpha beta");
+            let range = view
+                .input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range;
+            assert_eq!(range, 5..5);
+        });
     }
 }
