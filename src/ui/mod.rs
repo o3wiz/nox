@@ -369,6 +369,8 @@ pub struct Workspace {
     header_click_armed: bool,
     #[cfg(test)]
     header_zoom_count: usize,
+    #[cfg(test)]
+    quit_count: usize,
 }
 
 impl Workspace {
@@ -479,6 +481,9 @@ impl Workspace {
             cx.on_blur(&path_focus, window, |this, _window, cx| {
                 this.on_path_input_blur(cx);
             }),
+            cx.on_focus_lost(window, |this, window, cx| {
+                this.restore_focus(window, cx);
+            }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.header_click_armed = false;
@@ -558,6 +563,8 @@ impl Workspace {
             header_click_armed: false,
             #[cfg(test)]
             header_zoom_count: 0,
+            #[cfg(test)]
+            quit_count: 0,
         };
         for path in paths {
             this.open(path, cx);
@@ -1192,6 +1199,11 @@ impl Workspace {
     }
 
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = if self.tabs.is_empty() {
+            Pane::Main
+        } else {
+            pane
+        };
         self.active_pane = pane;
         self.show_goto = false;
         self.dismiss_presets(cx);
@@ -1226,6 +1238,10 @@ impl Workspace {
     }
 
     fn focus_visible_pane(&mut self, preferred: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            self.focus_pane(Pane::Main, window, cx);
+            return;
+        }
         let (min_h, max_h) = self.results_height_bounds(window);
         let eff = self.results_height.clamp(min_h, max_h);
         let main_hidden = is_main_hidden(eff, max_h);
@@ -1236,6 +1252,10 @@ impl Workspace {
             _ => preferred,
         };
         self.focus_pane(pane, window, cx);
+    }
+
+    fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_visible_pane(self.active_pane, window, cx);
     }
 
     fn selection_count(tab: &Tab, pane: Pane) -> usize {
@@ -2273,8 +2293,18 @@ impl Workspace {
                 }
             }
             Command::Open => self.choose_file(cx),
-            Command::Quit => cx.quit(),
+            Command::Quit => {
+                #[cfg(test)]
+                {
+                    self.quit_count += 1;
+                }
+                cx.quit();
+                return;
+            }
             Command::FocusSearch => {
+                if self.tabs.is_empty() {
+                    return;
+                }
                 self.show_goto = false;
                 self.dismiss_presets(cx);
                 self.dismiss_path_editing(cx);
@@ -2352,6 +2382,9 @@ impl Workspace {
             Command::CloseTab => {
                 let index = self.active;
                 self.close_tab_at(index, cx);
+                if self.tabs.is_empty() {
+                    self.focus.focus(window, cx);
+                }
             }
             Command::NextTab => {
                 if !self.tabs.is_empty() {
@@ -4204,8 +4237,11 @@ impl Workspace {
                                     cx.stop_propagation();
                                 }),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.close_tab_at(index, cx);
+                                if this.tabs.is_empty() {
+                                    this.focus.focus(window, cx);
+                                }
                             })),
                     )
                     .tooltip_show_delay(Duration::from_millis(450))
@@ -4220,10 +4256,13 @@ impl Workspace {
                         }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.switch(index, cx)))
-                    .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    .on_aux_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         if event.is_middle_click() {
                             cx.stop_propagation();
                             this.close_tab_at(index, cx);
+                            if this.tabs.is_empty() {
+                                this.focus.focus(window, cx);
+                            }
                         }
                     })),
             );
@@ -5068,6 +5107,8 @@ impl Workspace {
             .collect();
 
         let mut hero = div()
+            .debug_selector(|| "welcome".into())
+            .track_focus(&self.focus)
             .flex_1()
             .min_h_0()
             .flex()
@@ -6574,6 +6615,21 @@ pub fn run(config: Config, paths: Vec<PathBuf>) -> anyhow::Result<()> {
                 cx.update(move |cx| {
                     cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
                     cx.bind_keys(bindings);
+                    cx.on_action(|action: &Execute, cx| {
+                        if action.command == Command::Quit {
+                            cx.quit();
+                        }
+                    });
+                    cx.set_menus([Menu::new("Nox").items([
+                        MenuItem::os_submenu("Services", SystemMenuType::Services),
+                        MenuItem::separator(),
+                        MenuItem::action(
+                            "Quit Nox",
+                            Execute {
+                                command: Command::Quit,
+                            },
+                        ),
+                    ])]);
                     let bounds = Bounds::centered(
                         None,
                         size(px(config.window.width), px(config.window.height)),
@@ -12388,5 +12444,282 @@ mod tests {
             assert_eq!(theme::format_shortcut("cmd-left"), "Super+←");
             assert_eq!(theme::format_shortcut("cmd-right"), "Super+→");
         }
+    }
+
+    #[gpui::test]
+    fn quit_shortcut_works_when_no_logs_are_loaded(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let quit_key = if cfg!(target_os = "macos") {
+            "cmd-q"
+        } else {
+            "ctrl-q"
+        };
+        let focus_search_key = if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-f"
+        };
+        let focus_path_key = if cfg!(target_os = "macos") {
+            "cmd-shift-o"
+        } else {
+            "ctrl-shift-o"
+        };
+        let goto_key = if cfg!(target_os = "macos") {
+            "cmd-l"
+        } else {
+            "ctrl-l"
+        };
+        let presets_key = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, Vec::new(), window, cx));
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, 0);
+        });
+
+        // Pressing Cmd+Q / Ctrl+Q immediately on the empty welcome screen triggers Quit.
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.quit_count, 1));
+
+        // Interacting with the welcome screen, header, and file library preserves Workspace focus.
+        let welcome_pt =
+            cx.debug_bounds("welcome").expect("welcome bounds").origin + point(px(16.), px(16.));
+        cx.simulate_click(welcome_pt, Modifiers::none());
+        cx.run_until_parked();
+
+        let library_btn = cx
+            .debug_bounds("header-library")
+            .expect("library button bounds")
+            .center();
+        cx.simulate_click(library_btn, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.show_files));
+        cx.simulate_click(library_btn, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.show_files));
+
+        // Tab-only Workspace shortcuts (search, file path, go to line, presets) do not focus
+        // unmounted inputs or break Quit on the welcome screen.
+        for key in [focus_search_key, focus_path_key, goto_key, presets_key] {
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+        }
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.focus.is_focused(window));
+            assert!(!view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert!(!view.path_input.read(cx).focus_handle(cx).is_focused(window));
+            assert!(!view.goto.read(cx).focus_handle(cx).is_focused(window));
+            assert!(!view.show_goto);
+            assert!(!view.show_presets);
+        });
+
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.quit_count, 2));
+
+        // Log-only shortcuts are inactive on the welcome screen and do not disrupt Quit.
+        cx.simulate_keystrokes("m f down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.quit_count, 3));
+
+        // Even if the window loses focus, on_focus_lost restores welcome focus so Quit still works.
+        view.update_in(cx, |_view, window, cx| window.blur(cx));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.focus.is_focused(window));
+        });
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.quit_count, 4));
+    }
+
+    #[gpui::test]
+    fn quit_shortcut_works_after_closing_last_tab_from_any_focused_control(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let quit_key = if cfg!(target_os = "macos") {
+            "cmd-q"
+        } else {
+            "ctrl-q"
+        };
+        let close_tab_key = if cfg!(target_os = "macos") {
+            "cmd-w"
+        } else {
+            "ctrl-w"
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.log");
+        std::fs::write(&path, "ERROR first\nINFO second\nERROR third\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, Vec::new(), window, cx));
+        cx.run_until_parked();
+
+        let open_loaded_tab = |view: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            let log = log.clone();
+            let path = path.clone();
+            view.update(cx, |view, cx| {
+                view.open(path, cx);
+                view.tabs[0].log = Some(log);
+                view.tabs[0].loading = false;
+                view.input
+                    .update(cx, |input, cx| input.emplace("ERROR", cx));
+                view.start_search(0, cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+
+        let mut expected_quits = 0;
+
+        // 1. Main log pane focused -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 2. Search input focused -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 3. Results pane focused -> click tab close button -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        let close_btn = cx
+            .debug_bounds("tab-close-0")
+            .expect("tab close button bounds")
+            .center();
+        cx.simulate_click(close_btn, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 4. File path input focused -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 5. Go-to-line input focused -> close_tab_at without window handle -> on_focus_lost -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.close_tab_at(0, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 6. Presets search input focused -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::TogglePresets, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 7. Filter pane maximized (main pane hidden, results pane focused) -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            let (_min_h, max_h) = view.results_height_bounds(window);
+            view.results_height = max_h;
+            view.target_results_height = max_h;
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
     }
 }
