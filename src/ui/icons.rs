@@ -17,6 +17,7 @@ pub enum Icon {
     BookmarkFilled,
     Hash,
     Copy,
+    CopyMatches,
     Close,
     Search,
     Regex,
@@ -54,6 +55,7 @@ impl Icon {
         Icon::BookmarkFilled,
         Icon::Hash,
         Icon::Copy,
+        Icon::CopyMatches,
         Icon::Close,
         Icon::Search,
         Icon::Regex,
@@ -101,6 +103,8 @@ impl Icon {
             Icon::Hash => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><line x1="4.5" y1="9" x2="19.5" y2="9"/><line x1="4.5" y1="15" x2="19.5" y2="15"/><line x1="10" y1="3.5" x2="8" y2="20.5"/><line x1="16" y1="3.5" x2="14" y2="20.5"/></svg>"##,
 
             Icon::Copy => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5.5 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v.5"/></svg>"##,
+
+            Icon::CopyMatches => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2" fill="#ffffff"/><path d="M5.5 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v.5"/></svg>"##,
 
             Icon::Close => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="6.5" x2="17.5" y2="17.5"/><line x1="17.5" y1="6.5" x2="6.5" y2="17.5"/></svg>"##,
 

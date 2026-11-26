@@ -164,6 +164,18 @@ fn overlays_defaults_but_rejects_typos_wrong_types_and_invalid_values() {
 #[test]
 fn validates_highlights_colors_presets_and_duplicate_shortcuts() {
     let mut config = Config::load(None).unwrap();
+    config.window.filter_resize_sensitivity = 0.05;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.window.filter_resize_sensitivity = 10.5;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.window.filter_resize_sensitivity = f32::NAN;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
+    config.window.filter_resize_sensitivity = f32::INFINITY;
+    assert!(config.validate().is_err());
+    let mut config = Config::load(None).unwrap();
     config.appearance.accent = "red".into();
     assert!(config.validate().is_err());
     let mut config = Config::load(None).unwrap();
@@ -228,6 +240,92 @@ fn presets_parse_highlight_match_default_true_and_reject_non_booleans() {
         assert!(
             Config::load(Some(dir.path())).is_err(),
             "accepted invalid preset highlight_match {invalid}"
+        );
+    }
+}
+
+#[test]
+fn presets_parse_select_text_and_report_validation_warnings() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search.json");
+    fs::write(
+        &path,
+        r#"{
+            "presets": [
+                { "name": "Immediate", "pattern": "err", "mode": "literal" },
+                { "name": "NullSelect", "pattern": "warn", "mode": "literal", "select_text": null },
+                { "name": "Port", "pattern": "GET .* port PORT_NUMBER", "mode": "regex", "select_text": "PORT_NUMBER" },
+                { "name": "Unicode", "pattern": "user=שלום_ID!", "mode": "literal", "select_text": "שלום_ID" },
+                { "name": "Repeated", "pattern": "HOST -> HOST", "mode": "literal", "select_text": "HOST" },
+                { "name": "Missing", "pattern": "GET .* port 8080", "mode": "regex", "select_text": "PORT_NUMBER" },
+                { "name": "Empty", "pattern": "GET .*", "mode": "regex", "select_text": "" }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    // Mismatched or empty `select_text` produces warnings, not fatal load/validation errors.
+    let config = Config::load(Some(dir.path())).unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.search.presets.len(), 7);
+    assert_eq!(config.search.presets[0].select_text, None);
+    assert_eq!(config.search.presets[0].select_text_range(), None);
+    assert_eq!(config.search.presets[0].select_text_warning(), None);
+
+    assert_eq!(config.search.presets[1].select_text, None);
+    assert_eq!(config.search.presets[1].select_text_range(), None);
+    assert_eq!(config.search.presets[1].select_text_warning(), None);
+
+    assert_eq!(
+        config.search.presets[2].select_text.as_deref(),
+        Some("PORT_NUMBER")
+    );
+    let port_range = config.search.presets[2].select_text_range().unwrap();
+    assert_eq!(&config.search.presets[2].pattern[port_range], "PORT_NUMBER");
+    assert_eq!(config.search.presets[2].select_text_warning(), None);
+
+    let unicode_range = config.search.presets[3].select_text_range().unwrap();
+    assert_eq!(&config.search.presets[3].pattern[unicode_range], "שלום_ID");
+    assert_eq!(config.search.presets[3].select_text_warning(), None);
+
+    assert_eq!(config.search.presets[4].select_text_range(), Some(0..4));
+    assert_eq!(config.search.presets[4].select_text_warning(), None);
+
+    assert_eq!(config.search.presets[5].select_text_range(), None);
+    let missing_warning = config.search.presets[5]
+        .select_text_warning()
+        .expect("missing select_text should warn");
+    assert!(missing_warning.contains("Missing"));
+    assert!(missing_warning.contains("PORT_NUMBER"));
+
+    assert_eq!(config.search.presets[6].select_text_range(), None);
+    let empty_warning = config.search.presets[6]
+        .select_text_warning()
+        .expect("empty select_text should warn");
+    assert!(empty_warning.contains("Empty"));
+    assert!(empty_warning.contains("empty"));
+
+    let warnings = config.warnings();
+    assert_eq!(warnings.len(), 2);
+    assert_eq!(warnings[0], missing_warning);
+    assert_eq!(warnings[1], empty_warning);
+
+    // Session serialization omits `select_text` when `None` and preserves it when `Some`.
+    let serialized = serde_json::to_value(&config.search.presets).unwrap();
+    assert!(serialized[0].get("select_text").is_none());
+    assert_eq!(serialized[2]["select_text"], "PORT_NUMBER");
+
+    // Non-string values for `select_text` are rejected.
+    for invalid in [
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","select_text":123}]}"#,
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","select_text":true}]}"#,
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","select_text":[]}]}"#,
+        r#"{"presets":[{"name":"Bad","pattern":"err","mode":"regex","select_text":{}}]}"#,
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert!(
+            Config::load(Some(dir.path())).is_err(),
+            "accepted invalid preset select_text {invalid}"
         );
     }
 }
@@ -322,6 +420,41 @@ fn appearance_overlays_configurable_text_selection_color_and_opacity() {
 }
 
 #[test]
+fn window_overlays_and_validates_filter_resize_sensitivity() {
+    let defaults = Config::load(None).unwrap();
+    assert_eq!(defaults.window.filter_resize_sensitivity, 1.0);
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("window.json");
+    fs::write(&path, r#"{"filter_resize_sensitivity": 2.5}"#).unwrap();
+    let custom = Config::load(Some(dir.path())).unwrap();
+    assert!((custom.window.filter_resize_sensitivity - 2.5).abs() < 1e-6);
+    assert_eq!(custom.window.results_height, defaults.window.results_height);
+
+    // Boundary values 0.1 and 10.0 are accepted.
+    for valid in [0.1f32, 10.0] {
+        fs::write(&path, format!(r#"{{"filter_resize_sensitivity":{valid}}}"#)).unwrap();
+        let loaded = Config::load(Some(dir.path())).unwrap();
+        assert!((loaded.window.filter_resize_sensitivity - valid).abs() < 1e-6);
+    }
+
+    for invalid in [
+        r#"{"filter_resize_sensitivity":0}"#,
+        r#"{"filter_resize_sensitivity":0.09}"#,
+        r#"{"filter_resize_sensitivity":-1.0}"#,
+        r#"{"filter_resize_sensitivity":10.1}"#,
+        r#"{"filter_resize_sensitivity":"2.0"}"#,
+        r#"{"filter_resize_sensitivity":null}"#,
+    ] {
+        fs::write(&path, invalid).unwrap();
+        assert!(
+            Config::load(Some(dir.path())).is_err(),
+            "accepted invalid filter_resize_sensitivity {invalid}"
+        );
+    }
+}
+
+#[test]
 fn viewer_overlays_and_validates_cursor_surrounding_lines() {
     let defaults = Config::load(None).unwrap();
     assert_eq!(defaults.viewer.cursor_surrounding_lines, 0);
@@ -367,6 +500,7 @@ fn generated_config_round_trips_and_preserves_existing_files() {
     fs::write(dir.path().join("window.json"), r#"{"width":1800}"#).unwrap();
     assert!(config::write_defaults(dir.path()).is_err());
     assert_eq!(Config::load(Some(dir.path())).unwrap().window.width, 1800.);
+    assert!(dir.path().join("schemas/common.schema.json").is_file());
     for (name, _) in config::DEFAULTS {
         let schema: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(
@@ -377,9 +511,24 @@ fn generated_config_round_trips_and_preserves_existing_files() {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(schema["additionalProperties"], false);
+        let rejects_unknown = schema["additionalProperties"] == false
+            || (schema.get("$ref").is_some() && schema["unevaluatedProperties"] == false);
+        assert!(
+            rejects_unknown,
+            "{name}.schema.json must reject unknown properties"
+        );
         assert!(schema["properties"]["$schema"].is_object());
     }
+
+    // Existing common schema file alone also prevents overwriting.
+    let existing_common = tempdir().unwrap();
+    fs::create_dir_all(existing_common.path().join("schemas")).unwrap();
+    fs::write(
+        existing_common.path().join("schemas/common.schema.json"),
+        "{}",
+    )
+    .unwrap();
+    assert!(config::write_defaults(existing_common.path()).is_err());
 }
 
 #[test]
@@ -546,11 +695,14 @@ fn rotation_to_a_larger_file_is_recognized_as_replacement() {
 fn committed_schemas_match_the_rust_types() {
     let directory = tempdir().unwrap();
     config::write_schemas(directory.path()).unwrap();
+    let committed_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("schemas");
+
+    let mut generated_files = BTreeSet::new();
     for entry in fs::read_dir(directory.path()).unwrap() {
         let entry = entry.unwrap();
-        let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("schemas")
-            .join(entry.file_name());
+        let file_name = entry.file_name();
+        generated_files.insert(file_name.clone());
+        let committed = committed_dir.join(&file_name);
         let generated: serde_json::Value =
             serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap();
         let checked_in: serde_json::Value =
@@ -559,6 +711,161 @@ fn committed_schemas_match_the_rust_types() {
             generated, checked_in,
             "Regenerate schemas after changing configuration types"
         );
+    }
+
+    let committed_files: BTreeSet<_> = fs::read_dir(&committed_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        committed_files, generated_files,
+        "Committed schemas directory has stale or missing schema files"
+    );
+}
+
+#[test]
+fn shared_schema_definitions_are_deduplicated_and_all_refs_resolve() {
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    fn collect_refs(value: &Value, refs: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
+                    refs.push(reference.to_string());
+                }
+                for child in map.values() {
+                    collect_refs(child, refs);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_refs(item, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let directory = tempdir().unwrap();
+    config::write_schemas(directory.path()).unwrap();
+
+    let mut schemas: BTreeMap<String, Value> = BTreeMap::new();
+    for entry in fs::read_dir(directory.path()).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let value: Value = serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap();
+        schemas.insert(name, value);
+    }
+
+    let common = schemas
+        .get("common.schema.json")
+        .expect("common.schema.json must be generated");
+    let common_defs = common["$defs"]
+        .as_object()
+        .expect("common.schema.json must define $defs");
+    for expected in ["HexColor", "Preset", "SearchConfig", "SearchMode"] {
+        assert!(
+            common_defs.contains_key(expected),
+            "common.schema.json missing shared definition {expected}"
+        );
+    }
+
+    // `search.schema.json` and `session.schema.json` must share `SearchConfig`, `Preset`, and
+    // `SearchMode` via `common.schema.json` without duplicating them locally.
+    let search = &schemas["search.schema.json"];
+    assert_eq!(search["$ref"], "common.schema.json#/$defs/SearchConfig");
+    assert_eq!(search["unevaluatedProperties"], false);
+    assert!(search.get("$defs").is_none());
+
+    let session = &schemas["session.schema.json"];
+    let session_defs = session["$defs"].as_object().unwrap();
+    assert!(!session_defs.contains_key("Preset"));
+    assert!(!session_defs.contains_key("SearchMode"));
+    assert_eq!(
+        session_defs["SearchConfig"]["$ref"],
+        "common.schema.json#/$defs/SearchConfig"
+    );
+    assert_eq!(session_defs["SearchConfig"]["unevaluatedProperties"], false);
+    assert!(session_defs["SearchConfig"]["required"].is_array());
+
+    // `appearance.schema.json` and `highlighting.schema.json` share `HexColor` via common schema,
+    // while `FontSize` stays local to `appearance.schema.json`.
+    let appearance = &schemas["appearance.schema.json"];
+    assert_eq!(
+        appearance["properties"]["background"]["$ref"],
+        "common.schema.json#/$defs/HexColor"
+    );
+    assert_eq!(
+        appearance["properties"]["ui_font_size"]["$ref"],
+        "#/$defs/FontSize"
+    );
+    assert_eq!(
+        appearance["properties"]["font_size"]["$ref"],
+        "#/$defs/FontSize"
+    );
+    assert!(
+        !appearance["$defs"]
+            .as_object()
+            .unwrap()
+            .contains_key("HexColor")
+    );
+
+    let highlighting = &schemas["highlighting.schema.json"];
+    assert_eq!(
+        highlighting["$defs"]["HighlightRule"]["properties"]["color"]["$ref"],
+        "common.schema.json#/$defs/HexColor"
+    );
+    assert!(
+        !highlighting["$defs"]
+            .as_object()
+            .unwrap()
+            .contains_key("HexColor")
+    );
+
+    // No `$defs` body may be duplicated across any two schema files.
+    let mut seen_defs: BTreeMap<String, (String, Value)> = BTreeMap::new();
+    for (file_name, schema) in &schemas {
+        if let Some(defs) = schema.get("$defs").and_then(Value::as_object) {
+            for (def_name, def_val) in defs {
+                if let Some((prev_file, prev_val)) = seen_defs.get(def_name) {
+                    assert_ne!(
+                        prev_val, def_val,
+                        "Duplicate $defs/{def_name} in {prev_file} and {file_name}"
+                    );
+                } else {
+                    seen_defs.insert(def_name.clone(), (file_name.clone(), def_val.clone()));
+                }
+            }
+        }
+    }
+
+    // Every `$ref` across every schema file must resolve to an existing `$defs` target.
+    for (file_name, schema) in &schemas {
+        let mut refs = Vec::new();
+        collect_refs(schema, &mut refs);
+        for reference in refs {
+            if let Some(local_name) = reference.strip_prefix("#/$defs/") {
+                assert!(
+                    schema["$defs"]
+                        .as_object()
+                        .is_some_and(|defs| defs.contains_key(local_name)),
+                    "Unresolved local $ref {reference:?} in {file_name}"
+                );
+            } else if let Some((target_file, local_name)) = reference.split_once("#/$defs/") {
+                let target_schema = schemas.get(target_file).unwrap_or_else(|| {
+                    panic!("Unresolved external schema file {target_file:?} in {file_name}")
+                });
+                assert!(
+                    target_schema["$defs"]
+                        .as_object()
+                        .is_some_and(|defs| defs.contains_key(local_name)),
+                    "Unresolved external $ref {reference:?} in {file_name}"
+                );
+            } else {
+                panic!("Unexpected $ref format {reference:?} in {file_name}");
+            }
+        }
     }
 }
 
@@ -686,7 +993,7 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     );
     assert!(report.added_fields > 0);
     assert!(report.added_bindings > 0);
-    assert_eq!(report.schemas_updated, config::DEFAULTS.len() + 1);
+    assert_eq!(report.schemas_updated, config::DEFAULTS.len() + 2);
 
     // Check window.json: `$schema` inserted first, existing + deprecated fields kept, missing added.
     let window: serde_json::Value =
@@ -702,6 +1009,7 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert_eq!(window["height"], 850);
     assert_eq!(window["maximized"], false);
     assert_eq!(window["results_height"], 250);
+    assert_eq!(window["filter_resize_sensitivity"], 1.0);
     assert_eq!(window["show_status_bar"], true);
 
     // Check appearance.json: custom + deprecated preserved, newer fields added.
@@ -732,8 +1040,10 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert_eq!(presets[0]["name"], "Custom");
     assert_eq!(presets[0]["highlight_match"], true);
     assert_eq!(presets[0]["deprecated_priority"], 3);
+    assert!(presets[0].get("select_text").is_none());
     assert_eq!(presets[1]["name"], "NoHighlight");
     assert_eq!(presets[1]["highlight_match"], false);
+    assert!(presets[1].get("select_text").is_none());
 
     // Check keyboard.json: custom & deprecated preserved, conflicts skipped, missing added.
     let keyboard: serde_json::Value =
@@ -766,6 +1076,9 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     }));
     assert!(bindings.iter().any(|b| {
         b["keys"] == "up" && b["context"] == "FilePath" && b["action"] == "previous_line"
+    }));
+    assert!(bindings.iter().any(|b| {
+        b["keys"] == "c" && b["context"] == "Log" && b["action"] == "copy_match_results"
     }));
 
     // Created missing files should point to local `schemas/`.
@@ -804,7 +1117,7 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert!(second.updated_files.is_empty());
     assert_eq!(second.added_fields, 0);
     assert_eq!(second.added_bindings, 0);
-    assert_eq!(second.schemas_updated, config::DEFAULTS.len() + 1);
+    assert_eq!(second.schemas_updated, config::DEFAULTS.len() + 2);
 }
 
 #[test]
@@ -889,4 +1202,415 @@ fn migrate_config_rejects_missing_dir_and_corrupt_json_without_partial_writes() 
         fs::read_to_string(broken_dir.join("window.json")).unwrap(),
         original_window
     );
+}
+
+#[test]
+fn text_editing_line_selection_and_deletion_config_defaults_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    // Existing move bindings remain intact.
+    assert!(has_binding(
+        &defaults,
+        "cmd-left",
+        KeyContext::TextInput,
+        Command::MoveToLineStart
+    ));
+    assert!(has_binding(
+        &defaults,
+        "cmd-right",
+        KeyContext::TextInput,
+        Command::MoveToLineEnd
+    ));
+    assert!(has_binding(
+        &defaults,
+        "home",
+        KeyContext::TextInput,
+        Command::MoveToLineStart
+    ));
+    assert!(has_binding(
+        &defaults,
+        "end",
+        KeyContext::TextInput,
+        Command::MoveToLineEnd
+    ));
+
+    // New default select-to-line bindings exist in TextInput (and not shift-home/shift-end).
+    assert!(has_binding(
+        &defaults,
+        "cmd-shift-left",
+        KeyContext::TextInput,
+        Command::SelectToLineStart
+    ));
+    assert!(has_binding(
+        &defaults,
+        "shift-up",
+        KeyContext::TextInput,
+        Command::SelectToLineStart
+    ));
+    assert!(has_binding(
+        &defaults,
+        "cmd-shift-right",
+        KeyContext::TextInput,
+        Command::SelectToLineEnd
+    ));
+    assert!(has_binding(
+        &defaults,
+        "shift-down",
+        KeyContext::TextInput,
+        Command::SelectToLineEnd
+    ));
+    assert!(!defaults.keyboard.bindings.iter().any(|b| {
+        b.context == KeyContext::TextInput && matches!(b.keys.as_str(), "shift-home" | "shift-end")
+    }));
+
+    // Delete-to-line-start defaults to cmd-backspace in TextInput; delete-to-line-end has no default.
+    assert!(has_binding(
+        &defaults,
+        "cmd-backspace",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(
+        !defaults
+            .keyboard
+            .bindings
+            .iter()
+            .any(|b| b.action == Command::DeleteToLineEnd)
+    );
+
+    // Custom keyboard.json can override delete_to_line_start and configure delete_to_line_end and custom select bindings.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "bindings": [
+    { "keys": "ctrl-u", "context": "TextInput", "action": "delete_to_line_start" },
+    { "keys": "alt-k", "context": "TextInput", "action": "delete_to_line_end" },
+    { "keys": "shift-home", "context": "TextInput", "action": "select_to_line_start" },
+    { "keys": "shift-end", "context": "TextInput", "action": "select_to_line_end" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let custom = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom,
+        "ctrl-u",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(!has_binding(
+        &custom,
+        "cmd-backspace",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(has_binding(
+        &custom,
+        "alt-k",
+        KeyContext::TextInput,
+        Command::DeleteToLineEnd
+    ));
+
+    // Migration adds missing select_to_line_* and delete_to_line_start defaults without adding delete_to_line_end.
+    let migrate_dir = tempdir().unwrap();
+    fs::write(
+        migrate_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "cmd-left", "context": "TextInput", "action": "move_to_line_start" },
+    { "keys": "cmd-right", "context": "TextInput", "action": "move_to_line_end" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(migrate_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let migrated = Config::load(Some(migrate_dir.path())).unwrap();
+    assert!(has_binding(
+        &migrated,
+        "cmd-shift-left",
+        KeyContext::TextInput,
+        Command::SelectToLineStart
+    ));
+    assert!(has_binding(
+        &migrated,
+        "shift-up",
+        KeyContext::TextInput,
+        Command::SelectToLineStart
+    ));
+    assert!(has_binding(
+        &migrated,
+        "cmd-shift-right",
+        KeyContext::TextInput,
+        Command::SelectToLineEnd
+    ));
+    assert!(has_binding(
+        &migrated,
+        "shift-down",
+        KeyContext::TextInput,
+        Command::SelectToLineEnd
+    ));
+    assert!(has_binding(
+        &migrated,
+        "cmd-backspace",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(
+        !migrated
+            .keyboard
+            .bindings
+            .iter()
+            .any(|b| b.action == Command::DeleteToLineEnd)
+    );
+
+    // Migration preserves an existing custom delete_to_line_start binding instead of adding cmd-backspace.
+    let custom_migrate_dir = tempdir().unwrap();
+    fs::write(
+        custom_migrate_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "ctrl-u", "context": "TextInput", "action": "delete_to_line_start" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_migrate_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_migrate_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "ctrl-u",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "cmd-backspace",
+        KeyContext::TextInput,
+        Command::DeleteToLineStart
+    ));
+}
+
+#[test]
+fn first_and_last_line_shortcuts_defaults_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    // Log supports both home/end and secondary-up/down for first/last line and selection extension.
+    for (keys, action) in [
+        ("home", Command::FirstLine),
+        ("secondary-up", Command::FirstLine),
+        ("end", Command::LastLine),
+        ("secondary-down", Command::LastLine),
+        ("shift-home", Command::SelectFirstLine),
+        ("secondary-shift-up", Command::SelectFirstLine),
+        ("shift-end", Command::SelectLastLine),
+        ("secondary-shift-down", Command::SelectLastLine),
+    ] {
+        assert!(
+            has_binding(&defaults, keys, KeyContext::Log, action),
+            "missing Log default binding {keys} -> {action:?}"
+        );
+    }
+
+    // Presets and FilePath menus both support secondary-up/down for first/last line.
+    for context in [KeyContext::Presets, KeyContext::FilePath] {
+        assert!(has_binding(
+            &defaults,
+            "secondary-up",
+            context,
+            Command::FirstLine
+        ));
+        assert!(has_binding(
+            &defaults,
+            "secondary-down",
+            context,
+            Command::LastLine
+        ));
+    }
+
+    // Migrating an older keyboard.json with default home/end Log bindings and basic FilePath
+    // bindings adds the newly introduced secondary-up/down and secondary-shift-up/down defaults.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "home", "context": "Log", "action": "first_line" },
+    { "keys": "end", "context": "Log", "action": "last_line" },
+    { "keys": "shift-home", "context": "Log", "action": "select_first_line" },
+    { "keys": "shift-end", "context": "Log", "action": "select_last_line" },
+    { "keys": "up", "context": "FilePath", "action": "previous_line" },
+    { "keys": "down", "context": "FilePath", "action": "next_line" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    for (keys, context, action) in [
+        ("home", KeyContext::Log, Command::FirstLine),
+        ("secondary-up", KeyContext::Log, Command::FirstLine),
+        ("end", KeyContext::Log, Command::LastLine),
+        ("secondary-down", KeyContext::Log, Command::LastLine),
+        ("shift-home", KeyContext::Log, Command::SelectFirstLine),
+        (
+            "secondary-shift-up",
+            KeyContext::Log,
+            Command::SelectFirstLine,
+        ),
+        ("shift-end", KeyContext::Log, Command::SelectLastLine),
+        (
+            "secondary-shift-down",
+            KeyContext::Log,
+            Command::SelectLastLine,
+        ),
+        ("secondary-up", KeyContext::Presets, Command::FirstLine),
+        ("secondary-down", KeyContext::Presets, Command::LastLine),
+        ("secondary-up", KeyContext::FilePath, Command::FirstLine),
+        ("secondary-down", KeyContext::FilePath, Command::LastLine),
+    ] {
+        assert!(
+            has_binding(&upgraded, keys, context, action),
+            "migrated config missing {keys} in {context:?} -> {action:?}"
+        );
+    }
+    let second = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert_eq!(second.added_bindings, 0);
+
+    // Custom rebindings and conflicting key slots remain respected during migration.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "g", "context": "Log", "action": "first_line" },
+    { "keys": "secondary-down", "context": "FilePath", "action": "next_line" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "g",
+        KeyContext::Log,
+        Command::FirstLine
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-up",
+        KeyContext::Log,
+        Command::FirstLine
+    ));
+    assert!(has_binding(
+        &custom_migrated,
+        "secondary-down",
+        KeyContext::FilePath,
+        Command::NextLine
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-down",
+        KeyContext::FilePath,
+        Command::LastLine
+    ));
+    assert!(has_binding(
+        &custom_migrated,
+        "secondary-up",
+        KeyContext::FilePath,
+        Command::FirstLine
+    ));
+}
+
+#[test]
+fn reset_horizontal_scroll_default_binding_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    assert!(has_binding(
+        &defaults,
+        "secondary-left",
+        KeyContext::Log,
+        Command::ResetHorizontalScroll
+    ));
+
+    // Migrating an older keyboard.json with left/right scroll bindings adds secondary-left.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "left", "context": "Log", "action": "scroll_left" },
+    { "keys": "right", "context": "Log", "action": "scroll_right" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    assert!(has_binding(
+        &upgraded,
+        "secondary-left",
+        KeyContext::Log,
+        Command::ResetHorizontalScroll
+    ));
+
+    // Custom rebindings for reset_horizontal_scroll are preserved without adding secondary-left.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "0", "context": "Log", "action": "reset_horizontal_scroll" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "0",
+        KeyContext::Log,
+        Command::ResetHorizontalScroll
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-left",
+        KeyContext::Log,
+        Command::ResetHorizontalScroll
+    ));
 }

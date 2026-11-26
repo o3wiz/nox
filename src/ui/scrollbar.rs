@@ -28,13 +28,21 @@ pub struct ScrollMetrics {
 }
 
 impl ScrollMetrics {
-    /// Extracts scrollable metrics for `axis` from a `UniformListScrollHandle` after prepaint.
+    /// Extracts scrollable metrics for `axis` from a `UniformListScrollHandle` after prepaint,
+    /// subtracting a fixed non-scrolling `leading_inset` (such as a sticky gutter width on the
+    /// horizontal axis) from both viewport and content width so thumb proportions match the
+    /// visible scrollable region while preserving `max_offset`.
+    ///
     /// Returns `None` if the list has not been laid out yet or does not overflow along `axis`.
-    pub fn from_uniform_list(handle: &UniformListScrollHandle, axis: ScrollAxis) -> Option<Self> {
+    pub fn from_uniform_list_with_inset(
+        handle: &UniformListScrollHandle,
+        axis: ScrollAxis,
+        leading_inset: f32,
+    ) -> Option<Self> {
         let state = handle.0.borrow();
         let item_size = state.last_item_size?;
         let offset_pt = state.base_handle.offset();
-        let (viewport, content, offset) = match axis {
+        let (raw_viewport, raw_content, offset) = match axis {
             ScrollAxis::Vertical => (
                 f32::from(item_size.item.height),
                 f32::from(item_size.contents.height),
@@ -46,10 +54,17 @@ impl ScrollMetrics {
                 -f32::from(offset_pt.x),
             ),
         };
-        let max_offset = (content - viewport).max(0.0);
-        if viewport <= 0.0 || content <= 0.0 || max_offset <= 0.5 {
+        let max_offset = (raw_content - raw_viewport).max(0.0);
+        if raw_viewport <= 0.0 || raw_content <= 0.0 || max_offset <= 0.5 {
             return None;
         }
+        let inset = leading_inset.max(0.0);
+        let (viewport, content) =
+            if inset > 0.0 && raw_viewport > inset + 1.0 && raw_content > inset + 1.0 {
+                (raw_viewport - inset, raw_content - inset)
+            } else {
+                (raw_viewport, raw_content)
+            };
         Some(Self {
             viewport,
             content,
@@ -144,9 +159,10 @@ pub fn scroll_offset_for_thumb_start(
 pub fn compute_scrollbar_layout(
     handle: &UniformListScrollHandle,
     axis: ScrollAxis,
+    leading_inset: f32,
     outer_bounds: Bounds<Pixels>,
 ) -> Option<ScrollbarLayout> {
-    let metrics = ScrollMetrics::from_uniform_list(handle, axis)?;
+    let metrics = ScrollMetrics::from_uniform_list_with_inset(handle, axis, leading_inset)?;
     let (track_bounds, track_len, min_thumb) = match axis {
         ScrollAxis::Vertical => {
             let h = (f32::from(outer_bounds.size.height) - TRACK_END_PADDING * 2.0).max(0.0);
@@ -328,7 +344,11 @@ pub fn set_uniform_list_axis_offset(
         state.deferred_scroll_to_item = None;
     }
     let mut current = state.base_handle.offset();
-    let clamped = -positive_offset.max(0.0);
+    let clamped = if positive_offset <= 0.0 {
+        0.0
+    } else {
+        -positive_offset
+    };
     match axis {
         ScrollAxis::Vertical => current.y = px(clamped),
         ScrollAxis::Horizontal => current.x = px(clamped),
@@ -507,6 +527,7 @@ pub fn reveal_uniform_list_row(
 pub fn scrollbar_canvas(
     scroll: UniformListScrollHandle,
     axis: ScrollAxis,
+    leading_inset: f32,
     track_state: ScrollbarTrackState,
     dragging: bool,
     theme: Theme,
@@ -516,7 +537,7 @@ pub fn scrollbar_canvas(
     let paint_state = track_state;
     canvas(
         move |bounds, window, _cx| {
-            let layout = compute_scrollbar_layout(&scroll, axis, bounds);
+            let layout = compute_scrollbar_layout(&scroll, axis, leading_inset, bounds);
             prepaint_state.layout.set(layout);
             if layout.is_some() {
                 let behavior = match axis {
@@ -973,5 +994,34 @@ mod tests {
             reveal_scroll_top(0, 10, 24.0, f32::NAN, 0.0, 3, RevealStrategy::Nearest),
             None
         );
+    }
+
+    #[test]
+    fn scroll_metrics_with_leading_inset_tracks_scrollable_region_and_preserves_max_offset() {
+        let handle = UniformListScrollHandle::new();
+        {
+            let mut state = handle.0.borrow_mut();
+            state.last_item_size = Some(gpui::ItemSize {
+                item: size(px(800.0), px(400.0)),
+                contents: size(px(1600.0), px(2000.0)),
+            });
+            state.base_handle.set_offset(point(px(-200.0), px(-100.0)));
+        }
+
+        let inset =
+            ScrollMetrics::from_uniform_list_with_inset(&handle, ScrollAxis::Horizontal, 102.0)
+                .expect("horizontal metrics with sticky gutter inset");
+        assert_eq!(inset.viewport, 698.0);
+        assert_eq!(inset.content, 1498.0);
+        assert_eq!(inset.max_offset, 800.0);
+        assert_eq!(inset.offset, 200.0);
+
+        // When the viewport is narrower than the leading inset, fall back safely without dropping metrics.
+        let narrow_fallback =
+            ScrollMetrics::from_uniform_list_with_inset(&handle, ScrollAxis::Horizontal, 900.0)
+                .expect("fallback metrics when viewport is narrower than inset");
+        assert_eq!(narrow_fallback.viewport, 800.0);
+        assert_eq!(narrow_fallback.content, 1600.0);
+        assert_eq!(narrow_fallback.max_offset, 800.0);
     }
 }

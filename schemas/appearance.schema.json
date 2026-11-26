@@ -7,47 +7,34 @@
       "type": "string"
     },
     "ui_font_size": {
-      "type": "number",
-      "format": "float",
-      "minimum": 8,
-      "maximum": 32
+      "$ref": "#/$defs/FontSize"
     },
     "font_family": {
       "type": "string"
     },
     "font_size": {
-      "type": "number",
-      "format": "float",
-      "minimum": 8,
-      "maximum": 32
+      "$ref": "#/$defs/FontSize"
     },
     "background": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "panel": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "foreground": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "muted": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "accent": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "selection": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "text_selection_color": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "text_selection_opacity": {
       "type": "number",
@@ -56,20 +43,25 @@
       "maximum": 1.0
     },
     "border": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "match_foreground": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "match_background": {
-      "type": "string",
-      "pattern": "^#[0-9A-Fa-f]{6}$"
+      "$ref": "common.schema.json#/$defs/HexColor"
     },
     "$schema": {
       "type": "string"
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "FontSize": {
+      "type": "number",
+      "format": "float",
+      "minimum": 8,
+      "maximum": 32
+    }
+  }
 }

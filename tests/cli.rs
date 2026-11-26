@@ -44,6 +44,7 @@ fn init_config_and_write_schemas_round_trip_through_cli() {
         .unwrap();
     assert!(init.status.success());
     assert!(cfg_dir.join("window.json").is_file());
+    assert!(cfg_dir.join("schemas/common.schema.json").is_file());
     assert!(cfg_dir.join("schemas/session.schema.json").is_file());
 
     let check = Command::new(env!("CARGO_BIN_EXE_nox"))
@@ -61,6 +62,7 @@ fn init_config_and_write_schemas_round_trip_through_cli() {
         .unwrap();
     assert!(schemas.status.success());
     assert!(schema_dir.join("window.schema.json").is_file());
+    assert!(schema_dir.join("common.schema.json").is_file());
     assert!(schema_dir.join("session.schema.json").is_file());
 }
 
@@ -124,6 +126,7 @@ fn migrate_config_cli_updates_explicit_and_default_directories_and_skips_missing
     );
     assert!(String::from_utf8_lossy(&first.stdout).contains("Migrated configuration"));
     assert!(explicit.join("files.json").is_file());
+    assert!(explicit.join("schemas/common.schema.json").is_file());
     assert!(explicit.join("schemas/session.schema.json").is_file());
 
     let window: serde_json::Value =
@@ -244,6 +247,66 @@ fn migrate_config_cli_updates_explicit_and_default_directories_and_skips_missing
             .unwrap();
         assert!(!out.status.success(), "unexpectedly succeeded for {args:?}");
     }
+}
+
+#[test]
+fn check_config_warns_when_preset_select_text_is_missing_from_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let search_path = dir.path().join("search.json");
+    std::fs::write(
+        &search_path,
+        r#"{
+            "presets": [
+                {
+                    "name": "Port request",
+                    "pattern": "GET .* port 8080",
+                    "mode": "regex",
+                    "select_text": "PORT_NUMBER"
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let warned = Command::new(env!("CARGO_BIN_EXE_nox"))
+        .env_remove("NOX_CONFIG_DIR")
+        .args(["--check-config", "--config-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(warned.status.success());
+    let stdout = String::from_utf8_lossy(&warned.stdout);
+    let stderr = String::from_utf8_lossy(&warned.stderr);
+    assert!(stdout.contains("Configuration valid"));
+    assert!(stdout.contains("1 warning(s)"));
+    assert!(stderr.contains("warning:"));
+    assert!(stderr.contains("Port request"));
+    assert!(stderr.contains("PORT_NUMBER"));
+
+    std::fs::write(
+        &search_path,
+        r#"{
+            "presets": [
+                {
+                    "name": "Port request",
+                    "pattern": "GET .* port PORT_NUMBER",
+                    "mode": "regex",
+                    "select_text": "PORT_NUMBER"
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let clean = Command::new(env!("CARGO_BIN_EXE_nox"))
+        .env_remove("NOX_CONFIG_DIR")
+        .args(["--check-config", "--config-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(clean.status.success());
+    assert!(String::from_utf8_lossy(&clean.stdout).contains("Configuration valid (7 sections)"));
+    assert!(String::from_utf8_lossy(&clean.stderr).is_empty());
 }
 
 #[cfg(target_os = "macos")]

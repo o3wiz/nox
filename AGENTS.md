@@ -8,7 +8,7 @@
 - `src/main.rs`: CLI argument parsing (`--help`, `--version`, `--config-dir`, `--init-config`, `--migrate-config`, `--write-schemas`, `--check-config`) and application startup.
 - `src/ui/`: GPUI presentation layer (`mod.rs`, `components.rs`, `icons.rs`, `resize.rs`, `scrollbar.rs`, `selectable_text.rs`, `theme.rs`).
 - `config/`: default JSON configuration files embedded into the binary at compile time.
-- `schemas/`: JSON Schemas generated from the Rust config/session types (verified by tests).
+- `schemas/`: JSON Schemas generated from the Rust config/session types, with shared definitions centralized in `schemas/common.schema.json` (verified by tests).
 - `fixtures/demo.log`: sample log file for local testing and demos.
 - `packaging/`: native desktop delivery assets (`assets/nox.svg`, `macos/Info.plist`, `macos/Nox.icns`, `linux/nox.desktop`).
 - `tests/`: integration tests (`tests/core.rs`, `tests/cli.rs`).
@@ -31,7 +31,11 @@ Use Rust `1.95+` (edition 2024) from the repository root:
 
 ## Coding Style & Naming Conventions
 
-Follow standard Rust formatting with `rustfmt` (four-space indentation). Use `snake_case` for modules, files, and functions; `UpperCamelCase` for types and traits; and `SCREAMING_SNAKE_CASE` for constants. Keep `main` focused on CLI/startup and delegate behavior to library and UI modules. Whenever Rust config or session structs change, regenerate `schemas/` via `cargo run -- --write-schemas schemas`.
+Follow standard Rust formatting with `rustfmt` (four-space indentation). Use `snake_case` for modules, files, and functions; `UpperCamelCase` for types and traits; and `SCREAMING_SNAKE_CASE` for constants. Keep `main` focused on CLI/startup and delegate behavior to library and UI modules.
+
+Follow the DRY (Don't Repeat Yourself) principle as a rule of thumb: keep a single source of truth for shared types, constants, validation rules, helper logic, and schema definitions rather than copying them across files or modules (for example, shared JSON Schema definitions live in `schemas/common.schema.json` and are referenced via `$ref`). Prefer clear, shared abstractions once behavior or structure truly overlaps, while avoiding premature indirection for unrelated concepts that only happen to look similar.
+
+Whenever Rust config or session structs change, regenerate `schemas/` via `cargo run -- --write-schemas schemas`.
 
 ## Testing Guidelines
 

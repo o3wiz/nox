@@ -3,6 +3,7 @@ mod icons;
 mod resize;
 mod scrollbar;
 mod selectable_text;
+mod sticky_row;
 mod theme;
 
 use components::{
@@ -11,7 +12,7 @@ use components::{
 };
 use gpui::{prelude::*, *};
 use gpui_ce_elements::editable_text::{
-    EditableTextState, StringStorage, TextChanged,
+    EditableTextState, StringStorage, TextBoundary, TextChanged,
     actions::{
         self as input_actions, DEFAULT_INPUT_CONTEXT, EditableTextActionHandler, default_bindings,
     },
@@ -26,7 +27,7 @@ use nox::{
         CompletionResult, PathCompletion, complete_path, ensure_trailing_separator, home_dir,
         resolve_input_path,
     },
-    search::{self, SearchResults},
+    search::{self, MatchCopyResult, SearchResults},
     selection::{LineSelection, TextPosition, TextSelection, word_range_at},
     session::{self, SavedTab, Session},
     zoom::{
@@ -59,6 +60,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use sticky_row::StickyRowContent;
 use theme::{ICON_HERO, ICON_MD, ICON_SM, ICON_XS, Theme};
 
 #[derive(Clone, PartialEq, Deserialize, schemars::JsonSchema, Action)]
@@ -141,6 +143,21 @@ pub fn keybindings(config: &Config) -> anyhow::Result<Vec<KeyBinding>> {
     Ok(out)
 }
 
+/// Returns GPUI CE's default editable-text keybindings with built-in line-deletion
+/// shortcuts (`DeleteToLineStart` / `DeleteToLineEnd`) stripped so those actions only
+/// trigger when explicitly configured in `keyboard.json`.
+fn text_input_default_bindings() -> Vec<KeyBinding> {
+    default_bindings()
+        .as_keybindings(Some(DEFAULT_INPUT_CONTEXT))
+        .filter(|binding| {
+            !binding
+                .action()
+                .partial_eq(&input_actions::DeleteToLineStart)
+                && !binding.action().partial_eq(&input_actions::DeleteToLineEnd)
+        })
+        .collect()
+}
+
 fn sanitize_single_line_search_text(text: &str) -> String {
     text.replace(['\r', '\n'], "")
 }
@@ -153,6 +170,12 @@ fn append_regex_alternative(existing: &str, selected: &str) -> String {
     } else {
         format!("{existing}|{selected}")
     }
+}
+
+fn utf16_range_for_utf8(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let start = text[..range.start].encode_utf16().count();
+    let end = start + text[range.start..range.end].encode_utf16().count();
+    start..end
 }
 
 const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
@@ -369,6 +392,8 @@ pub struct Workspace {
     header_click_armed: bool,
     #[cfg(test)]
     header_zoom_count: usize,
+    #[cfg(test)]
+    quit_count: usize,
 }
 
 impl Workspace {
@@ -479,6 +504,9 @@ impl Workspace {
             cx.on_blur(&path_focus, window, |this, _window, cx| {
                 this.on_path_input_blur(cx);
             }),
+            cx.on_focus_lost(window, |this, window, cx| {
+                this.restore_focus(window, cx);
+            }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.header_click_armed = false;
@@ -558,6 +586,8 @@ impl Workspace {
             header_click_armed: false,
             #[cfg(test)]
             header_zoom_count: 0,
+            #[cfg(test)]
+            quit_count: 0,
         };
         for path in paths {
             this.open(path, cx);
@@ -585,6 +615,17 @@ impl Workspace {
             this.status = Some(StatusMessage::error(format!(
                 "{error} · session saving disabled"
             )));
+        } else {
+            let warnings = this.config.warnings();
+            if warnings.len() == 1 {
+                this.status = Some(StatusMessage::warning(warnings[0].clone()));
+            } else if !warnings.is_empty() {
+                this.status = Some(StatusMessage::warning(format!(
+                    "{} config warnings: {}",
+                    warnings.len(),
+                    warnings[0]
+                )));
+            }
         }
         this
     }
@@ -1192,6 +1233,11 @@ impl Workspace {
     }
 
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = if self.tabs.is_empty() {
+            Pane::Main
+        } else {
+            pane
+        };
         self.active_pane = pane;
         self.show_goto = false;
         self.dismiss_presets(cx);
@@ -1226,6 +1272,10 @@ impl Workspace {
     }
 
     fn focus_visible_pane(&mut self, preferred: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            self.focus_pane(Pane::Main, window, cx);
+            return;
+        }
         let (min_h, max_h) = self.results_height_bounds(window);
         let eff = self.results_height.clamp(min_h, max_h);
         let main_hidden = is_main_hidden(eff, max_h);
@@ -1236,6 +1286,10 @@ impl Workspace {
             _ => preferred,
         };
         self.focus_pane(pane, window, cx);
+    }
+
+    fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_visible_pane(self.active_pane, window, cx);
     }
 
     fn selection_count(tab: &Tab, pane: Pane) -> usize {
@@ -1729,6 +1783,81 @@ impl Workspace {
         }));
     }
 
+    fn copy_match_results(&mut self, pane: Pane, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(log) = &tab.log else {
+            return;
+        };
+        if tab.results.matches.is_empty() {
+            self.status = Some(StatusMessage::warning("No match results to copy"));
+            return;
+        }
+        if Self::selection_count(tab, pane) == 0 {
+            self.status = Some(StatusMessage::warning("No lines selected"));
+            return;
+        }
+        let selected_matches = match pane {
+            Pane::Main => search::selected_match_lines(
+                &tab.results.matches,
+                &tab.main_selection,
+                None,
+                log.len(),
+            ),
+            Pane::Results => search::selected_match_lines(
+                &tab.results.matches,
+                &tab.result_selection,
+                Some(&tab.results.visible),
+                log.len(),
+            ),
+        };
+        if selected_matches.is_empty() {
+            self.status = Some(StatusMessage::warning("No match results in selected lines"));
+            return;
+        }
+        let compiled_fallback;
+        let regex = if tab.options.mode == SearchMode::Regex && !tab.options.invert {
+            if let Some(re) = tab.highlight_regex.as_ref() {
+                Some(re)
+            } else if !tab.query.is_empty() {
+                compiled_fallback = search::compile(&tab.query, &tab.options).ok();
+                compiled_fallback.as_ref()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match search::extract_match_results(
+            log,
+            &selected_matches,
+            regex,
+            &tab.options,
+            MAX_COPY_BYTES,
+        ) {
+            Ok(MatchCopyResult::Copied { text, count }) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.status = Some(StatusMessage::success(if count == 1 {
+                    "Copied 1 match result".to_owned()
+                } else {
+                    format!("Copied {} match results", format_count(count))
+                }));
+            }
+            Ok(MatchCopyResult::Empty) => {
+                self.status = Some(StatusMessage::warning("No highlighted match text to copy"));
+            }
+            Ok(MatchCopyResult::LimitExceeded) => {
+                self.status = Some(StatusMessage::warning(
+                    "Match results too large to copy (limit 64 MB)",
+                ));
+            }
+            Err(error) => {
+                self.status = Some(StatusMessage::error(error.to_string()));
+            }
+        }
+    }
+
     fn search_selected_text(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         let Some(result) = self.extract_selected_text(pane) else {
             return;
@@ -2024,6 +2153,40 @@ impl Workspace {
         }
     }
 
+    fn reset_horizontal_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.active_pane_for(window);
+        self.active_pane = pane;
+        let (min_h, max_h) = self.results_height_bounds(window);
+        let eff = self.results_height.clamp(min_h, max_h);
+        if (pane == Pane::Main && is_main_hidden(eff, max_h))
+            || (pane == Pane::Results && is_results_hidden(eff))
+        {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let handle = match pane {
+            Pane::Main => {
+                if tab.log.as_ref().is_none_or(|log| log.is_empty()) {
+                    return;
+                }
+                &tab.scroll
+            }
+            Pane::Results => {
+                if tab.results.visible.is_empty() {
+                    return;
+                }
+                &tab.result_scroll
+            }
+        };
+        let current_x = f32::from(handle.0.borrow().base_handle.offset().x);
+        if current_x.abs() > 0.01 {
+            set_uniform_list_axis_offset(handle, ScrollAxis::Horizontal, 0.0);
+            cx.notify();
+        }
+    }
+
     fn command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
             Command::ShowFiles => {
@@ -2045,9 +2208,15 @@ impl Workspace {
             | Command::PageUp
             | Command::PageDown => {
                 if self.path_input_focused(window, cx)
-                    && matches!(command, Command::NextLine | Command::PreviousLine)
+                    && matches!(
+                        command,
+                        Command::NextLine
+                            | Command::PreviousLine
+                            | Command::FirstLine
+                            | Command::LastLine
+                    )
                 {
-                    self.navigate_path_completions(command == Command::NextLine, cx);
+                    self.navigate_path_completions(command, cx);
                     return;
                 }
                 if self.show_presets
@@ -2077,6 +2246,10 @@ impl Workspace {
             }
             Command::ScrollLeft | Command::ScrollRight => {
                 self.scroll_horizontal(command == Command::ScrollRight, window, cx);
+                return;
+            }
+            Command::ResetHorizontalScroll => {
+                self.reset_horizontal_scroll(window, cx);
                 return;
             }
             Command::SelectAll => {
@@ -2273,8 +2446,18 @@ impl Workspace {
                 }
             }
             Command::Open => self.choose_file(cx),
-            Command::Quit => cx.quit(),
+            Command::Quit => {
+                #[cfg(test)]
+                {
+                    self.quit_count += 1;
+                }
+                cx.quit();
+                return;
+            }
             Command::FocusSearch => {
+                if self.tabs.is_empty() {
+                    return;
+                }
                 self.show_goto = false;
                 self.dismiss_presets(cx);
                 self.dismiss_path_editing(cx);
@@ -2352,6 +2535,9 @@ impl Workspace {
             Command::CloseTab => {
                 let index = self.active;
                 self.close_tab_at(index, cx);
+                if self.tabs.is_empty() {
+                    self.focus.focus(window, cx);
+                }
             }
             Command::NextTab => {
                 if !self.tabs.is_empty() {
@@ -2451,6 +2637,11 @@ impl Workspace {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
                 self.copy_selected_text(pane, cx);
+            }
+            Command::CopyMatchResults => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                self.copy_match_results(pane, cx);
             }
             Command::SearchSelectedText => {
                 let pane = self.active_pane_for(window);
@@ -2604,7 +2795,12 @@ impl Workspace {
                 self.set_zoom_percent(DEFAULT_ZOOM_PERCENT, cx);
                 return;
             }
-            Command::MoveToLineStart | Command::MoveToLineEnd => {
+            Command::MoveToLineStart
+            | Command::MoveToLineEnd
+            | Command::SelectToLineStart
+            | Command::SelectToLineEnd
+            | Command::DeleteToLineStart
+            | Command::DeleteToLineEnd => {
                 if let Some(input) = self.focused_text_input(window, cx) {
                     input.update(cx, |state, cx| match command {
                         Command::MoveToLineStart => {
@@ -2612,6 +2808,30 @@ impl Workspace {
                         }
                         Command::MoveToLineEnd => {
                             state.nav_line_end(&input_actions::NavLineEnd, window, cx);
+                        }
+                        Command::SelectToLineStart => {
+                            state.select_linear(
+                                NavigationDirection::Back,
+                                TextBoundary::HardLine,
+                                cx,
+                            );
+                        }
+                        Command::SelectToLineEnd => {
+                            state.select_linear(
+                                NavigationDirection::Forward,
+                                TextBoundary::HardLine,
+                                cx,
+                            );
+                        }
+                        Command::DeleteToLineStart => {
+                            state.delete_to_line_start(
+                                &input_actions::DeleteToLineStart,
+                                window,
+                                cx,
+                            );
+                        }
+                        Command::DeleteToLineEnd => {
+                            state.delete_to_line_end(&input_actions::DeleteToLineEnd, window, cx);
                         }
                         _ => unreachable!(),
                     });
@@ -2779,14 +2999,16 @@ impl Workspace {
         cx.notify();
     }
 
-    fn navigate_path_completions(&mut self, forward: bool, cx: &mut Context<Self>) {
+    fn navigate_path_completions(&mut self, command: Command, cx: &mut Context<Self>) {
         if !self.show_path_completions {
             self.refresh_path_completions(true, cx);
             if !self.path_completions.items.is_empty() {
-                let idx = if forward {
-                    0
-                } else {
-                    self.path_completions.items.len() - 1
+                let idx = match command {
+                    Command::NextLine | Command::FirstLine => 0,
+                    Command::PreviousLine | Command::LastLine => {
+                        self.path_completions.items.len() - 1
+                    }
+                    _ => return,
                 };
                 self.path_completion_index = Some(idx);
                 self.path_completions_scroll.scroll_to_item(idx);
@@ -2799,11 +3021,15 @@ impl Workspace {
             self.path_completion_index = None;
             return;
         }
-        let next = match (self.path_completion_index, forward) {
-            (None, true) => 0,
-            (None, false) => len - 1,
-            (Some(i), true) => (i + 1) % len,
-            (Some(i), false) => (i + len - 1) % len,
+        let next = match (self.path_completion_index, command) {
+            (_, Command::FirstLine) => 0,
+            (_, Command::LastLine) => len - 1,
+            (None, Command::NextLine) => 0,
+            (None, Command::PreviousLine) => len - 1,
+            (Some(i), Command::NextLine) => (i + 1) % len,
+            (Some(i), Command::PreviousLine) => (i + len - 1) % len,
+            (Some(i), _) => i.min(len - 1),
+            (None, _) => return,
         };
         self.path_completion_index = Some(next);
         self.path_completions_scroll.scroll_to_item(next);
@@ -3106,14 +3332,57 @@ impl Workspace {
         let Some(preset) = self.config.search.presets.get(index).cloned() else {
             return;
         };
-        self.input
-            .update(cx, |input, cx| input.emplace(&preset.pattern, cx));
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.options.mode = preset.mode;
             tab.options.highlight_matches = preset.highlight_match;
         }
+        self.show_goto = false;
         self.dismiss_presets(cx);
         self.preset_index = index;
+        if preset.select_text.is_some() {
+            if let Some(range) = preset.select_text_range() {
+                let version = self.input.update(cx, |input, cx| {
+                    input.emplace(&preset.pattern, cx);
+                    input.move_to(range.start, cx);
+                    input.select_to(range.end, cx);
+                    input.version()
+                });
+                self.input.read(cx).focus_handle(cx).focus(window, cx);
+                let expected_utf16 = utf16_range_for_utf8(&preset.pattern, range.clone());
+                cx.on_next_frame(window, move |this, window, cx| {
+                    if !this.input.read(cx).focus_handle(cx).is_focused(window) {
+                        return;
+                    }
+                    let unchanged = this.input.update(cx, |input, cx| {
+                        if input.version() != version {
+                            return false;
+                        }
+                        input
+                            .selected_text_range(false, window, cx)
+                            .is_some_and(|sel| sel.range == expected_utf16)
+                    });
+                    if unchanged {
+                        this.input.update(cx, |input, cx| {
+                            input.move_to(range.start, cx);
+                            input.select_to(range.end, cx);
+                        });
+                    }
+                });
+            } else {
+                self.input.update(cx, |input, cx| {
+                    input.emplace(&preset.pattern, cx);
+                    input.move_to(preset.pattern.len(), cx);
+                });
+                self.input.read(cx).focus_handle(cx).focus(window, cx);
+                if let Some(warning) = preset.select_text_warning() {
+                    self.status = Some(StatusMessage::warning(warning));
+                }
+            }
+            cx.notify();
+            return;
+        }
+        self.input
+            .update(cx, |input, cx| input.emplace(&preset.pattern, cx));
         self.start_search(self.active, cx);
         self.focus_visible_pane(self.active_pane, window, cx);
     }
@@ -3307,6 +3576,7 @@ impl Workspace {
             self.results_height,
             &mut self.target_results_height,
             bounds,
+            self.config.window.filter_resize_sensitivity,
             now,
         );
         if cx.reduce_motion() {
@@ -3743,6 +4013,7 @@ impl Workspace {
             .child(scrollbar_canvas(
                 scroll,
                 ScrollAxis::Vertical,
+                0.0,
                 track_state,
                 dragging,
                 t.clone(),
@@ -3767,18 +4038,22 @@ impl Workspace {
         };
         let track_state = self.scrollbar_state(id).clone();
         let dragging = self.scrollbar_drag.is_some_and(|drag| drag.id == id);
+        let gutter_width = self
+            .zoom_metrics()
+            .sticky_gutter_width(self.config.viewer.line_numbers);
         let view = cx.entity().downgrade();
 
         div()
             .debug_selector(move || debug_name.into())
             .absolute()
             .bottom_0()
-            .left_0()
+            .left(px(gutter_width))
             .right_0()
             .h(px(HORIZONTAL_BAR_HEIGHT))
             .child(scrollbar_canvas(
                 scroll,
                 ScrollAxis::Horizontal,
+                gutter_width,
                 track_state,
                 dragging,
                 self.theme.clone(),
@@ -3816,6 +4091,15 @@ impl Workspace {
         let tab_width = self.config.viewer.tab_width;
         let metrics = self.zoom_metrics();
         let row_height = px(metrics.line_height);
+        let show_line_numbers = self.config.viewer.line_numbers;
+        let scrolled_horizontally = {
+            let handle = if results {
+                &tab.result_scroll
+            } else {
+                &tab.scroll
+            };
+            f32::from(handle.0.borrow().base_handle.offset().x) < -0.5
+        };
         let frame = self.render_frame;
         let cache = self.row_layouts(pane).clone();
         let text_selection = tab.text_selection(pane);
@@ -3915,6 +4199,99 @@ impl Workspace {
                     gpui::transparent_black()
                 };
 
+                let mark_border_color = if !show_line_numbers && scrolled_horizontally {
+                    t.border.opacity(0.8)
+                } else {
+                    gpui::transparent_black()
+                };
+                let line_number_border_color = if scrolled_horizontally {
+                    t.border
+                } else {
+                    t.border.opacity(0.6)
+                };
+                let sticky_gutter = div()
+                    .debug_selector(move || {
+                        format!("{}-gutter-{row}", if results { "result" } else { "main" })
+                    })
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_l_2()
+                    .border_color(border_color)
+                    .child(
+                        div()
+                            .id((if results { "rmark" } else { "mark" }, line))
+                            .debug_selector(move || {
+                                format!("{}-mark-{row}", if results { "result" } else { "main" })
+                            })
+                            .w(px(metrics.mark_gutter_width))
+                            .h_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(!show_line_numbers, |g| {
+                                g.border_r_1().border_color(mark_border_color)
+                            })
+                            .when(marked, |g| {
+                                g.child(
+                                    Icon::BookmarkFilled
+                                        .element(px(metrics.bookmark_icon_size), t.warning),
+                                )
+                            })
+                            .when(!marked && matched, |g| {
+                                g.child(
+                                    Icon::MatchDot.element(px(metrics.match_dot_size), t.accent),
+                                )
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _window, cx| {
+                                    this.toggle_bookmark_line(line, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .when(show_line_numbers, |gutter| {
+                        gutter.child(
+                            div()
+                                .debug_selector(move || {
+                                    format!(
+                                        "{}-linenum-{row}",
+                                        if results { "result" } else { "main" }
+                                    )
+                                })
+                                .w(px(metrics.line_number_width))
+                                .h_full()
+                                .pr(px(metrics.line_number_padding))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .border_r_1()
+                                .border_color(line_number_border_color)
+                                .text_size(px(metrics.line_number_size))
+                                .text_color(if selected { t.foreground } else { t.muted })
+                                .child(format!("{}", line + 1)),
+                        )
+                    })
+                    .into_any_element();
+                let text_cell = div()
+                    .flex_shrink_0()
+                    .when(show_line_numbers, |cell| {
+                        cell.pl(px(metrics.line_number_padding))
+                    })
+                    .pr_4()
+                    .child(
+                        div()
+                            .debug_selector(move || {
+                                format!("{}-text-{row}", if results { "result" } else { "main" })
+                            })
+                            .child(line_content),
+                    )
+                    .into_any_element();
+
                 Some(
                     div()
                         .id((if results { "result" } else { "line" }, line))
@@ -3930,69 +4307,9 @@ impl Workspace {
                         .text_size(px(metrics.font_size))
                         .bg(row_bg)
                         .hover(move |s| s.bg(hover_bg))
-                        .border_l_2()
-                        .border_color(border_color)
                         .text_color(text_color)
                         .cursor_pointer()
-                        .child(
-                            div()
-                                .id((if results { "rmark" } else { "mark" }, line))
-                                .w(px(metrics.mark_gutter_width))
-                                .h_full()
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(marked, |g| {
-                                    g.child(
-                                        Icon::BookmarkFilled
-                                            .element(px(metrics.bookmark_icon_size), t.warning),
-                                    )
-                                })
-                                .when(!marked && matched, |g| {
-                                    g.child(
-                                        Icon::MatchDot
-                                            .element(px(metrics.match_dot_size), t.accent),
-                                    )
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _window, cx| {
-                                        this.toggle_bookmark_line(line, cx);
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        )
-                        .when(self.config.viewer.line_numbers, |row| {
-                            row.child(
-                                div()
-                                    .w(px(metrics.line_number_width))
-                                    .h_full()
-                                    .pr(px(metrics.line_number_padding))
-                                    .mr(px(metrics.line_number_padding))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .border_r_1()
-                                    .border_color(t.border.opacity(0.6))
-                                    .text_size(px(metrics.line_number_size))
-                                    .text_color(if selected { t.foreground } else { t.muted })
-                                    .child(format!("{}", line + 1)),
-                            )
-                        })
-                        .child(
-                            div().pr_4().child(
-                                div()
-                                    .debug_selector(move || {
-                                        format!(
-                                            "{}-text-{row}",
-                                            if results { "result" } else { "main" }
-                                        )
-                                    })
-                                    .child(line_content),
-                            ),
-                        )
+                        .child(StickyRowContent::new(sticky_gutter, text_cell, row_height))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -4204,8 +4521,11 @@ impl Workspace {
                                     cx.stop_propagation();
                                 }),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.close_tab_at(index, cx);
+                                if this.tabs.is_empty() {
+                                    this.focus.focus(window, cx);
+                                }
                             })),
                     )
                     .tooltip_show_delay(Duration::from_millis(450))
@@ -4220,10 +4540,13 @@ impl Workspace {
                         }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.switch(index, cx)))
-                    .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    .on_aux_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         if event.is_middle_click() {
                             cx.stop_propagation();
                             this.close_tab_at(index, cx);
+                            if this.tabs.is_empty() {
+                                this.focus.focus(window, cx);
+                            }
                         }
                     })),
             );
@@ -4387,24 +4710,50 @@ impl Workspace {
                                     cx.listener(|this, _, window, cx| this.toggle_goto(window, cx)),
                                 ),
                             )
-                            .child(self.cmd_icon(
-                                "copy",
-                                Icon::Copy,
-                                if has_text_selection {
-                                    "Copy selected text".to_owned()
-                                } else if selected_count > 1 {
-                                    format!("Copy {} selected lines", format_count(selected_count))
-                                } else {
-                                    "Copy selected line".to_owned()
-                                },
-                                if has_text_selection {
-                                    Command::CopySelectedText
-                                } else {
-                                    Command::CopyLine
-                                },
-                                ButtonTone::Ghost,
-                                cx,
-                            ))
+                            .child(
+                                self.cmd_icon(
+                                    "copy",
+                                    Icon::Copy,
+                                    if has_text_selection {
+                                        "Copy selected text".to_owned()
+                                    } else if selected_count > 1 {
+                                        format!(
+                                            "Copy {} selected lines",
+                                            format_count(selected_count)
+                                        )
+                                    } else {
+                                        "Copy selected line".to_owned()
+                                    },
+                                    if has_text_selection {
+                                        Command::CopySelectedText
+                                    } else {
+                                        Command::CopyLine
+                                    },
+                                    ButtonTone::Ghost,
+                                    cx,
+                                )
+                                .debug_selector(|| "copy".into()),
+                            )
+                            .child(
+                                self.cmd_icon(
+                                    "copy-matches",
+                                    Icon::CopyMatches,
+                                    if selected_count > 1 {
+                                        format!(
+                                            "Copy {} selected lines' match results",
+                                            format_count(selected_count)
+                                        )
+                                    } else if selected_count == 1 {
+                                        "Copy selected line's match results".to_owned()
+                                    } else {
+                                        "Copy selected lines' match results".to_owned()
+                                    },
+                                    Command::CopyMatchResults,
+                                    ButtonTone::Ghost,
+                                    cx,
+                                )
+                                .debug_selector(|| "copy-matches".into()),
+                            )
                             .child(toolbar_divider(t))
                             .child(self.render_zoom_button(
                                 "zoom-out",
@@ -4776,7 +5125,7 @@ impl Workspace {
                     this.submit_file_path(true, window, cx);
                 } else if event.keystroke.key == "tab" && event.keystroke.modifiers.shift {
                     cx.stop_propagation();
-                    this.navigate_path_completions(false, cx);
+                    this.navigate_path_completions(Command::PreviousLine, cx);
                 }
             }))
             .child(
@@ -5068,6 +5417,8 @@ impl Workspace {
             .collect();
 
         let mut hero = div()
+            .debug_selector(|| "welcome".into())
+            .track_focus(&self.focus)
             .flex_1()
             .min_h_0()
             .flex()
@@ -5463,6 +5814,22 @@ impl Workspace {
                             .into_any_element()
                     };
 
+                    let pattern_element: AnyElement =
+                        if let Some(select_range) = preset.select_text_range() {
+                            let select_style = HighlightStyle {
+                                color: Some(t.accent),
+                                background_color: Some(t.accent_subtle),
+                                ..Default::default()
+                            };
+                            StyledText::new(preset.pattern.clone())
+                                .with_highlights(vec![(select_range, select_style)])
+                                .into_any_element()
+                        } else {
+                            preset.pattern.clone().into_any_element()
+                        };
+                    let select_warning = preset.select_text_warning();
+                    let warning_tip_theme = t.clone();
+
                     list = list.child(
                         div()
                             .id(("preset-item", preset_index))
@@ -5522,16 +5889,46 @@ impl Workspace {
                                     .child(
                                         div()
                                             .flex_shrink_0()
-                                            .px_1p5()
-                                            .py_0p5()
-                                            .rounded_sm()
-                                            .bg(t.background)
-                                            .border_1()
-                                            .border_color(t.border)
-                                            .font(t.mono_font_spec())
-                                            .text_size(px(10.))
-                                            .text_color(t.muted)
-                                            .child(mode_label),
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .when_some(select_warning, |el, warning| {
+                                                el.child(
+                                                    div()
+                                                        .id(("preset-warning", preset_index))
+                                                        .debug_selector(move || {
+                                                            format!("preset-warning-{preset_index}")
+                                                        })
+                                                        .flex()
+                                                        .items_center()
+                                                        .child(
+                                                            Icon::AlertTriangle
+                                                                .element(px(12.), t.warning),
+                                                        )
+                                                        .tooltip_show_delay(TOOLTIP_DELAY)
+                                                        .tooltip(move |_window, cx| {
+                                                            Tooltip::view(
+                                                                warning.clone(),
+                                                                None,
+                                                                warning_tip_theme.clone(),
+                                                                cx,
+                                                            )
+                                                        }),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(t.background)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .font(t.mono_font_spec())
+                                                    .text_size(px(10.))
+                                                    .text_color(t.muted)
+                                                    .child(mode_label),
+                                            ),
                                     ),
                             )
                             .child(
@@ -5541,7 +5938,7 @@ impl Workspace {
                                     .font(t.mono_font_spec())
                                     .text_size(t.xs_size)
                                     .text_color(t.muted)
-                                    .child(preset.pattern.clone()),
+                                    .child(pattern_element),
                             ),
                     );
                 }
@@ -5781,30 +6178,39 @@ impl Workspace {
                 .debug_selector(|| "highlight-matches".into()),
             )
             .child(search_box)
-            .child(self.cmd_icon(
-                "prev-match",
-                Icon::ChevronUp,
-                "Previous match",
-                Command::PreviousMatch,
-                ButtonTone::Ghost,
-                cx,
-            ))
-            .child(self.cmd_icon(
-                "next-match",
-                Icon::ChevronDown,
-                "Next match",
-                Command::NextMatch,
-                ButtonTone::Ghost,
-                cx,
-            ))
-            .child(self.cmd_icon(
-                "search",
-                Icon::ArrowRight,
-                "Apply search",
-                Command::Search,
-                ButtonTone::Primary,
-                cx,
-            ));
+            .child(
+                self.cmd_icon(
+                    "prev-match",
+                    Icon::ChevronUp,
+                    "Previous match",
+                    Command::PreviousMatch,
+                    ButtonTone::Ghost,
+                    cx,
+                )
+                .debug_selector(|| "prev-match".into()),
+            )
+            .child(
+                self.cmd_icon(
+                    "next-match",
+                    Icon::ChevronDown,
+                    "Next match",
+                    Command::NextMatch,
+                    ButtonTone::Ghost,
+                    cx,
+                )
+                .debug_selector(|| "next-match".into()),
+            )
+            .child(
+                self.cmd_icon(
+                    "search",
+                    Icon::ArrowRight,
+                    "Apply search",
+                    Command::Search,
+                    ButtonTone::Primary,
+                    cx,
+                )
+                .debug_selector(|| "search-apply".into()),
+            );
 
         if !self.config.search.presets.is_empty() {
             bar = bar
@@ -6313,7 +6719,7 @@ impl Render for Workspace {
                 .flex_col()
                 .child(
                     div()
-                        .when(results_multi_selected, |body| body.key_context("Selection"))
+                        .key_context("FilterLog")
                         .flex_1()
                         .w_full()
                         .min_h_0()
@@ -6321,10 +6727,18 @@ impl Render for Workspace {
                         .flex_col()
                         .child(
                             div()
-                                .when(results_text_selected, |body| {
-                                    body.key_context("TextSelected")
-                                })
-                                .track_focus(&self.results_focus)
+                                .when(results_multi_selected, |body| body.key_context("Selection"))
+                                .flex_1()
+                                .w_full()
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .when(results_text_selected, |body| {
+                                            body.key_context("TextSelected")
+                                        })
+                                        .track_focus(&self.results_focus)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, window, cx| {
@@ -6398,6 +6812,7 @@ impl Render for Workspace {
                                     )
                                 }),
                         ),
+                    ),
                 );
 
             div()
@@ -6572,8 +6987,23 @@ pub fn run(config: Config, paths: Vec<PathBuf>) -> anyhow::Result<()> {
             // again. Schedule startup after the launch callback has returned.
             cx.spawn(async move |cx| {
                 cx.update(move |cx| {
-                    cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+                    cx.bind_keys(text_input_default_bindings());
                     cx.bind_keys(bindings);
+                    cx.on_action(|action: &Execute, cx| {
+                        if action.command == Command::Quit {
+                            cx.quit();
+                        }
+                    });
+                    cx.set_menus([Menu::new("Nox").items([
+                        MenuItem::os_submenu("Services", SystemMenuType::Services),
+                        MenuItem::separator(),
+                        MenuItem::action(
+                            "Quit Nox",
+                            Execute {
+                                command: Command::Quit,
+                            },
+                        ),
+                    ])]);
                     let bounds = Bounds::centered(
                         None,
                         size(px(config.window.width), px(config.window.height)),
@@ -6619,7 +7049,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -6665,7 +7095,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -6835,6 +7265,23 @@ mod tests {
                     "Icon::{icon:?} rasterized completely transparent"
                 );
             }
+
+            let visible_pixel_count = |icon: Icon| -> usize {
+                cx.svg_renderer()
+                    .render_single_frame(icon.svg_bytes(), 2.0)
+                    .unwrap()
+                    .as_bytes(0)
+                    .expect("icon frame bytes")
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|px| px[3] > 0)
+                    .count()
+            };
+            assert!(
+                visible_pixel_count(Icon::CopyMatches) > visible_pixel_count(Icon::Copy),
+                "Icon::CopyMatches should fill the front square with more opaque pixels than Icon::Copy"
+            );
         });
     }
 
@@ -6914,7 +7361,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -7020,7 +7467,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -7119,7 +7566,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -7223,7 +7670,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -7400,7 +7847,7 @@ mod tests {
         config.search.presets[0].highlight_match = false;
         config.search.presets[1].highlight_match = true;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -7470,34 +7917,39 @@ mod tests {
                 pattern: "error|fatal|panic".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                select_text: None,
             },
             config::Preset {
                 name: "Warnings".into(),
                 pattern: "warn".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                select_text: None,
             },
             config::Preset {
                 name: "Requests".into(),
                 pattern: "GET|POST|PUT|DELETE".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                select_text: None,
             },
             config::Preset {
                 name: "HTTP 5xx Errors".into(),
                 pattern: "HTTP 5\\d\\d".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                select_text: None,
             },
             config::Preset {
                 name: "Auth Errors".into(),
                 pattern: "401|403|unauthorized".into(),
                 mode: SearchMode::Regex,
                 highlight_match: false,
+                select_text: None,
             },
         ];
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -7702,6 +8154,253 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn applying_selectable_preset_focuses_search_selects_text_and_defers_search(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "Errors".into(),
+                pattern: "ERROR".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                select_text: None,
+            },
+            config::Preset {
+                name: "Port request".into(),
+                pattern: "GET .* port PORT_NUMBER".into(),
+                mode: SearchMode::Regex,
+                highlight_match: false,
+                select_text: Some("PORT_NUMBER".into()),
+            },
+            config::Preset {
+                name: "Unicode user".into(),
+                pattern: "user=שלום_NAME!".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                select_text: Some("שלום_NAME".into()),
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selectable-presets.log");
+        std::fs::write(
+            &path,
+            "ERROR initial failure\nGET /api port 8080\nGET /api port 9090\nuser=alice!\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let selected_range = |input: &Entity<EditableTextState>,
+                              window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // Valid presets produce no startup warning.
+        view.read_with(cx, |view, _| assert_eq!(view.status, None));
+
+        // Seed an active search via the non-selectable preset.
+        view.update_in(cx, |view, window, cx| view.apply_preset(0, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+
+        let presets_key = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+
+        // Open patterns dropdown, pick "Port request" with Enter: copies pattern, focuses search,
+        // selects "PORT_NUMBER", updates mode/highlight options, and does NOT search yet.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "GET .* port PORT_NUMBER");
+            assert_eq!(selected_range(&view.input, window, cx), 12..23);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(!view.tabs[0].options.highlight_matches);
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert!(!view.tabs[0].searching);
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert_eq!(view.status, None);
+        });
+
+        // Typing replaces only the selected placeholder, and pressing Enter executes the search.
+        cx.simulate_input("8080");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "GET .* port 8080");
+            assert_eq!(view.tabs[0].query, "ERROR");
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].query, "GET .* port 8080");
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+        });
+
+        // Clicking a Unicode selectable preset also focuses search, selects the UTF-16 span,
+        // defers searching, and allows replacing the placeholder directly.
+        let trigger_center = cx
+            .debug_bounds("presets-trigger")
+            .expect("presets trigger")
+            .center();
+        cx.simulate_click(trigger_center, Modifiers::none());
+        cx.run_until_parked();
+        let unicode_item_center = cx
+            .debug_bounds("preset-item-2")
+            .expect("unicode preset item")
+            .center();
+        cx.simulate_click(unicode_item_center, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "user=שלום_NAME!");
+            let expected =
+                utf16_range_for_utf8("user=שלום_NAME!", "user=".len().."user=שלום_NAME".len());
+            assert_eq!(selected_range(&view.input, window, cx), expected);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.highlight_matches);
+            assert_eq!(view.tabs[0].query, "GET .* port 8080");
+            assert!(!view.tabs[0].searching);
+        });
+        cx.simulate_input("alice");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "user=alice!");
+            assert_eq!(view.tabs[0].query, "user=alice!");
+            assert_eq!(view.tabs[0].results.matches, vec![3]);
+        });
+    }
+
+    #[gpui::test]
+    fn selectable_preset_with_missing_select_text_warns_and_focuses_search_without_searching(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "Port request".into(),
+                pattern: "GET .* port 8080".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+                select_text: Some("PORT_NUMBER".into()),
+            },
+            config::Preset {
+                name: "Empty select".into(),
+                pattern: "warn".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                select_text: Some(String::new()),
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("warn-presets.log");
+        std::fs::write(&path, "GET /api port 8080\nwarn slow query\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let selected_range = |input: &Entity<EditableTextState>,
+                              window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // Startup surfaces a warning status for misconfigured select_text presets.
+        view.read_with(cx, |view, _| {
+            let status = view.status.as_ref().expect("startup warning status");
+            assert_eq!(status.tone, StatusTone::Warning);
+            assert!(status.text.contains("2 config warnings"));
+            assert!(status.text.contains("PORT_NUMBER"));
+        });
+
+        // Opening the patterns dropdown renders warning badges on both affected presets.
+        view.update_in(cx, |view, window, cx| view.toggle_presets(window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("preset-warning-0").is_some());
+        assert!(cx.debug_bounds("preset-warning-1").is_some());
+
+        // Applying preset 0 warns, focuses search with caret at end, and does not search.
+        view.update(cx, |view, _| view.status = None);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "GET .* port 8080");
+            assert_eq!(selected_range(&view.input, window, cx), 16..16);
+            assert_eq!(view.tabs[0].query, "");
+            assert!(!view.tabs[0].searching);
+            let status = view.status.as_ref().expect("apply warning status");
+            assert_eq!(status.tone, StatusTone::Warning);
+            assert!(status.text.contains("Port request"));
+            assert!(status.text.contains("PORT_NUMBER"));
+        });
+
+        // Applying preset 1 (empty select_text) warns, focuses search at end, and does not search.
+        view.update_in(cx, |view, window, cx| {
+            view.status = None;
+            view.apply_preset(1, window, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), "warn");
+            assert_eq!(selected_range(&view.input, window, cx), 4..4);
+            assert_eq!(view.tabs[0].query, "");
+            assert!(!view.tabs[0].searching);
+            let status = view.status.as_ref().expect("empty select_text warning");
+            assert_eq!(status.tone, StatusTone::Warning);
+            assert!(status.text.contains("Empty select"));
+            assert!(status.text.contains("empty"));
+        });
+    }
+
     #[test]
     fn theme_fallbacks_include_symbol_fonts_without_duplicates() {
         let config = Config::load(None).unwrap();
@@ -7764,7 +8463,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -7821,7 +8520,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -7990,7 +8689,7 @@ mod tests {
             action: Command::SwapSelectionAnchor,
         });
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -8043,7 +8742,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -8162,7 +8861,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -8220,7 +8919,7 @@ mod tests {
         config.files.restore_session = false;
         config.viewer.show_overview = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -8328,7 +9027,7 @@ mod tests {
         config.files.restore_session = false;
         config.viewer.max_display_chars = 64;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -8587,7 +9286,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -8917,7 +9616,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -9051,6 +9750,130 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn filter_pane_keyboard_resize_sensitivity_scales_tap_and_hold_but_not_buttons(
+        cx: &mut TestAppContext,
+    ) {
+        use resize::BASE_RESIZE_STEP;
+
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("sample.log");
+        std::fs::write(&file, "ERROR alpha\nINFO beta\nERROR gamma\n").unwrap();
+
+        let measure = |cx: &mut TestAppContext, sensitivity: f32| -> (f32, f32, f32, f32) {
+            let mut config = Config::load(None).unwrap();
+            config.files.save_session = false;
+            config.files.restore_session = false;
+            config.window.filter_resize_sensitivity = sensitivity;
+            cx.update(|cx| {
+                cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+                cx.bind_keys(keybindings(&config).unwrap());
+            });
+
+            let (view, vcx) = cx.add_window_view(|window, cx| {
+                Workspace::new(config, vec![file.clone()], window, cx)
+            });
+            wait_for_tab_loaded(&view, 0, vcx);
+
+            let step_frame = |vcx: &mut VisualTestContext, ms: u64| {
+                vcx.background_executor
+                    .advance_clock(Duration::from_millis(ms));
+                vcx.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                });
+                vcx.run_until_parked();
+            };
+            let settle = |vcx: &mut VisualTestContext| {
+                for _ in 0..45 {
+                    step_frame(vcx, 16);
+                }
+            };
+
+            let key_minus = Keystroke::parse("-").unwrap();
+            let key_shift_minus = Keystroke::parse("shift--").unwrap();
+
+            // Single tap `-` grows by BASE_RESIZE_STEP * sensitivity.
+            vcx.simulate_keystrokes("-");
+            vcx.simulate_event(KeyUpEvent {
+                keystroke: key_minus.clone(),
+            });
+            settle(vcx);
+            let after_grow_tap = view.read_with(vcx, |view, _| view.results_height);
+
+            // Single tap `shift--` shrinks back by the same sensitivity-scaled step.
+            vcx.simulate_keystrokes("shift--");
+            vcx.simulate_event(KeyUpEvent {
+                keystroke: key_shift_minus,
+            });
+            settle(vcx);
+            let after_shrink_tap = view.read_with(vcx, |view, _| view.results_height);
+
+            // Clicking the header grow button still uses the fixed BASE_RESIZE_STEP.
+            let grow_btn = vcx
+                .debug_bounds("results-grow")
+                .expect("grow button")
+                .center();
+            vcx.simulate_click(grow_btn, Modifiers::none());
+            vcx.run_until_parked();
+            settle(vcx);
+            let button_delta = view.read_with(vcx, |view, _| view.results_height - 250.0);
+
+            // Reset height back to 100px to leave plenty of room for a long-press glide comparison.
+            view.update(vcx, |view, cx| {
+                view.resize_motion.cancel();
+                view.results_height = 100.0;
+                view.target_results_height = 100.0;
+                cx.notify();
+            });
+            vcx.run_until_parked();
+
+            // Sustained hold of `-` for ~450ms glides faster with higher sensitivity.
+            vcx.simulate_event(KeyDownEvent {
+                keystroke: key_minus.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            for i in 0..28 {
+                if i >= 14 && i % 3 == 0 {
+                    vcx.simulate_event(KeyDownEvent {
+                        keystroke: key_minus.clone(),
+                        is_held: true,
+                        prefer_character_input: false,
+                    });
+                }
+                step_frame(vcx, 16);
+            }
+            vcx.simulate_event(KeyUpEvent {
+                keystroke: key_minus,
+            });
+            settle(vcx);
+            let hold_displacement = view.read_with(vcx, |view, _| view.results_height - 100.0);
+
+            (
+                after_grow_tap - 250.0,
+                after_shrink_tap,
+                button_delta,
+                hold_displacement,
+            )
+        };
+
+        let (tap_low, reset_low, btn_low, hold_low) = measure(cx, 0.5);
+        let (tap_high, reset_high, btn_high, hold_high) = measure(cx, 2.5);
+
+        assert_eq!(tap_low, BASE_RESIZE_STEP * 0.5);
+        assert_eq!(reset_low, 250.0);
+        assert_eq!(btn_low, BASE_RESIZE_STEP);
+
+        assert_eq!(tap_high, BASE_RESIZE_STEP * 2.5);
+        assert_eq!(reset_high, 250.0);
+        assert_eq!(btn_high, BASE_RESIZE_STEP);
+
+        assert!(
+            hold_high > hold_low * 3.5,
+            "2.5x sensitivity hold should glide much further than 0.5x (low={hold_low}, high={hold_high})"
+        );
+    }
+
     #[test]
     fn theme_uses_configured_text_selection_color_and_opacity() {
         let default_config = Config::load(None).unwrap();
@@ -9087,7 +9910,7 @@ mod tests {
         config.appearance.text_selection_color = "#FF5500".into();
         config.appearance.text_selection_opacity = 0.6;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -9301,7 +10124,7 @@ mod tests {
             action: Command::CopySelectedText,
         });
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -9426,7 +10249,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -9525,7 +10348,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -9672,7 +10495,7 @@ mod tests {
             action: Command::SearchSelectedText,
         });
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -9721,7 +10544,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let directory = tempfile::tempdir().unwrap();
@@ -10000,7 +10823,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -10140,7 +10963,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -10331,7 +11154,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -10471,7 +11294,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -10778,7 +11601,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -10989,7 +11812,7 @@ mod tests {
         config.files.restore_session = true;
         config.files.state_file = Some(state_file.display().to_string());
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -11198,7 +12021,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -11442,7 +12265,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -11529,10 +12352,12 @@ mod tests {
         let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
 
         // 1. Default (0): stepping down through all initially visible rows does not scroll.
-        let default_config = Config::load(None).unwrap();
+        let mut default_config = Config::load(None).unwrap();
+        default_config.files.save_session = false;
+        default_config.files.restore_session = false;
         assert_eq!(default_config.viewer.cursor_surrounding_lines, 0);
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&default_config).unwrap());
         });
         let (default_view, default_cx) = cx.add_window_view(|window, cx| {
@@ -11577,6 +12402,8 @@ mod tests {
 
         // 2. Main pane with cursor_surrounding_lines = 4.
         let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
         config.viewer.cursor_surrounding_lines = 4;
         let (view, vcx) = cx.add_window_view(|window, cx| {
             let mut workspace = Workspace::new(config.clone(), Vec::new(), window, cx);
@@ -11758,11 +12585,14 @@ mod tests {
         vcx.run_until_parked();
         let bottom_visible_row = main_full_rows - 2;
         let row0_bounds = vcx.debug_bounds("main-text-0").expect("row 0 text bounds");
+        let gutter0_bounds = vcx
+            .debug_bounds("main-gutter-0")
+            .expect("row 0 gutter bounds");
         let scroll_before_click = view.read_with(vcx, |view, _| {
             -f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().y)
         });
         let click_pos = point(
-            row0_bounds.left() + px(8.0),
+            row0_bounds.left().max(gutter0_bounds.right()) + px(8.0),
             row0_bounds.center().y + px(bottom_visible_row as f32 * line_height),
         );
         for count in [1, 2] {
@@ -11862,9 +12692,11 @@ mod tests {
 
         // 1. Zooming scales the surrounding margin in rows (using zoomed line_height).
         let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
         config.viewer.cursor_surrounding_lines = 4;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
         let (view, vcx) = cx.add_window_view(|window, cx| {
@@ -11907,6 +12739,8 @@ mod tests {
 
         // 2. Large cursor_surrounding_lines (larger than half viewport) centers cursor vertically.
         let mut center_config = Config::load(None).unwrap();
+        center_config.files.save_session = false;
+        center_config.files.restore_session = false;
         center_config.viewer.cursor_surrounding_lines = 500;
         let (center_view, center_cx) = cx.add_window_view(|window, cx| {
             let mut workspace = Workspace::new(center_config.clone(), Vec::new(), window, cx);
@@ -11952,6 +12786,8 @@ mod tests {
         });
         assert!(initial_edge_row >= 8);
         let mut init_config = Config::load(None).unwrap();
+        init_config.files.save_session = false;
+        init_config.files.restore_session = false;
         init_config.viewer.cursor_surrounding_lines = 5;
         let (init_view, init_cx) = cx.add_window_view(|window, cx| {
             let mut workspace = Workspace::new(init_config.clone(), Vec::new(), window, cx);
@@ -12008,7 +12844,7 @@ mod tests {
         config.files.save_session = false;
         config.files.restore_session = false;
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -12262,7 +13098,7 @@ mod tests {
         });
         config.validate().unwrap();
         cx.update(|cx| {
-            cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
+            cx.bind_keys(text_input_default_bindings());
             cx.bind_keys(keybindings(&config).unwrap());
         });
 
@@ -12388,5 +13224,2285 @@ mod tests {
             assert_eq!(theme::format_shortcut("cmd-left"), "Super+←");
             assert_eq!(theme::format_shortcut("cmd-right"), "Super+→");
         }
+    }
+
+    #[gpui::test]
+    fn quit_shortcut_works_when_no_logs_are_loaded(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let quit_key = if cfg!(target_os = "macos") {
+            "cmd-q"
+        } else {
+            "ctrl-q"
+        };
+        let focus_search_key = if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-f"
+        };
+        let focus_path_key = if cfg!(target_os = "macos") {
+            "cmd-shift-o"
+        } else {
+            "ctrl-shift-o"
+        };
+        let goto_key = if cfg!(target_os = "macos") {
+            "cmd-l"
+        } else {
+            "ctrl-l"
+        };
+        let presets_key = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, Vec::new(), window, cx));
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, 0);
+        });
+
+        // Pressing Cmd+Q / Ctrl+Q immediately on the empty welcome screen triggers Quit.
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.quit_count, 1));
+
+        // Interacting with the welcome screen, header, and file library preserves Workspace focus.
+        let welcome_pt =
+            cx.debug_bounds("welcome").expect("welcome bounds").origin + point(px(16.), px(16.));
+        cx.simulate_click(welcome_pt, Modifiers::none());
+        cx.run_until_parked();
+
+        let library_btn = cx
+            .debug_bounds("header-library")
+            .expect("library button bounds")
+            .center();
+        cx.simulate_click(library_btn, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.show_files));
+        cx.simulate_click(library_btn, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.show_files));
+
+        // Tab-only Workspace shortcuts (search, file path, go to line, presets) do not focus
+        // unmounted inputs or break Quit on the welcome screen.
+        for key in [focus_search_key, focus_path_key, goto_key, presets_key] {
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+        }
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.focus.is_focused(window));
+            assert!(!view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert!(!view.path_input.read(cx).focus_handle(cx).is_focused(window));
+            assert!(!view.goto.read(cx).focus_handle(cx).is_focused(window));
+            assert!(!view.show_goto);
+            assert!(!view.show_presets);
+        });
+
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.quit_count, 2));
+
+        // Log-only shortcuts are inactive on the welcome screen and do not disrupt Quit.
+        cx.simulate_keystrokes("m f down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.quit_count, 3));
+
+        // Even if the window loses focus, on_focus_lost restores welcome focus so Quit still works.
+        view.update_in(cx, |_view, window, cx| window.blur(cx));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.focus.is_focused(window));
+        });
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.quit_count, 4));
+    }
+
+    #[gpui::test]
+    fn quit_shortcut_works_after_closing_last_tab_from_any_focused_control(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let quit_key = if cfg!(target_os = "macos") {
+            "cmd-q"
+        } else {
+            "ctrl-q"
+        };
+        let close_tab_key = if cfg!(target_os = "macos") {
+            "cmd-w"
+        } else {
+            "ctrl-w"
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.log");
+        std::fs::write(&path, "ERROR first\nINFO second\nERROR third\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, Vec::new(), window, cx));
+        cx.run_until_parked();
+
+        let open_loaded_tab = |view: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            let log = log.clone();
+            let path = path.clone();
+            view.update(cx, |view, cx| {
+                view.open(path, cx);
+                view.tabs[0].log = Some(log);
+                view.tabs[0].loading = false;
+                view.input
+                    .update(cx, |input, cx| input.emplace("ERROR", cx));
+                view.start_search(0, cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+
+        let mut expected_quits = 0;
+
+        // 1. Main log pane focused -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 2. Search input focused -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 3. Results pane focused -> click tab close button -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        let close_btn = cx
+            .debug_bounds("tab-close-0")
+            .expect("tab close button bounds")
+            .center();
+        cx.simulate_click(close_btn, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 4. File path input focused -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 5. Go-to-line input focused -> close_tab_at without window handle -> on_focus_lost -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.close_tab_at(0, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 6. Presets search input focused -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::TogglePresets, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+
+        // 7. Filter pane maximized (main pane hidden, results pane focused) -> Cmd+W -> Cmd+Q.
+        open_loaded_tab(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            let (_min_h, max_h) = view.results_height_bounds(window);
+            view.results_height = max_h;
+            view.target_results_height = max_h;
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_tab_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(quit_key);
+        cx.run_until_parked();
+        expected_quits += 1;
+        view.update_in(cx, |view, window, _cx| {
+            assert!(view.tabs.is_empty());
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.quit_count, expected_quits);
+        });
+    }
+
+    #[gpui::test]
+    fn copy_match_results_button_and_shortcut_copy_selected_lines_in_both_panes(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.context_lines = 1;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("copy_matches.log");
+        std::fs::write(
+            &path,
+            concat!(
+                "INFO boot\n",
+                "WARN user=alice status=200 extra=ok\n",
+                "DEBUG middle\n",
+                "ERROR user=bob status=503 status=504\n",
+                "INFO tail\n",
+            ),
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, Vec::new(), window, cx));
+        cx.run_until_parked();
+
+        // Both copy buttons are hidden on the welcome screen, and default shortcut formats as "C".
+        assert!(cx.debug_bounds("copy").is_none());
+        assert!(cx.debug_bounds("copy-matches").is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.theme.shortcut(Command::CopyMatchResults).as_deref(),
+                Some("C")
+            );
+        });
+
+        // Open a tab and attach indexed log.
+        view.update(cx, |view, cx| {
+            view.open(path.clone(), cx);
+            view.tabs[0].log = Some(log);
+            view.tabs[0].loading = false;
+            view.tabs[0].bookmarks.insert(0);
+            view.refresh_bookmarks(0, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let copy_bounds = cx.debug_bounds("copy").expect("copy button bounds");
+        let copy_matches_bounds = cx
+            .debug_bounds("copy-matches")
+            .expect("copy-matches button bounds");
+        let zoom_out_bounds = cx.debug_bounds("zoom-out").expect("zoom-out button bounds");
+        let search_apply_bounds = cx
+            .debug_bounds("search-apply")
+            .expect("search-apply button bounds");
+        assert_eq!(
+            copy_bounds.top(),
+            copy_matches_bounds.top(),
+            "copy-matches button should sit in the header toolbar next to copy"
+        );
+        assert!(
+            copy_bounds.right() < copy_matches_bounds.left()
+                && copy_matches_bounds.right() < zoom_out_bounds.left(),
+            "copy-matches button should sit immediately to the right of copy before zoom controls"
+        );
+        assert!(
+            copy_matches_bounds.bottom() < search_apply_bounds.top(),
+            "copy-matches button should sit in the header toolbar above the filter bar"
+        );
+
+        // Pressing `c` in the Main pane (Log context) with no search matches warns without copying.
+        cx.simulate_keystrokes("c");
+        assert!(cx.read_from_clipboard().is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No match results to copy"))
+            );
+        });
+
+        // Focusing the Filter pane and pressing `c` with no matches also warns without copying.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+            view.status = None;
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert!(cx.read_from_clipboard().is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No match results to copy"))
+            );
+        });
+
+        // Typing `c` in the search input inserts text normally instead of triggering Log.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.simulate_input("case");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "case");
+        });
+        assert!(cx.read_from_clipboard().is_none());
+
+        // Search in Regex mode with capturing groups and context/bookmarks present.
+        view.update_in(cx, |view, window, cx| {
+            view.input.update(cx, |input, cx| {
+                input.emplace(r"user=(\w+).*?status=(\d{3})", cx);
+            });
+            view.command(Command::Search, window, cx);
+            view.focus_pane(Pane::Main, window, cx);
+            view.status = None;
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].results.matches, vec![1, 3]);
+            assert_eq!(view.tabs[0].results.visible, vec![0, 1, 2, 3, 4]);
+        });
+
+        // In Main pane with only non-matching line 0 selected: warns and copies nothing.
+        cx.simulate_keystrokes("c");
+        assert!(cx.read_from_clipboard().is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No match results in selected lines"))
+            );
+        });
+
+        // In Main pane with matching line 1 selected: pressing `c` copies only that line's captures.
+        cx.simulate_keystrokes("down c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::success("Copied 1 match result"))
+            );
+        });
+
+        // In Main pane with lines 1..=3 selected (includes non-matching line 2): copies lines 1 & 3.
+        cx.simulate_keystrokes("shift-down shift-down c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200\nbob 503".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::success("Copied 2 match results"))
+            );
+        });
+
+        // Empty selection in Main pane warns "No lines selected" and keeps clipboard intact.
+        view.update(cx, |view, cx| {
+            view.tabs[0].main_selection = LineSelection::empty();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200\nbob 503".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No lines selected"))
+            );
+        });
+
+        // Turning off highlight_matches in Regex mode still copies what would be highlighted
+        // when clicking the copy-matches button for the active pane's selected lines.
+        let select_all_key = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleHighlightMatches, window, cx);
+            assert!(!view.tabs[0].options.highlight_matches);
+            view.tabs[0].main_selection.select_single(3);
+            view.tabs[0].selected = 3;
+            cx.notify();
+        });
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("sentinel".to_owned()))
+        });
+        let copy_matches_bounds = cx
+            .debug_bounds("copy-matches")
+            .expect("copy-matches button bounds after search");
+        cx.simulate_click(copy_matches_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("bob 503".to_owned())
+        );
+
+        // In Filter pane: row 0 is context/bookmark line 0 (not a match) -> warns, does not copy.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("bob 503".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No match results in selected lines"))
+            );
+        });
+
+        // In Filter pane: moving down to row 1 (match line 1) copies only row 1, and `m` still works.
+        cx.simulate_keystrokes("down c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200".to_owned())
+        );
+        cx.simulate_keystrokes("m");
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.tabs[0].bookmarks.contains(&1),
+                "Log context shortcuts must remain active in the Filter pane"
+            );
+        });
+        cx.simulate_keystrokes("m");
+
+        // In Filter pane: Select All copies all matches while skipping context & bookmark rows.
+        cx.simulate_keystrokes(select_all_key);
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200\nbob 503".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::success("Copied 2 match results"))
+            );
+        });
+
+        // Regex without capturing groups copies full regex matches, space-separated per line,
+        // for only the selected rows in the Filter pane.
+        view.update_in(cx, |view, window, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace(r"status=\d{3}", cx));
+            view.command(Command::Search, window, cx);
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.tabs[0].result_selection = LineSelection::single(3); // visible[3] = line 3
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("status=503 status=504".to_owned())
+        );
+
+        // Switching to Literal mode copies full matched lines from the selected rows only
+        // (excluding context and bookmark rows even when selected via Select All).
+        view.update_in(cx, |view, window, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("status=", cx));
+            view.command(Command::ToggleRegex, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert_eq!(view.tabs[0].results.matches, vec![1, 3]);
+            assert_eq!(view.tabs[0].results.visible, vec![0, 1, 2, 3, 4]);
+        });
+        // Select rows 0..=2 (bookmark/context 0, match 1, context 2) -> only line 1 is copied.
+        view.update(cx, |view, cx| {
+            view.tabs[0].result_selection = LineSelection::single(0);
+            view.tabs[0].result_selection.extend_to(2);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("WARN user=alice status=200 extra=ok".to_owned())
+        );
+
+        // Select All in Literal mode copies both matched lines without context/bookmarks.
+        cx.simulate_keystrokes(select_all_key);
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(
+                "WARN user=alice status=200 extra=ok\nERROR user=bob status=503 status=504"
+                    .to_owned()
+            )
+        );
+
+        // Regex mode with a non-participating optional capture group on a selected matching line
+        // warns and keeps clipboard intact.
+        view.update_in(cx, |view, window, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace(r"INFO (missing)?", cx));
+            view.command(Command::ToggleRegex, window, cx);
+        });
+        cx.run_until_parked();
+        // Line 0 ("INFO boot") matches `INFO (missing)?` and is row 0 in visible results.
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(
+                "WARN user=alice status=200 extra=ok\nERROR user=bob status=503 status=504"
+                    .to_owned()
+            )
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No highlighted match text to copy"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn filter_log_context_overrides_log_in_filter_pane_regardless_of_binding_order(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Put FilterLog BEFORE Log for the same key to verify specificity + DOM depth precedence.
+        config.keyboard.bindings = vec![
+            config::Binding {
+                keys: "x".to_owned(),
+                context: config::KeyContext::FilterLog,
+                action: Command::CopyMatchResults,
+            },
+            config::Binding {
+                keys: "x".to_owned(),
+                context: config::KeyContext::Log,
+                action: Command::ToggleBookmark,
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("filter_context.log");
+        std::fs::write(&path, "INFO alpha\nERROR beta\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].loading = false;
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR (\\w+)", cx));
+            view.command(Command::Search, window, cx);
+            view.focus_pane(Pane::Main, window, cx);
+        });
+        cx.run_until_parked();
+
+        // In Main pane, `x` runs the `Log` binding (ToggleBookmark), not `FilterLog`.
+        cx.simulate_keystrokes("x");
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.contains(&0));
+        });
+        assert!(cx.read_from_clipboard().is_none());
+
+        // In Filter pane, `x` runs the more specific `FilterLog` binding (CopyMatchResults).
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("beta".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0]));
+        });
+    }
+
+    #[gpui::test]
+    fn text_selection_to_line_start_and_end_work_across_all_text_inputs(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("select-line.log");
+        std::fs::write(&path, "line 0\nline 1\nline 2\nline 3\nline 4\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].selected = 1;
+            view.tabs[0].main_selection = LineSelection::single(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let selection_state = |input: &Entity<EditableTextState>,
+                               window: &mut Window,
+                               cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+        };
+
+        // 1. Search box (`Search` / `TextInput`): cmd-shift-left/right and shift-up/down select
+        //    to line start/end, preserve anchor when reversing, replace selection on input, and
+        //    handle boundary no-ops and multibyte/surrogate-pair Unicode text.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("alpha beta");
+        cx.simulate_keystrokes("left left left left left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, 5..5);
+        });
+
+        cx.simulate_keystrokes("cmd-shift-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, 0..5);
+            assert!(sel.reversed);
+        });
+
+        cx.simulate_keystrokes("cmd-shift-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, 5..10);
+            assert!(!sel.reversed);
+        });
+        cx.simulate_input(" gamma");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "alpha gamma");
+        });
+
+        cx.simulate_keystrokes("left left left left left left");
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, 0..5);
+            assert!(sel.reversed);
+        });
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, 5..11);
+            assert!(!sel.reversed);
+        });
+        cx.simulate_input("!");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "alpha!");
+        });
+
+        // Boundary behavior: at start/end, selecting further is a safe no-op, and selecting the
+        // opposite direction selects the entire line.
+        cx.simulate_keystrokes("home cmd-shift-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(selection_state(&view.input, window, cx).range, 0..0);
+        });
+        cx.simulate_keystrokes("cmd-shift-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, 0..6);
+            assert!(!sel.reversed);
+        });
+        cx.simulate_keystrokes("end shift-down");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(selection_state(&view.input, window, cx).range, 6..6);
+        });
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, 0..6);
+            assert!(sel.reversed);
+        });
+
+        // Multibyte + UTF-16 surrogate pair Unicode text.
+        let unicode = "שלום 🚀 мир";
+        let split_utf8 = "שלום ".len();
+        let split_utf16 = "שלום ".encode_utf16().count();
+        let end_utf16 = unicode.encode_utf16().count();
+        view.update_in(cx, |view, _window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.emplace(unicode, cx);
+                state.move_to(split_utf8, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, 0..split_utf16);
+            assert!(sel.reversed);
+        });
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.input, window, cx);
+            assert_eq!(sel.range, split_utf16..end_utf16);
+            assert!(!sel.reversed);
+        });
+
+        // 2. File path bar (`FilePath` / `TextInput`): selects from caret to start/end without
+        //    opening completions.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        let initial_path =
+            view.read_with(cx, |view, cx| view.path_input.read(cx).as_str().to_owned());
+        let path_end_utf16 = initial_path.encode_utf16().count();
+        cx.simulate_keystrokes("home right right cmd-shift-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.path_input, window, cx);
+            assert_eq!(sel.range, 2..path_end_utf16);
+            assert!(!sel.reversed);
+            assert!(!view.show_path_completions);
+        });
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.path_input, window, cx);
+            assert_eq!(sel.range, 0..2);
+            assert!(sel.reversed);
+            assert!(!view.show_path_completions);
+        });
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.path_input, window, cx);
+            assert_eq!(sel.range, 2..path_end_utf16);
+            assert!(!sel.reversed);
+        });
+        cx.simulate_keystrokes("cmd-shift-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.path_input, window, cx);
+            assert_eq!(sel.range, 0..2);
+            assert!(sel.reversed);
+        });
+
+        // 3. Pattern search box (`Presets` / `TextInput`): selects inside the filter text without
+        //    moving `preset_index`.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::TogglePresets, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
+        cx.simulate_input("error");
+        cx.run_until_parked();
+        let preset_index_after_filter = view.read_with(cx, |view, _| view.preset_index);
+        cx.simulate_keystrokes("left left shift-up");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.presets_search, window, cx);
+            assert_eq!(sel.range, 0..3);
+            assert!(sel.reversed);
+            assert_eq!(view.preset_index, preset_index_after_filter);
+        });
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.presets_search, window, cx);
+            assert_eq!(sel.range, 3..5);
+            assert!(!sel.reversed);
+            assert_eq!(view.preset_index, preset_index_after_filter);
+        });
+        cx.simulate_keystrokes("cmd-shift-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.presets_search, window, cx);
+            assert_eq!(sel.range, 0..3);
+            assert!(sel.reversed);
+        });
+        cx.simulate_keystrokes("cmd-shift-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.presets_search, window, cx);
+            assert_eq!(sel.range, 3..5);
+            assert!(!sel.reversed);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 4. Go-to-line input (`GoTo` / `TextInput`).
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("12345");
+        cx.simulate_keystrokes("left left cmd-shift-left");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.goto, window, cx);
+            assert_eq!(sel.range, 0..3);
+            assert!(sel.reversed);
+        });
+        cx.simulate_keystrokes("cmd-shift-right");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.goto, window, cx);
+            assert_eq!(sel.range, 3..5);
+            assert!(!sel.reversed);
+        });
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.goto, window, cx);
+            assert_eq!(sel.range, 0..3);
+            assert!(sel.reversed);
+        });
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let sel = selection_state(&view.goto, window, cx);
+            assert_eq!(sel.range, 3..5);
+            assert!(!sel.reversed);
+        });
+        cx.simulate_input("99");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.goto.read(cx).as_str(), "12399");
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 5. Log pane (`Log` context) retains shift-up / shift-down multi-line selection untouched,
+        //    and invoking select-to-line commands with no focused text input is a safe no-op.
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.tabs[0].selected, 1);
+            view.command(Command::SelectToLineStart, window, cx);
+            view.command(Command::SelectToLineEnd, window, cx);
+            assert_eq!(view.tabs[0].selected, 1);
+            assert_eq!(view.tabs[0].main_selection.count(), 1);
+        });
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 2);
+            assert_eq!(view.tabs[0].main_selection.count(), 2);
+            assert!(view.tabs[0].main_selection.contains(1));
+            assert!(view.tabs[0].main_selection.contains(2));
+        });
+        cx.simulate_keystrokes("shift-up shift-up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 0);
+            assert_eq!(view.tabs[0].main_selection.count(), 2);
+            assert!(view.tabs[0].main_selection.contains(0));
+            assert!(view.tabs[0].main_selection.contains(1));
+        });
+
+        // Verify shortcut label formatting for the new default selection shortcuts.
+        if cfg!(target_os = "macos") {
+            assert_eq!(theme::format_shortcut("cmd-shift-left"), "⌘⇧←");
+            assert_eq!(theme::format_shortcut("cmd-shift-right"), "⌘⇧→");
+            assert_eq!(theme::format_shortcut("shift-up"), "⇧↑");
+            assert_eq!(theme::format_shortcut("shift-down"), "⇧↓");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(theme::format_shortcut("cmd-shift-left"), "Win+Shift+←");
+            assert_eq!(theme::format_shortcut("cmd-shift-right"), "Win+Shift+→");
+            assert_eq!(theme::format_shortcut("shift-up"), "Shift+↑");
+            assert_eq!(theme::format_shortcut("shift-down"), "Shift+↓");
+        } else {
+            assert_eq!(theme::format_shortcut("cmd-shift-left"), "Super+Shift+←");
+            assert_eq!(theme::format_shortcut("cmd-shift-right"), "Super+Shift+→");
+            assert_eq!(theme::format_shortcut("shift-up"), "Shift+↑");
+            assert_eq!(theme::format_shortcut("shift-down"), "Shift+↓");
+        }
+    }
+
+    #[gpui::test]
+    fn text_delete_to_line_start_and_end_work_with_default_and_custom_bindings_across_all_text_inputs(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        assert!(config.keyboard.bindings.iter().any(|b| {
+            b.keys == "cmd-backspace"
+                && b.context == config::KeyContext::TextInput
+                && b.action == Command::DeleteToLineStart
+        }));
+        assert!(
+            !config
+                .keyboard
+                .bindings
+                .iter()
+                .any(|b| b.action == Command::DeleteToLineEnd)
+        );
+        config.files.save_session = false;
+        config.files.restore_session = false;
+
+        // Add custom TextInput bindings alongside the default `cmd-backspace` for delete_to_line_start.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "ctrl-u".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::DeleteToLineStart,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-k".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::DeleteToLineEnd,
+        });
+        // Register a Presets-specific override BEFORE a TextInput binding for the same key to
+        // ensure context specificity beats JSON order.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-delete".into(),
+            context: config::KeyContext::Presets,
+            action: Command::FirstLine,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-delete".into(),
+            context: config::KeyContext::TextInput,
+            action: Command::DeleteToLineEnd,
+        });
+        config.validate().unwrap();
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("delete-line.log");
+        std::fs::write(&path, "line 0\nline 1\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].selected = 1;
+            view.tabs[0].main_selection = LineSelection::single(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let caret_range = |input: &Entity<EditableTextState>,
+                           window: &mut Window,
+                           cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        // 1. Search box (`Search` / `TextInput`): default cmd-backspace and custom bindings for
+        //    mid-line delete to start/end, boundary no-ops, undo, active selection deletion, and
+        //    multibyte Unicode.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("alpha beta gamma");
+        cx.simulate_keystrokes("left left left left left left left left left left");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "beta gamma");
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+        // At start of line, delete_to_line_start is a safe no-op.
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "beta gamma");
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+
+        cx.simulate_keystrokes("right right right right alt-k");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "beta");
+            assert_eq!(caret_range(&view.input, window, cx), 4..4);
+        });
+        // At end of line, delete_to_line_end is a safe no-op.
+        cx.simulate_keystrokes("alt-k");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "beta");
+            assert_eq!(caret_range(&view.input, window, cx), 4..4);
+        });
+
+        // Undo restores the deleted tail cleanly.
+        let undo = if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        };
+        cx.simulate_keystrokes(undo);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "beta gamma");
+        });
+
+        // When a selection exists, delete_to_line_start removes the selection.
+        cx.simulate_keystrokes("home right shift-right shift-right shift-right ctrl-u");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "b gamma");
+            assert_eq!(caret_range(&view.input, window, cx), 1..1);
+        });
+
+        // Multibyte Unicode text.
+        view.update_in(cx, |view, _window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.emplace("שלום мир", cx);
+                state.move_to("שלום ".len(), cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-k");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "שלום ");
+            let end = "שלום ".encode_utf16().count();
+            assert_eq!(caret_range(&view.input, window, cx), end..end);
+        });
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "");
+            assert_eq!(caret_range(&view.input, window, cx), 0..0);
+        });
+
+        // 2. File path bar (`FilePath` / `TextInput`).
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        let initial_path =
+            view.read_with(cx, |view, cx| view.path_input.read(cx).as_str().to_owned());
+        cx.simulate_keystrokes("home");
+        cx.simulate_input("prefix_");
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.path_input.read(cx).as_str(), initial_path);
+            assert_eq!(caret_range(&view.path_input, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("_suffix");
+        cx.simulate_keystrokes("left left left left left left left alt-k");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.path_input.read(cx).as_str(), initial_path);
+            let end = initial_path.encode_utf16().count();
+            assert_eq!(caret_range(&view.path_input, window, cx), end..end);
+        });
+
+        // 3. Pattern search box (`Presets` / `TextInput`): deletion updates live preset filtering,
+        //    and Presets-specific override beats TextInput binding regardless of order.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::TogglePresets, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("err_nomatch");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.filtered_presets.is_empty());
+        });
+        cx.simulate_keystrokes("left left left left left left left left alt-k");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.presets_search.read(cx).as_str(), "err");
+            assert!(!view.filtered_presets.is_empty());
+        });
+        cx.simulate_keystrokes("left cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.presets_search.read(cx).as_str(), "r");
+            assert_eq!(caret_range(&view.presets_search, window, cx), 0..0);
+        });
+        // Clear filter to restore multiple presets, select index 1, then verify alt-delete runs
+        // Presets' FirstLine override instead of TextInput's DeleteToLineEnd.
+        cx.simulate_keystrokes("alt-k");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.preset_index, 1));
+        cx.simulate_input("e");
+        cx.simulate_keystrokes("down home alt-delete");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.preset_index, 0);
+            assert_eq!(view.presets_search.read(cx).as_str(), "e");
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 4. Go-to-line input (`GoTo` / `TextInput`).
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::GoToLine, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("123456");
+        cx.simulate_keystrokes("left left left alt-k");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.goto.read(cx).as_str(), "123");
+            assert_eq!(caret_range(&view.goto, window, cx), 3..3);
+        });
+        cx.simulate_keystrokes("left cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.goto.read(cx).as_str(), "3");
+            assert_eq!(caret_range(&view.goto, window, cx), 0..0);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 5. Calling delete-to-line commands when no text input is focused is a safe no-op.
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.focus.is_focused(window));
+            view.command(Command::DeleteToLineStart, window, cx);
+            view.command(Command::DeleteToLineEnd, window, cx);
+            assert_eq!(view.tabs[0].selected, 1);
+            assert_eq!(view.goto.read(cx).as_str(), "3");
+        });
+
+        // Verify shortcut label formatting for the default delete_to_line_start shortcut.
+        if cfg!(target_os = "macos") {
+            assert_eq!(theme::format_shortcut("cmd-backspace"), "⌘⌫");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(theme::format_shortcut("cmd-backspace"), "Win+Backspace");
+        } else {
+            assert_eq!(theme::format_shortcut("cmd-backspace"), "Super+Backspace");
+        }
+    }
+
+    #[gpui::test]
+    fn text_delete_to_line_shortcuts_come_only_from_keyboard_config(cx: &mut TestAppContext) {
+        let filtered_defaults = text_input_default_bindings();
+        assert!(!filtered_defaults.iter().any(|binding| {
+            binding
+                .action()
+                .partial_eq(&input_actions::DeleteToLineStart)
+                || binding.action().partial_eq(&input_actions::DeleteToLineEnd)
+        }));
+        // Other standard editable-text bindings remain intact.
+        assert!(
+            filtered_defaults
+                .iter()
+                .any(|binding| { binding.action().partial_eq(&input_actions::DeleteLeft) })
+        );
+        assert!(
+            filtered_defaults
+                .iter()
+                .any(|binding| { binding.action().partial_eq(&input_actions::Copy) })
+        );
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(filtered_defaults.clone());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("default-delete.log");
+        std::fs::write(&path, "line 0\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(config.clone(), vec![path.clone()], window, cx)
+        });
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log.clone());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("alpha beta");
+        cx.simulate_keystrokes("left left left left left");
+        cx.run_until_parked();
+
+        // Unconfigured GPUI built-in line-delete shortcuts and ctrl-u should not mutate text.
+        for stroke in [
+            "ctrl-k",
+            "ctrl-shift-backspace",
+            "ctrl-shift-delete",
+            "ctrl-u",
+        ] {
+            cx.simulate_keystrokes(stroke);
+            cx.run_until_parked();
+            view.update_in(cx, |view, window, cx| {
+                assert_eq!(
+                    view.input.read(cx).as_str(),
+                    "alpha beta",
+                    "default binding {stroke} unexpectedly deleted text"
+                );
+                let range = view
+                    .input
+                    .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                    .expect("selection range")
+                    .range;
+                assert_eq!(
+                    range,
+                    5..5,
+                    "default binding {stroke} unexpectedly moved caret"
+                );
+            });
+        }
+
+        // The default `cmd-backspace` binding in keyboard.json deletes to line start.
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), " beta");
+            let range = view
+                .input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range;
+            assert_eq!(range, 0..0);
+        });
+
+        // Removing `delete_to_line_start` from keyboard.json disables `cmd-backspace` too.
+        let mut unbound_config = config;
+        unbound_config
+            .keyboard
+            .bindings
+            .retain(|b| b.action != Command::DeleteToLineStart);
+        cx.update(|_window, cx| {
+            cx.clear_key_bindings();
+            cx.bind_keys(filtered_defaults);
+            cx.bind_keys(keybindings(&unbound_config).unwrap());
+        });
+        view.update_in(cx, |view, _window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.emplace("alpha beta", cx);
+                state.move_to(5, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "alpha beta");
+            let range = view
+                .input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range;
+            assert_eq!(range, 5..5);
+        });
+    }
+
+    #[gpui::test]
+    fn first_and_last_line_shortcuts_work_in_log_filter_presets_and_file_path_menus(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets.push(config::Preset {
+            name: "HTTP 5xx Errors".into(),
+            pattern: "HTTP 5\\d\\d".into(),
+            mode: SearchMode::Regex,
+            highlight_match: true,
+            select_text: None,
+        });
+        config.search.presets.push(config::Preset {
+            name: "Auth Errors".into(),
+            pattern: "401|403".into(),
+            mode: SearchMode::Regex,
+            highlight_match: true,
+            select_text: None,
+        });
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let alpha = root.join("alpha.log");
+        let beta = root.join("beta.log");
+        let gamma = root.join("gamma.log");
+        let zeta = root.join("zeta.log");
+        std::fs::write(
+            &alpha,
+            "match line 0\nplain line 1\nmatch line 2\nplain line 3\nmatch line 4\nmatch line 5\n",
+        )
+        .unwrap();
+        for file in [&beta, &gamma, &zeta] {
+            std::fs::write(file, "entry\n").unwrap();
+        }
+        let dir_prefix = ensure_trailing_separator(&root.display().to_string());
+
+        let (first_key, last_key, select_first_key, select_last_key, presets_key) =
+            if cfg!(target_os = "macos") {
+                (
+                    "cmd-up",
+                    "cmd-down",
+                    "cmd-shift-up",
+                    "cmd-shift-down",
+                    "cmd-p",
+                )
+            } else {
+                (
+                    "ctrl-up",
+                    "ctrl-down",
+                    "ctrl-shift-up",
+                    "ctrl-shift-down",
+                    "ctrl-p",
+                )
+            };
+
+        let (view, cx) = cx
+            .add_window_view(|window, cx| Workspace::new(config, vec![alpha.clone()], window, cx));
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // 1. Main log pane (`Log`): secondary-up/down jump to first/last line,
+        //    secondary-shift-up/down extend selection to first/last line (including reversal).
+        view.update(cx, |view, cx| {
+            view.tabs[0].selected = 2;
+            view.tabs[0].main_selection = LineSelection::single(2);
+            view.tabs[0].follow = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 5);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(5, 5)]);
+            assert!(!view.tabs[0].follow);
+        });
+
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 0);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(0, 0)]);
+        });
+
+        cx.simulate_keystrokes("down down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(select_last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 5);
+            assert_eq!(view.tabs[0].main_selection.anchor, 2);
+            assert_eq!(view.tabs[0].main_selection.cursor, 5);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(2, 5)]);
+        });
+
+        cx.simulate_keystrokes(select_first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 0);
+            assert_eq!(view.tabs[0].main_selection.anchor, 2);
+            assert_eq!(view.tabs[0].main_selection.cursor, 0);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(0, 2)]);
+        });
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].selected, 5);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(5, 5)]);
+        });
+
+        // Existing home/end and shift-home/shift-end remain intact in Log.
+        cx.simulate_keystrokes("home down shift-end");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(1, 5)]);
+        });
+        cx.simulate_keystrokes("shift-home");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(0, 1)]);
+        });
+
+        // 2. Filter results pane (`Log` / `FilterLog`): secondary-up/down and
+        //    secondary-shift-up/down navigate and extend selection within visible results.
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].results = SearchResults {
+                matches: vec![0, 2, 4, 5],
+                visible: vec![0, 2, 4, 5],
+                ..SearchResults::default()
+            };
+            view.tabs[0].result_selection = LineSelection::single(1);
+            view.focus_pane(Pane::Results, window, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(3, 3)]);
+            assert_eq!(view.tabs[0].result_selection.cursor, 3);
+            assert_eq!(view.tabs[0].selected, 5);
+        });
+
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(0, 0)]);
+            assert_eq!(view.tabs[0].result_selection.cursor, 0);
+            assert_eq!(view.tabs[0].selected, 0);
+        });
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(select_last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.anchor, 1);
+            assert_eq!(view.tabs[0].result_selection.cursor, 3);
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(1, 3)]);
+            assert_eq!(view.tabs[0].selected, 5);
+        });
+
+        cx.simulate_keystrokes(select_first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.anchor, 1);
+            assert_eq!(view.tabs[0].result_selection.cursor, 0);
+            assert_eq!(view.tabs[0].result_selection.ranges(), &[(0, 1)]);
+            assert_eq!(view.tabs[0].selected, 0);
+        });
+
+        // Return focus to main pane at line 2 before testing menus.
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].selected = 2;
+            view.tabs[0].main_selection = LineSelection::single(2);
+            view.focus_pane(Pane::Main, window, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // 3. Saved patterns menu (`Presets`): secondary-up/down jump to first/last preset
+        //    (both unfiltered and filtered) without moving log selection or mutating filter text.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_presets);
+            assert_eq!(view.filtered_presets.len(), 5);
+            assert_eq!(view.preset_index, 0);
+        });
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.preset_index, 4);
+            assert_eq!(view.tabs[0].selected, 2);
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(2, 2)]);
+        });
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.preset_index, 0);
+            assert_eq!(view.tabs[0].selected, 2);
+        });
+
+        cx.simulate_input("err");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.filtered_presets.len(), 3);
+            assert_eq!(view.preset_index, 0);
+        });
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.preset_index, 2);
+            assert_eq!(view.presets_search.read(cx).as_str(), "err");
+            assert_eq!(view.tabs[0].selected, 2);
+        });
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.preset_index, 0);
+            assert_eq!(view.presets_search.read(cx).as_str(), "err");
+        });
+        // Log-only select-to-first/last shortcuts do not leak into the Log pane while in Presets.
+        cx.simulate_keystrokes(select_last_key);
+        cx.simulate_keystrokes(select_first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(2, 2)]);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 4. File path input & completions menu (`FilePath`): secondary-up/down jump to
+        //    first/last completion (opening the menu if closed) without touching log selection.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&dir_prefix);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completions.items.len(), 4);
+            assert_eq!(view.path_completion_index, None);
+        });
+
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(3));
+            assert_eq!(view.path_completions.items[3].label, "zeta.log");
+            assert_eq!(view.tabs[0].selected, 2);
+        });
+        // Repeating last_key stays clamped at the last item (does not wrap).
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(3));
+        });
+
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(0));
+            assert_eq!(view.path_completions.items[0].label, "alpha.log");
+        });
+        // Repeating first_key stays clamped at the first item (does not wrap).
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.path_completion_index, Some(0));
+        });
+
+        // With completions dismissed (first Escape), last_key/first_key re-open and jump directly.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.path_input_focused(window, cx));
+            assert!(!view.show_path_completions);
+        });
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completion_index, Some(3));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.show_path_completions);
+            assert_eq!(view.path_completion_index, Some(0));
+        });
+
+        // Log-only select-to-first/last shortcuts do not leak into the Log pane while in FilePath.
+        cx.simulate_keystrokes(select_last_key);
+        cx.simulate_keystrokes(select_first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].main_selection.ranges(), &[(2, 2)]);
+        });
+
+        // Jumping to last completion and pressing Enter opens zeta.log.
+        cx.simulate_keystrokes(last_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].path, zeta);
+            assert!(!view.show_path_completions);
+        });
+
+        // With no matching completions, first/last shortcuts are safe no-ops.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusFilePath, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input(&format!("{dir_prefix}does_not_exist_"));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(last_key);
+        cx.simulate_keystrokes(first_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_path_completions);
+            assert_eq!(view.path_completion_index, None);
+        });
+
+        // 5. Shortcut label formatting matches platform conventions.
+        if cfg!(target_os = "macos") {
+            assert_eq!(theme::format_shortcut("secondary-up"), "⌘↑");
+            assert_eq!(theme::format_shortcut("secondary-down"), "⌘↓");
+            assert_eq!(theme::format_shortcut("secondary-shift-up"), "⌘⇧↑");
+            assert_eq!(theme::format_shortcut("secondary-shift-down"), "⌘⇧↓");
+        } else {
+            assert_eq!(theme::format_shortcut("secondary-up"), "Ctrl+↑");
+            assert_eq!(theme::format_shortcut("secondary-down"), "Ctrl+↓");
+            assert_eq!(theme::format_shortcut("secondary-shift-up"), "Ctrl+Shift+↑");
+            assert_eq!(
+                theme::format_shortcut("secondary-shift-down"),
+                "Ctrl+Shift+↓"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn sticky_gutter_stays_pinned_and_interactive_across_horizontal_scroll_in_both_panes(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.line_numbers = true;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sticky-gutter.log");
+        let wide_body = (0..40)
+            .map(|chunk| format!("TOKEN_{chunk:02}_PAYLOAD "))
+            .collect::<String>();
+        let mut content = String::new();
+        for i in 0..80 {
+            if i == 1 {
+                content.push_str("short line\n");
+            } else {
+                content.push_str(&format!("MATCH line_{i:02} START_PREFIX {wide_body}END\n"));
+            }
+        }
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let visible: Vec<usize> = (0..80).filter(|&i| i != 1).collect();
+        let results = SearchResults {
+            matches: visible.clone(),
+            visible,
+            limited: false,
+            widest_row: 0,
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "MATCH".into();
+            view.tabs[0].sync_highlight_regex();
+            view.tabs[0].results = results;
+            view.tabs[0].selected = 0;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let expected_gutter_w =
+            view.read_with(cx, |view, _| view.zoom_metrics().sticky_gutter_width(true));
+        let main_gutter0_before = cx
+            .debug_bounds("main-gutter-0")
+            .expect("main gutter 0 bounds");
+        let main_mark0_before = cx.debug_bounds("main-mark-0").expect("main mark 0 bounds");
+        let main_num0_before = cx
+            .debug_bounds("main-linenum-0")
+            .expect("main line number 0 bounds");
+        let main_text0_before = cx.debug_bounds("main-text-0").expect("main text 0 bounds");
+        let main_hscroll_before = cx
+            .debug_bounds("main-hscroll")
+            .expect("main horizontal scrollbar bounds");
+        let res_gutter0_before = cx
+            .debug_bounds("result-gutter-0")
+            .expect("result gutter 0 bounds");
+        let res_mark0_before = cx
+            .debug_bounds("result-mark-0")
+            .expect("result mark 0 bounds");
+        let res_num0_before = cx
+            .debug_bounds("result-linenum-0")
+            .expect("result line number 0 bounds");
+        let res_text0_before = cx
+            .debug_bounds("result-text-0")
+            .expect("result text 0 bounds");
+        let res_hscroll_before = cx
+            .debug_bounds("results-hscroll")
+            .expect("results horizontal scrollbar bounds");
+
+        assert!(
+            (f32::from(main_gutter0_before.size.width) - expected_gutter_w).abs() < 0.5,
+            "expected gutter width {expected_gutter_w}, got {:?}",
+            main_gutter0_before.size.width
+        );
+        assert!(
+            (f32::from(main_hscroll_before.origin.x) - f32::from(main_gutter0_before.right()))
+                .abs()
+                < 0.5,
+            "main horizontal scrollbar should begin flush with sticky gutter right edge"
+        );
+        assert!(
+            (f32::from(res_hscroll_before.origin.x) - f32::from(res_gutter0_before.right())).abs()
+                < 0.5,
+            "results horizontal scrollbar should begin flush with sticky gutter right edge"
+        );
+
+        // 1. Scroll horizontally via Right arrow keys in Main pane: text moves left, gutter stays pinned.
+        for _ in 0..5 {
+            cx.simulate_keystrokes("right");
+        }
+        cx.run_until_parked();
+
+        let main_offset_after_keys = view.read_with(cx, |view, _| {
+            f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x)
+        });
+        assert!(
+            main_offset_after_keys < -150.0,
+            "expected horizontal scroll via right arrow, got {main_offset_after_keys}"
+        );
+        let main_gutter0_scrolled = cx.debug_bounds("main-gutter-0").unwrap();
+        let main_gutter1_scrolled = cx.debug_bounds("main-gutter-1").unwrap();
+        let main_mark0_scrolled = cx.debug_bounds("main-mark-0").unwrap();
+        let main_num0_scrolled = cx.debug_bounds("main-linenum-0").unwrap();
+        let main_text0_scrolled = cx.debug_bounds("main-text-0").unwrap();
+
+        assert!(
+            (f32::from(main_gutter0_scrolled.origin.x) - f32::from(main_gutter0_before.origin.x))
+                .abs()
+                < 0.5,
+            "main gutter 0 must remain pinned during horizontal scroll"
+        );
+        assert!(
+            (f32::from(main_gutter1_scrolled.origin.x) - f32::from(main_gutter0_before.origin.x))
+                .abs()
+                < 0.5,
+            "short row gutter must remain pinned during horizontal scroll"
+        );
+        assert!(
+            (f32::from(main_mark0_scrolled.origin.x) - f32::from(main_mark0_before.origin.x)).abs()
+                < 0.5,
+            "main marker/match column must remain pinned during horizontal scroll"
+        );
+        assert!(
+            (f32::from(main_num0_scrolled.origin.x) - f32::from(main_num0_before.origin.x)).abs()
+                < 0.5,
+            "main line number column must remain pinned during horizontal scroll"
+        );
+        assert!(
+            f32::from(main_text0_scrolled.origin.x) < f32::from(main_text0_before.origin.x) - 100.0,
+            "log text should scroll left behind the sticky gutter"
+        );
+
+        // 2. Scroll wheel horizontal & vertical input directly over the sticky gutter works and keeps gutter pinned.
+        cx.simulate_event(ScrollWheelEvent {
+            position: main_num0_scrolled.center(),
+            delta: ScrollDelta::Pixels(point(px(-96.0), px(0.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let main_offset_after_wheel_x = view.read_with(cx, |view, _| {
+            f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x)
+        });
+        assert!(
+            main_offset_after_wheel_x < main_offset_after_keys - 50.0,
+            "horizontal wheel scrolling over sticky gutter should scroll the pane"
+        );
+        assert!(
+            (f32::from(cx.debug_bounds("main-gutter-0").unwrap().origin.x)
+                - f32::from(main_gutter0_before.origin.x))
+            .abs()
+                < 0.5
+        );
+
+        // 3. Clicking the sticky mark gutter while text is scrolled behind it toggles bookmark without selecting text.
+        let mark2_pos = cx.debug_bounds("main-mark-2").unwrap().center();
+        cx.simulate_click(mark2_pos, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.tabs[0].bookmarks.contains(&2),
+                "clicking pinned mark gutter should bookmark line 2"
+            );
+            assert!(
+                !view.tabs[0].has_text_selection(Pane::Main),
+                "clicking pinned mark gutter must not select scrolled-behind text"
+            );
+        });
+        cx.simulate_click(mark2_pos, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.tabs[0].bookmarks.contains(&2));
+        });
+
+        // 4. Clicking and Shift+clicking sticky line numbers selects rows without triggering text selection.
+        let num3_pos = cx.debug_bounds("main-linenum-3").unwrap().center();
+        let num5_pos = cx.debug_bounds("main-linenum-5").unwrap().center();
+        cx.simulate_click(num3_pos, Modifiers::none());
+        cx.simulate_click(num5_pos, Modifiers::shift());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].main_selection.iter().collect::<Vec<_>>(),
+                vec![3, 4, 5],
+                "clicking sticky line numbers must support single and Shift+click row selection"
+            );
+            assert!(
+                !view.tabs[0].has_text_selection(Pane::Main),
+                "clicking sticky line numbers must not trigger hidden text selection"
+            );
+        });
+
+        // 5. Dragging text selection from visible text leftward into the sticky gutter clamps to the visible text edge.
+        let gutter0_right = cx.debug_bounds("main-gutter-0").unwrap().right();
+        let row0_y = cx.debug_bounds("main-gutter-0").unwrap().center().y;
+        let drag_start = point(gutter0_right + px(90.0), row0_y);
+        let drag_into_gutter = point(main_num0_scrolled.center().x, row0_y);
+        cx.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(drag_into_gutter, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(drag_into_gutter, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        let copy_key = if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        };
+        cx.simulate_keystrokes(copy_key);
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard should contain visible selected substring");
+        assert!(
+            !copied.is_empty() && !copied.contains("START_PREFIX"),
+            "dragging into sticky gutter must clamp to visible text and not copy scrolled-off prefix, got {copied:?}"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 6. Vertical scroll while horizontally scrolled keeps newly revealed rows' gutters pinned.
+        let vertical_wheel_pos = cx.debug_bounds("main-linenum-0").unwrap().center();
+        cx.simulate_event(ScrollWheelEvent {
+            position: vertical_wheel_pos,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-240.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let scrolled_in_gutter = cx
+            .debug_bounds("main-gutter-12")
+            .expect("row 12 should be visible after vertical wheel scroll over sticky gutter");
+        assert!(
+            (f32::from(scrolled_in_gutter.origin.x) - f32::from(main_gutter0_before.origin.x))
+                .abs()
+                < 0.5,
+            "newly scrolled-in row gutter must also remain pinned horizontally"
+        );
+
+        // 7. Clicking horizontal scrollbar moves further right while keeping gutter pinned.
+        let hbounds = cx.debug_bounds("main-hscroll").unwrap();
+        let hclick = point(
+            hbounds.origin.x + hbounds.size.width * 0.85,
+            hbounds.center().y,
+        );
+        cx.simulate_click(hclick, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            (f32::from(cx.debug_bounds("main-gutter-12").unwrap().origin.x)
+                - f32::from(main_gutter0_before.origin.x))
+            .abs()
+                < 0.5,
+            "gutter must remain pinned after horizontal scrollbar click"
+        );
+
+        // 8. Results (filter) pane: scrolling horizontally keeps its marker + line-number gutter pinned & clickable.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        for _ in 0..5 {
+            cx.simulate_keystrokes("right");
+        }
+        cx.run_until_parked();
+
+        let res_gutter0_scrolled = cx.debug_bounds("result-gutter-0").unwrap();
+        let res_mark0_scrolled = cx.debug_bounds("result-mark-0").unwrap();
+        let res_num0_scrolled = cx.debug_bounds("result-linenum-0").unwrap();
+        let res_text0_scrolled = cx.debug_bounds("result-text-0").unwrap();
+        assert!(
+            (f32::from(res_gutter0_scrolled.origin.x) - f32::from(res_gutter0_before.origin.x))
+                .abs()
+                < 0.5,
+            "results gutter must remain pinned during horizontal scroll"
+        );
+        assert!(
+            (f32::from(res_mark0_scrolled.origin.x) - f32::from(res_mark0_before.origin.x)).abs()
+                < 0.5
+        );
+        assert!(
+            (f32::from(res_num0_scrolled.origin.x) - f32::from(res_num0_before.origin.x)).abs()
+                < 0.5
+        );
+        assert!(
+            f32::from(res_text0_scrolled.origin.x) < f32::from(res_text0_before.origin.x) - 100.0
+        );
+
+        cx.simulate_click(res_mark0_scrolled.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.contains(&0));
+            assert!(!view.tabs[0].has_text_selection(Pane::Results));
+        });
+
+        let res_num1 = cx.debug_bounds("result-linenum-1").unwrap().center();
+        cx.simulate_click(res_num1, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs[0].result_selection.cursor, 1);
+            assert!(!view.tabs[0].has_text_selection(Pane::Results));
+        });
+
+        // 9. Zooming while horizontally scrolled scales gutter width and keeps gutter + scrollbar aligned.
+        let zoom_in_key = if cfg!(target_os = "macos") {
+            "cmd-="
+        } else {
+            "ctrl-="
+        };
+        cx.simulate_keystrokes(zoom_in_key);
+        cx.simulate_keystrokes(zoom_in_key);
+        cx.run_until_parked();
+        let zoomed_expected_w =
+            view.read_with(cx, |view, _| view.zoom_metrics().sticky_gutter_width(true));
+        let zoomed_res_gutter = cx.debug_bounds("result-gutter-0").unwrap();
+        let zoomed_res_hscroll = cx.debug_bounds("results-hscroll").unwrap();
+        assert!(
+            (f32::from(zoomed_res_gutter.origin.x) - f32::from(res_gutter0_before.origin.x)).abs()
+                < 0.5
+        );
+        assert!(
+            (f32::from(zoomed_res_gutter.size.width) - zoomed_expected_w).abs() < 0.5,
+            "zoomed gutter width should match sticky_gutter_width"
+        );
+        assert!(
+            (f32::from(zoomed_res_hscroll.origin.x) - f32::from(zoomed_res_gutter.right())).abs()
+                < 0.5,
+            "zoomed horizontal scrollbar should remain flush with zoomed sticky gutter"
+        );
+    }
+
+    #[gpui::test]
+    fn sticky_mark_gutter_stays_pinned_when_line_numbers_hidden(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.line_numbers = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("no-linenum.log");
+        let wide_payload = "x".repeat(320);
+        std::fs::write(
+            &path,
+            format!("MATCH row0 {wide_payload}\nMATCH row1 {wide_payload}\n"),
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("main-linenum-0").is_none());
+        let gutter_before = cx.debug_bounds("main-gutter-0").unwrap();
+        let mark_before = cx.debug_bounds("main-mark-0").unwrap();
+        let text_before = cx.debug_bounds("main-text-0").unwrap();
+        let hscroll = cx.debug_bounds("main-hscroll").unwrap();
+        let expected_w =
+            view.read_with(cx, |view, _| view.zoom_metrics().sticky_gutter_width(false));
+        assert!((f32::from(gutter_before.size.width) - expected_w).abs() < 0.5);
+        assert!((f32::from(hscroll.origin.x) - f32::from(gutter_before.right())).abs() < 0.5);
+
+        for _ in 0..4 {
+            cx.simulate_keystrokes("right");
+        }
+        cx.run_until_parked();
+
+        let gutter_after = cx.debug_bounds("main-gutter-0").unwrap();
+        let mark_after = cx.debug_bounds("main-mark-0").unwrap();
+        let text_after = cx.debug_bounds("main-text-0").unwrap();
+        assert!((f32::from(gutter_after.origin.x) - f32::from(gutter_before.origin.x)).abs() < 0.5);
+        assert!((f32::from(mark_after.origin.x) - f32::from(mark_before.origin.x)).abs() < 0.5);
+        assert!(f32::from(text_after.origin.x) < f32::from(text_before.origin.x) - 100.0);
+
+        // Clicking the pinned bookmark column while text is scrolled underneath toggles bookmark cleanly.
+        cx.simulate_click(mark_after.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs[0].bookmarks.contains(&0));
+            assert!(!view.tabs[0].has_text_selection(Pane::Main));
+        });
+    }
+
+    #[gpui::test]
+    fn secondary_left_resets_horizontal_scroll_in_active_log_pane_only(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reset-hscroll.log");
+        let long_payload = "x".repeat(320);
+        let content = (0..80)
+            .map(|i| format!("MATCH line {i} {long_payload}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let visible: Vec<usize> = (0..80).collect();
+        let results = SearchResults {
+            matches: visible.clone(),
+            visible,
+            limited: false,
+            widest_row: 0,
+        };
+
+        let reset_key = if cfg!(target_os = "macos") {
+            "cmd-left"
+        } else {
+            "ctrl-left"
+        };
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].query = "MATCH".into();
+            view.tabs[0].results = results;
+            view.tabs[0].selected = 2;
+            view.tabs[0].follow = true;
+            view.tabs[0].main_selection = LineSelection::single(2);
+            view.tabs[0].result_selection = LineSelection::single(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let expected_label = if cfg!(target_os = "macos") {
+                "⌘←"
+            } else {
+                "Ctrl+←"
+            };
+            assert_eq!(
+                view.theme
+                    .shortcut(Command::ResetHorizontalScroll)
+                    .as_deref(),
+                Some(expected_label)
+            );
+        });
+
+        // No-op when already at horizontal offset 0.
+        cx.simulate_keystrokes(reset_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x),
+                0.0
+            );
+        });
+
+        // Scroll both panes horizontally and vertically so we can verify active-pane isolation
+        // and vertical scroll / selection / follow preservation.
+        view.update(cx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Vertical, 120.0);
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 300.0);
+            set_uniform_list_axis_offset(&view.tabs[0].result_scroll, ScrollAxis::Vertical, 72.0);
+            set_uniform_list_axis_offset(
+                &view.tabs[0].result_scroll,
+                ScrollAxis::Horizontal,
+                220.0,
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // In Main pane: secondary-left resets only main horizontal scroll back to 0.
+        cx.simulate_keystrokes(reset_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let main_offset = view.tabs[0].scroll.0.borrow().base_handle.offset();
+            let res_offset = view.tabs[0].result_scroll.0.borrow().base_handle.offset();
+            assert_eq!(f32::from(main_offset.x), 0.0);
+            assert!((f32::from(main_offset.y) + 120.0).abs() < 0.5);
+            assert_eq!(view.tabs[0].selected, 2);
+            assert!(view.tabs[0].follow);
+            assert!(
+                (f32::from(res_offset.x) + 220.0).abs() < 0.5,
+                "resetting main pane must not move results pane"
+            );
+            let main_hlayout = view
+                .main_hscroll_state
+                .layout()
+                .expect("main horizontal scrollbar layout");
+            assert_eq!(main_hlayout.thumb.start, 0.0);
+        });
+
+        // Re-scroll main pane, switch to Results pane, and verify secondary-left resets only results.
+        view.update(cx, |view, cx| {
+            set_uniform_list_axis_offset(&view.tabs[0].scroll, ScrollAxis::Horizontal, 180.0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(reset_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let main_offset = view.tabs[0].scroll.0.borrow().base_handle.offset();
+            let res_offset = view.tabs[0].result_scroll.0.borrow().base_handle.offset();
+            assert_eq!(f32::from(res_offset.x), 0.0);
+            assert!((f32::from(res_offset.y) + 72.0).abs() < 0.5);
+            assert!(
+                (f32::from(main_offset.x) + 180.0).abs() < 0.5,
+                "resetting results pane must not move main pane"
+            );
+            let res_hlayout = view
+                .results_hscroll_state
+                .layout()
+                .expect("results horizontal scrollbar layout");
+            assert_eq!(res_hlayout.thumb.start, 0.0);
+        });
+
+        // In Search input, cmd-left moves the text caret to line start and never resets log scroll.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("abc");
+        cx.simulate_keystrokes("cmd-left");
+        cx.simulate_input("Z");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "Zabc");
+            assert!(
+                (f32::from(view.tabs[0].scroll.0.borrow().base_handle.offset().x) + 180.0).abs()
+                    < 0.5,
+                "cmd-left in Search input must not reset log horizontal scroll"
+            );
+        });
     }
 }

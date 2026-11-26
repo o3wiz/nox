@@ -5,5 +5,6 @@
   "height": 850,
   "maximized": false,
   "results_height": 250,
+  "filter_resize_sensitivity": 1.0,
   "show_status_bar": true
 }

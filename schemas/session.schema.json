@@ -91,44 +91,7 @@
       ]
     },
     "SearchConfig": {
-      "type": "object",
-      "properties": {
-        "mode": {
-          "$ref": "#/$defs/SearchMode"
-        },
-        "case_sensitive": {
-          "type": "boolean"
-        },
-        "whole_word": {
-          "type": "boolean"
-        },
-        "invert": {
-          "type": "boolean"
-        },
-        "highlight_matches": {
-          "type": "boolean",
-          "default": true
-        },
-        "context_lines": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0,
-          "maximum": 100
-        },
-        "max_results": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 1,
-          "maximum": 10000000
-        },
-        "presets": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Preset"
-          }
-        }
-      },
-      "additionalProperties": false,
+      "$ref": "common.schema.json#/$defs/SearchConfig",
       "required": [
         "mode",
         "case_sensitive",
@@ -137,38 +100,8 @@
         "context_lines",
         "max_results",
         "presets"
-      ]
-    },
-    "SearchMode": {
-      "type": "string",
-      "enum": [
-        "literal",
-        "regex"
-      ]
-    },
-    "Preset": {
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": "string"
-        },
-        "pattern": {
-          "type": "string"
-        },
-        "mode": {
-          "$ref": "#/$defs/SearchMode"
-        },
-        "highlight_match": {
-          "type": "boolean",
-          "default": true
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "pattern",
-        "mode"
-      ]
+      ],
+      "unevaluatedProperties": false
     }
   }
 }

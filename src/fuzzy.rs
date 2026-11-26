@@ -314,6 +314,7 @@ mod tests {
             pattern: pattern.to_owned(),
             mode: SearchMode::Regex,
             highlight_match: true,
+            select_text: None,
         }
     }
 

@@ -102,6 +102,11 @@
       "context": "Log"
     },
     {
+      "keys": "c",
+      "action": "copy_match_results",
+      "context": "Log"
+    },
+    {
       "keys": "enter",
       "action": "search",
       "context": "Search"
@@ -157,7 +162,17 @@
       "context": "Log"
     },
     {
+      "keys": "secondary-up",
+      "action": "first_line",
+      "context": "Log"
+    },
+    {
       "keys": "end",
+      "action": "last_line",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-down",
       "action": "last_line",
       "context": "Log"
     },
@@ -179,6 +194,11 @@
     {
       "keys": "right",
       "action": "scroll_right",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-left",
+      "action": "reset_horizontal_scroll",
       "context": "Log"
     },
     {
@@ -212,7 +232,17 @@
       "context": "Log"
     },
     {
+      "keys": "secondary-shift-up",
+      "action": "select_first_line",
+      "context": "Log"
+    },
+    {
       "keys": "shift-end",
+      "action": "select_last_line",
+      "context": "Log"
+    },
+    {
+      "keys": "secondary-shift-down",
       "action": "select_last_line",
       "context": "Log"
     },
@@ -332,6 +362,16 @@
       "context": "FilePath"
     },
     {
+      "keys": "secondary-up",
+      "action": "first_line",
+      "context": "FilePath"
+    },
+    {
+      "keys": "secondary-down",
+      "action": "last_line",
+      "context": "FilePath"
+    },
+    {
       "keys": "escape",
       "action": "focus_log",
       "context": "FilePath"
@@ -354,6 +394,31 @@
     {
       "keys": "end",
       "action": "move_to_line_end",
+      "context": "TextInput"
+    },
+    {
+      "keys": "cmd-shift-left",
+      "action": "select_to_line_start",
+      "context": "TextInput"
+    },
+    {
+      "keys": "cmd-shift-right",
+      "action": "select_to_line_end",
+      "context": "TextInput"
+    },
+    {
+      "keys": "shift-up",
+      "action": "select_to_line_start",
+      "context": "TextInput"
+    },
+    {
+      "keys": "shift-down",
+      "action": "select_to_line_end",
+      "context": "TextInput"
+    },
+    {
+      "keys": "cmd-backspace",
+      "action": "delete_to_line_start",
       "context": "TextInput"
     }
   ]
