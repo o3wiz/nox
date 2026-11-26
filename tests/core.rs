@@ -536,6 +536,7 @@ fn rotation_to_a_larger_file_is_recognized_as_replacement() {
     fs::rename(&path, dir.path().join("old.log")).unwrap();
     fs::write(&path, b"much larger replacement file\nmore\n").unwrap();
     let new = LogFile::open(&path, &AtomicBool::new(false)).unwrap();
+    assert_ne!(old.stamp, new.stamp);
     #[cfg(unix)]
     assert!(old.replaced_by(&new));
     assert_eq!(new.widest_line, 0);
