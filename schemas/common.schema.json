@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Common",
+  "description": "Shared JSON Schema definitions referenced by Nox configuration and session schemas.",
+  "$defs": {
+    "HexColor": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "Preset": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/SearchMode"
+        },
+        "highlight_match": {
+          "type": "boolean",
+          "default": true
+        },
+        "select_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "pattern",
+        "mode"
+      ]
+    },
+    "SearchConfig": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/SearchMode"
+        },
+        "case_sensitive": {
+          "type": "boolean"
+        },
+        "whole_word": {
+          "type": "boolean"
+        },
+        "invert": {
+          "type": "boolean"
+        },
+        "highlight_matches": {
+          "type": "boolean",
+          "default": true
+        },
+        "context_lines": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "max_results": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 1,
+          "maximum": 10000000
+        },
+        "presets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Preset"
+          }
+        }
+      }
+    },
+    "SearchMode": {
+      "type": "string",
+      "enum": [
+        "literal",
+        "regex"
+      ]
+    }
+  }
+}

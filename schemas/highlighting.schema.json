@@ -28,7 +28,7 @@
           "type": "string"
         },
         "color": {
-          "type": "string"
+          "$ref": "common.schema.json#/$defs/HexColor"
         },
         "case_sensitive": {
           "type": "boolean"

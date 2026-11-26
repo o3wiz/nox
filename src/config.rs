@@ -1,10 +1,11 @@
 //! Typed configuration and JSON schemas share a single source of truth.
 use anyhow::{Context, Result, bail, ensure};
-use schemars::{JsonSchema, schema_for};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema, schema_for};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -13,6 +14,46 @@ use std::{
 pub const DEFAULT_FILTER_RESIZE_SENSITIVITY: f32 = 1.0;
 pub const MIN_FILTER_RESIZE_SENSITIVITY: f32 = 0.1;
 pub const MAX_FILTER_RESIZE_SENSITIVITY: f32 = 10.0;
+
+const HEX_COLOR_PATTERN: &str = r"^#[0-9A-Fa-f]{6}$";
+const MIN_FONT_SIZE: u16 = 8;
+const MAX_FONT_SIZE: u16 = 32;
+const JSON_SCHEMA_DRAFT: &str = "https://json-schema.org/draft/2020-12/schema";
+const COMMON_SCHEMA_FILE: &str = "common.schema.json";
+const SESSION_SCHEMA_FILE: &str = "session.schema.json";
+const LOCAL_DEF_PREFIX: &str = "#/$defs/";
+
+struct HexColor;
+
+impl JsonSchema for HexColor {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("HexColor")
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "pattern": HEX_COLOR_PATTERN
+        })
+    }
+}
+
+struct FontSize;
+
+impl JsonSchema for FontSize {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("FontSize")
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "number",
+            "format": "float",
+            "minimum": MIN_FONT_SIZE,
+            "maximum": MAX_FONT_SIZE
+        })
+    }
+}
 
 fn default_filter_resize_sensitivity() -> f32 {
     DEFAULT_FILTER_RESIZE_SENSITIVITY
@@ -38,32 +79,32 @@ pub struct WindowConfig {
 #[serde(deny_unknown_fields)]
 pub struct AppearanceConfig {
     pub ui_font_family: String,
-    #[schemars(range(min = 8, max = 32))]
+    #[schemars(with = "FontSize")]
     pub ui_font_size: f32,
     pub font_family: String,
-    #[schemars(range(min = 8, max = 32))]
+    #[schemars(with = "FontSize")]
     pub font_size: f32,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub background: String,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub panel: String,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub foreground: String,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub muted: String,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub accent: String,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub selection: String,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub text_selection_color: String,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub text_selection_opacity: f32,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub border: String,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub match_foreground: String,
-    #[schemars(regex(pattern = r"^#[0-9A-Fa-f]{6}$"))]
+    #[schemars(with = "HexColor")]
     pub match_background: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -158,6 +199,7 @@ pub struct SearchConfig {
 pub struct HighlightRule {
     pub name: String,
     pub pattern: String,
+    #[schemars(with = "HexColor")]
     pub color: String,
     pub case_sensitive: bool,
 }
@@ -421,12 +463,12 @@ impl Config {
             "window.filter_resize_sensitivity must be 0.1..=10.0"
         );
         ensure!(
-            (8.0..=32.0).contains(&a.ui_font_size),
-            "appearance.ui_font_size must be 8..32"
+            (f32::from(MIN_FONT_SIZE)..=f32::from(MAX_FONT_SIZE)).contains(&a.ui_font_size),
+            "appearance.ui_font_size must be {MIN_FONT_SIZE}..{MAX_FONT_SIZE}"
         );
         ensure!(
-            (8.0..=32.0).contains(&a.font_size),
-            "appearance.font_size must be 8..32"
+            (f32::from(MIN_FONT_SIZE)..=f32::from(MAX_FONT_SIZE)).contains(&a.font_size),
+            "appearance.font_size must be {MIN_FONT_SIZE}..{MAX_FONT_SIZE}"
         );
         ensure!(
             (16.0..=64.0).contains(&v.line_height),
@@ -595,24 +637,392 @@ fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn section_schema<T: JsonSchema>() -> Result<Value> {
-    let mut schema = serde_json::to_value(schema_for!(T))?;
-    schema["properties"]["$schema"] = serde_json::json!({ "type": "string" });
-    // Config files are overlays; any field may be omitted.
-    schema.as_object_mut().unwrap().remove("required");
-    Ok(schema)
+struct RawSchema {
+    name: &'static str,
+    is_config_section: bool,
+    schema: Value,
 }
 
-fn all_section_schemas() -> Result<Vec<(&'static str, Value)>> {
-    Ok(vec![
-        ("window", section_schema::<WindowConfig>()?),
-        ("appearance", section_schema::<AppearanceConfig>()?),
-        ("viewer", section_schema::<ViewerConfig>()?),
-        ("search", section_schema::<SearchConfig>()?),
-        ("highlighting", section_schema::<HighlightConfig>()?),
-        ("files", section_schema::<FilesConfig>()?),
-        ("keyboard", section_schema::<KeyboardConfig>()?),
-    ])
+struct SchemaBundle {
+    sections: Vec<(&'static str, Value)>,
+    session: Value,
+    common: Value,
+}
+
+fn collect_local_def_refs(value: &Value, refs: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(def_name) = map
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|reference| reference.strip_prefix(LOCAL_DEF_PREFIX))
+            {
+                refs.insert(def_name.to_string());
+            }
+            for child in map.values() {
+                collect_local_def_refs(child, refs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_local_def_refs(item, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_local_def_refs(value: &mut Value, common_defs: &HashSet<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(reference) = map.get_mut("$ref").and_then(|v| match v {
+                Value::String(s) => Some(s),
+                _ => None,
+            }) && let Some(def_name) = reference.strip_prefix(LOCAL_DEF_PREFIX)
+                && common_defs.contains(def_name)
+            {
+                *reference = format!("{COMMON_SCHEMA_FILE}{LOCAL_DEF_PREFIX}{def_name}");
+            }
+            for child in map.values_mut() {
+                rewrite_local_def_refs(child, common_defs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_local_def_refs(item, common_defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn prune_unused_local_defs(schema: &mut Value) {
+    let Some(root_obj) = schema.as_object() else {
+        return;
+    };
+    let Some(defs) = root_obj.get("$defs").and_then(Value::as_object) else {
+        return;
+    };
+
+    let mut reachable = BTreeSet::new();
+    for (key, value) in root_obj {
+        if key != "$defs" {
+            collect_local_def_refs(value, &mut reachable);
+        }
+    }
+    loop {
+        let mut discovered = Vec::new();
+        for name in &reachable {
+            if let Some(def_val) = defs.get(name) {
+                let mut nested = BTreeSet::new();
+                collect_local_def_refs(def_val, &mut nested);
+                for dep in nested {
+                    if !reachable.contains(&dep) {
+                        discovered.push(dep);
+                    }
+                }
+            }
+        }
+        if discovered.is_empty() {
+            break;
+        }
+        reachable.extend(discovered);
+    }
+
+    let root_obj = schema.as_object_mut().expect("root schema object");
+    if let Some(defs) = root_obj.get_mut("$defs").and_then(Value::as_object_mut) {
+        defs.retain(|name, _| reachable.contains(name));
+        if defs.is_empty() {
+            root_obj.remove("$defs");
+        }
+    }
+}
+
+impl SchemaBundle {
+    fn generate() -> Result<Self> {
+        let mut raw_schemas = vec![
+            RawSchema {
+                name: "window",
+                is_config_section: true,
+                schema: serde_json::to_value(schema_for!(WindowConfig))?,
+            },
+            RawSchema {
+                name: "appearance",
+                is_config_section: true,
+                schema: serde_json::to_value(schema_for!(AppearanceConfig))?,
+            },
+            RawSchema {
+                name: "viewer",
+                is_config_section: true,
+                schema: serde_json::to_value(schema_for!(ViewerConfig))?,
+            },
+            RawSchema {
+                name: "search",
+                is_config_section: true,
+                schema: serde_json::to_value(schema_for!(SearchConfig))?,
+            },
+            RawSchema {
+                name: "highlighting",
+                is_config_section: true,
+                schema: serde_json::to_value(schema_for!(HighlightConfig))?,
+            },
+            RawSchema {
+                name: "files",
+                is_config_section: true,
+                schema: serde_json::to_value(schema_for!(FilesConfig))?,
+            },
+            RawSchema {
+                name: "keyboard",
+                is_config_section: true,
+                schema: serde_json::to_value(schema_for!(KeyboardConfig))?,
+            },
+            RawSchema {
+                name: "session",
+                is_config_section: false,
+                schema: serde_json::to_value(schema_for!(crate::session::Session))?,
+            },
+        ];
+
+        // Step 1: Extract root object schemas that also appear as `$defs` in other schemas
+        // (for example `SearchConfig`, shared between `search.schema.json` and `session.schema.json`).
+        let mut root_titles: HashMap<String, usize> = HashMap::new();
+        for (idx, raw) in raw_schemas.iter().enumerate() {
+            if let Some(title) = raw.schema.get("title").and_then(Value::as_str)
+                && raw.schema.get("type") == Some(&Value::String("object".into()))
+                && raw.schema.get("properties").is_some_and(Value::is_object)
+            {
+                root_titles.insert(title.to_string(), idx);
+            }
+        }
+
+        let mut shared_roots: BTreeMap<String, usize> = BTreeMap::new();
+        for (idx, raw) in raw_schemas.iter().enumerate() {
+            let Some(defs) = raw.schema.get("$defs").and_then(Value::as_object) else {
+                continue;
+            };
+            for (def_name, def_val) in defs {
+                if let Some(&root_idx) = root_titles.get(def_name)
+                    && root_idx != idx
+                {
+                    let root_schema = &raw_schemas[root_idx].schema;
+                    ensure!(
+                        root_schema.get("type") == def_val.get("type")
+                            && root_schema.get("properties") == def_val.get("properties"),
+                        "Conflicting schema definitions for shared root type {def_name:?}"
+                    );
+                    shared_roots.insert(def_name.clone(), root_idx);
+                }
+            }
+        }
+
+        let mut common_defs: BTreeMap<String, Value> = BTreeMap::new();
+        let mut direct_common_defs: HashSet<String> = HashSet::new();
+        let mut shared_root_indices: HashSet<usize> = HashSet::new();
+
+        for (def_name, &root_idx) in &shared_roots {
+            let root_obj = raw_schemas[root_idx]
+                .schema
+                .as_object()
+                .expect("root schema object");
+            let mut base_def = serde_json::Map::new();
+            base_def.insert("type".into(), Value::String("object".into()));
+            base_def.insert(
+                "properties".into(),
+                root_obj
+                    .get("properties")
+                    .cloned()
+                    .expect("shared root schema properties"),
+            );
+            common_defs.insert(def_name.clone(), Value::Object(base_def));
+
+            let mut rewritten = serde_json::Map::new();
+            if let Some(draft) = root_obj.get("$schema") {
+                rewritten.insert("$schema".into(), draft.clone());
+            }
+            if let Some(title) = root_obj.get("title") {
+                rewritten.insert("title".into(), title.clone());
+            }
+            rewritten.insert(
+                "$ref".into(),
+                Value::String(format!("{COMMON_SCHEMA_FILE}{LOCAL_DEF_PREFIX}{def_name}")),
+            );
+            if raw_schemas[root_idx].is_config_section {
+                rewritten.insert(
+                    "properties".into(),
+                    serde_json::json!({ "$schema": { "type": "string" } }),
+                );
+                rewritten.insert("unevaluatedProperties".into(), Value::Bool(false));
+            } else {
+                if let Some(required) = root_obj.get("required") {
+                    rewritten.insert("required".into(), required.clone());
+                }
+                if root_obj.get("additionalProperties") == Some(&Value::Bool(false)) {
+                    rewritten.insert("unevaluatedProperties".into(), Value::Bool(false));
+                }
+            }
+            if let Some(defs) = root_obj.get("$defs") {
+                rewritten.insert("$defs".into(), defs.clone());
+            }
+            raw_schemas[root_idx].schema = Value::Object(rewritten);
+            shared_root_indices.insert(root_idx);
+
+            for (idx, raw) in raw_schemas.iter_mut().enumerate() {
+                if idx == root_idx {
+                    continue;
+                }
+                if let Some(defs) = raw.schema.get_mut("$defs").and_then(Value::as_object_mut)
+                    && let Some(def_val) = defs.get_mut(def_name)
+                {
+                    let mut wrapper = serde_json::Map::new();
+                    wrapper.insert(
+                        "$ref".into(),
+                        Value::String(format!("{COMMON_SCHEMA_FILE}{LOCAL_DEF_PREFIX}{def_name}")),
+                    );
+                    if let Some(required) = def_val.get("required") {
+                        wrapper.insert("required".into(), required.clone());
+                    }
+                    if def_val.get("additionalProperties") == Some(&Value::Bool(false)) {
+                        wrapper.insert("unevaluatedProperties".into(), Value::Bool(false));
+                    }
+                    *def_val = Value::Object(wrapper);
+                }
+            }
+        }
+
+        // Step 2: Move every `$defs` entry shared across multiple schemas — plus any `$defs`
+        // transitively referenced by `common.schema.json` — into `common_defs`.
+        let mut def_occurrences: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for raw in &raw_schemas {
+            let Some(defs) = raw.schema.get("$defs").and_then(Value::as_object) else {
+                continue;
+            };
+            for (def_name, def_val) in defs {
+                if shared_roots.contains_key(def_name) {
+                    continue;
+                }
+                def_occurrences
+                    .entry(def_name.clone())
+                    .or_default()
+                    .push(def_val.clone());
+            }
+        }
+
+        for (def_name, entries) in &def_occurrences {
+            if entries.len() >= 2 {
+                ensure!(
+                    entries.iter().all(|value| value == &entries[0]),
+                    "Conflicting definitions for shared schema {def_name:?}"
+                );
+                common_defs.insert(def_name.clone(), entries[0].clone());
+                direct_common_defs.insert(def_name.clone());
+            }
+        }
+
+        loop {
+            let mut referenced = BTreeSet::new();
+            for def_val in common_defs.values() {
+                collect_local_def_refs(def_val, &mut referenced);
+            }
+            let mut added_any = false;
+            for dep in referenced {
+                if common_defs.contains_key(&dep) {
+                    continue;
+                }
+                let entries = def_occurrences.get(&dep).with_context(|| {
+                    format!("Common schema references unknown definition {dep:?}")
+                })?;
+                ensure!(
+                    entries.iter().all(|value| value == &entries[0]),
+                    "Conflicting definitions for shared schema {dep:?}"
+                );
+                common_defs.insert(dep.clone(), entries[0].clone());
+                direct_common_defs.insert(dep);
+                added_any = true;
+            }
+            if !added_any {
+                break;
+            }
+        }
+
+        // Step 3: Apply overlay adjustments to non-shared-root config section schemas.
+        for (idx, raw) in raw_schemas.iter_mut().enumerate() {
+            if raw.is_config_section && !shared_root_indices.contains(&idx) {
+                raw.schema["properties"]["$schema"] = serde_json::json!({ "type": "string" });
+                // Config files are overlays; any field may be omitted.
+                raw.schema.as_object_mut().unwrap().remove("required");
+            }
+        }
+
+        // Step 4: Rewrite references to common defs and drop extracted/unreferenced local defs.
+        for raw in &mut raw_schemas {
+            if let Some(defs) = raw.schema.get_mut("$defs").and_then(Value::as_object_mut) {
+                for def_name in &direct_common_defs {
+                    defs.remove(def_name);
+                }
+            }
+            rewrite_local_def_refs(&mut raw.schema, &direct_common_defs);
+            prune_unused_local_defs(&mut raw.schema);
+        }
+
+        // Step 5: Assemble `common.schema.json`.
+        let mut common_defs_map = serde_json::Map::new();
+        for (name, schema) in common_defs {
+            common_defs_map.insert(name, schema);
+        }
+        let mut common_root = serde_json::Map::new();
+        common_root.insert("$schema".into(), Value::String(JSON_SCHEMA_DRAFT.into()));
+        common_root.insert("title".into(), Value::String("Common".into()));
+        common_root.insert(
+            "description".into(),
+            Value::String(
+                "Shared JSON Schema definitions referenced by Nox configuration and session schemas."
+                    .into(),
+            ),
+        );
+        common_root.insert("$defs".into(), Value::Object(common_defs_map));
+
+        let session = raw_schemas.pop().expect("session schema").schema;
+        let sections = raw_schemas
+            .into_iter()
+            .map(|raw| (raw.name, raw.schema))
+            .collect();
+
+        Ok(Self {
+            sections,
+            session,
+            common: Value::Object(common_root),
+        })
+    }
+
+    fn section(&self, name: &str) -> &Value {
+        &self
+            .sections
+            .iter()
+            .find(|(section_name, _)| *section_name == name)
+            .expect("schema for default section")
+            .1
+    }
+
+    fn files(&self) -> Vec<(String, &Value)> {
+        let mut files: Vec<(String, &Value)> = self
+            .sections
+            .iter()
+            .map(|(name, schema)| (format!("{name}.schema.json"), schema))
+            .collect();
+        files.push((SESSION_SCHEMA_FILE.to_string(), &self.session));
+        files.push((COMMON_SCHEMA_FILE.to_string(), &self.common));
+        files
+    }
+
+    fn write_to(&self, directory: &Path) -> Result<usize> {
+        fs::create_dir_all(directory)?;
+        let files = self.files();
+        for (file_name, schema) in &files {
+            let contents = format!("{}\n", serde_json::to_string_pretty(schema)?);
+            write_file_atomic(&directory.join(file_name), contents.as_bytes())?;
+        }
+        Ok(files.len())
+    }
 }
 
 fn merge_missing_object_fields(existing: &mut Value, defaults: &Value) -> usize {
@@ -650,33 +1060,58 @@ fn merge_missing_object_fields(existing: &mut Value, defaults: &Value) -> usize 
     added
 }
 
-fn resolve_schema_ref<'a>(mut schema: &'a Value, root_schema: &'a Value) -> &'a Value {
+fn resolve_schema_ref<'a>(
+    mut schema: &'a Value,
+    mut doc: &'a Value,
+    common: &'a Value,
+) -> (&'a Value, &'a Value) {
     for _ in 0..8 {
         let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
             break;
         };
-        let Some(def_name) = reference.strip_prefix("#/$defs/") else {
+        if let Some(def_name) = reference.strip_prefix(LOCAL_DEF_PREFIX) {
+            let Some(target) = doc.get("$defs").and_then(|defs| defs.get(def_name)) else {
+                break;
+            };
+            schema = target;
+        } else if let Some(def_name) = reference
+            .strip_prefix(COMMON_SCHEMA_FILE)
+            .and_then(|rest| rest.strip_prefix(LOCAL_DEF_PREFIX))
+        {
+            let Some(target) = common.get("$defs").and_then(|defs| defs.get(def_name)) else {
+                break;
+            };
+            schema = target;
+            doc = common;
+        } else {
             break;
-        };
-        let Some(target) = root_schema.get("$defs").and_then(|defs| defs.get(def_name)) else {
-            break;
-        };
-        schema = target;
+        }
     }
-    schema
+    (schema, doc)
 }
 
-fn merge_array_item_defaults(existing: &mut Value, schema: &Value, root_schema: &Value) -> usize {
-    let resolved = resolve_schema_ref(schema, root_schema);
+fn merge_array_item_defaults(
+    existing: &mut Value,
+    schema: &Value,
+    doc: &Value,
+    common: &Value,
+) -> usize {
+    let (resolved, resolved_doc) = resolve_schema_ref(schema, doc, common);
     let mut added = 0;
     match existing {
         Value::Object(map) => {
-            let Some(properties) = resolved.get("properties").and_then(Value::as_object) else {
-                return 0;
-            };
-            for (prop_name, prop_schema) in properties {
-                if let Some(prop_value) = map.get_mut(prop_name) {
-                    added += merge_array_item_defaults(prop_value, prop_schema, root_schema);
+            let mut visited_props = HashSet::new();
+            for (source, source_doc) in [(schema, doc), (resolved, resolved_doc)] {
+                let Some(properties) = source.get("properties").and_then(Value::as_object) else {
+                    continue;
+                };
+                for (prop_name, prop_schema) in properties {
+                    if visited_props.insert(prop_name.as_str())
+                        && let Some(prop_value) = map.get_mut(prop_name)
+                    {
+                        added +=
+                            merge_array_item_defaults(prop_value, prop_schema, source_doc, common);
+                    }
                 }
             }
         }
@@ -684,13 +1119,14 @@ fn merge_array_item_defaults(existing: &mut Value, schema: &Value, root_schema: 
             let Some(item_schema) = resolved.get("items") else {
                 return 0;
             };
-            let resolved_item = resolve_schema_ref(item_schema, root_schema);
+            let (resolved_item, item_doc) = resolve_schema_ref(item_schema, resolved_doc, common);
             let item_properties = resolved_item.get("properties").and_then(Value::as_object);
             for item in items {
                 if let (Some(item_map), Some(props)) = (item.as_object_mut(), item_properties) {
                     for (field_name, field_schema) in props {
                         if !item_map.contains_key(field_name) {
-                            let resolved_field = resolve_schema_ref(field_schema, root_schema);
+                            let (resolved_field, _) =
+                                resolve_schema_ref(field_schema, item_doc, common);
                             if let Some(default_val) = field_schema
                                 .get("default")
                                 .or_else(|| resolved_field.get("default"))
@@ -701,7 +1137,7 @@ fn merge_array_item_defaults(existing: &mut Value, schema: &Value, root_schema: 
                         }
                     }
                 }
-                added += merge_array_item_defaults(item, resolved_item, root_schema);
+                added += merge_array_item_defaults(item, resolved_item, item_doc, common);
             }
         }
         _ => {}
@@ -825,7 +1261,7 @@ pub fn migrate_config(directory: &Path) -> Result<MigrationReport> {
         schemas_dir.display()
     );
 
-    let schemas = all_section_schemas()?;
+    let schemas = SchemaBundle::generate()?;
     let mut planned_writes: Vec<(PathBuf, String)> = Vec::new();
     let mut report = MigrationReport::default();
 
@@ -849,14 +1285,10 @@ pub fn migrate_config(directory: &Path) -> Result<MigrationReport> {
         );
 
         let default_value: Value = serde_json::from_str(&normalized_default)?;
-        let schema = &schemas
-            .iter()
-            .find(|(schema_name, _)| schema_name == name)
-            .expect("schema for default section")
-            .1;
+        let schema = schemas.section(name);
 
         let mut fields_added = merge_missing_object_fields(&mut existing, &default_value);
-        fields_added += merge_array_item_defaults(&mut existing, schema, schema);
+        fields_added += merge_array_item_defaults(&mut existing, schema, schema, &schemas.common);
         let bindings_added = if *name == "keyboard" {
             merge_missing_keyboard_bindings(&mut existing, &default_value)
         } else {
@@ -875,26 +1307,23 @@ pub fn migrate_config(directory: &Path) -> Result<MigrationReport> {
     for (path, contents) in planned_writes {
         write_file_atomic(&path, contents.as_bytes())?;
     }
-    report.schemas_updated = write_schemas_with_sections(&schemas_dir, &schemas)?;
+    report.schemas_updated = schemas.write_to(&schemas_dir)?;
     Ok(report)
 }
 
 pub fn write_defaults(directory: &Path) -> Result<()> {
-    ensure!(
-        !directory.join("schemas/session.schema.json").exists(),
-        "Refusing to overwrite existing session.schema.json"
-    );
+    let schemas = SchemaBundle::generate()?;
+    let schemas_dir = directory.join("schemas");
+    for (file_name, _) in schemas.files() {
+        ensure!(
+            !schemas_dir.join(&file_name).exists(),
+            "Refusing to overwrite existing {file_name}"
+        );
+    }
     for (name, _) in DEFAULTS {
         ensure!(
             !directory.join(format!("{name}.json")).exists(),
             "Refusing to overwrite existing {name}.json"
-        );
-        ensure!(
-            !directory
-                .join("schemas")
-                .join(format!("{name}.schema.json"))
-                .exists(),
-            "Refusing to overwrite existing {name}.schema.json"
         );
     }
     fs::create_dir_all(directory)?;
@@ -913,30 +1342,11 @@ pub fn write_defaults(directory: &Path) -> Result<()> {
             })?;
         file.write_all(contents.replace("../schemas/", "schemas/").as_bytes())?;
     }
-    write_schemas(&directory.join("schemas"))?;
+    schemas.write_to(&schemas_dir)?;
     Ok(())
 }
 
-fn write_schemas_with_sections(directory: &Path, schemas: &[(&str, Value)]) -> Result<usize> {
-    fs::create_dir_all(directory)?;
-    for (name, schema) in schemas {
-        let contents = format!("{}\n", serde_json::to_string_pretty(schema)?);
-        write_file_atomic(
-            &directory.join(format!("{name}.schema.json")),
-            contents.as_bytes(),
-        )?;
-    }
-    let session_schema = schema_for!(crate::session::Session);
-    let session_contents = format!("{}\n", serde_json::to_string_pretty(&session_schema)?);
-    write_file_atomic(
-        &directory.join("session.schema.json"),
-        session_contents.as_bytes(),
-    )?;
-    Ok(schemas.len() + 1)
-}
-
 pub fn write_schemas(directory: &Path) -> Result<()> {
-    let schemas = all_section_schemas()?;
-    write_schemas_with_sections(directory, &schemas)?;
+    SchemaBundle::generate()?.write_to(directory)?;
     Ok(())
 }

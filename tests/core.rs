@@ -500,6 +500,7 @@ fn generated_config_round_trips_and_preserves_existing_files() {
     fs::write(dir.path().join("window.json"), r#"{"width":1800}"#).unwrap();
     assert!(config::write_defaults(dir.path()).is_err());
     assert_eq!(Config::load(Some(dir.path())).unwrap().window.width, 1800.);
+    assert!(dir.path().join("schemas/common.schema.json").is_file());
     for (name, _) in config::DEFAULTS {
         let schema: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(
@@ -510,9 +511,24 @@ fn generated_config_round_trips_and_preserves_existing_files() {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(schema["additionalProperties"], false);
+        let rejects_unknown = schema["additionalProperties"] == false
+            || (schema.get("$ref").is_some() && schema["unevaluatedProperties"] == false);
+        assert!(
+            rejects_unknown,
+            "{name}.schema.json must reject unknown properties"
+        );
         assert!(schema["properties"]["$schema"].is_object());
     }
+
+    // Existing common schema file alone also prevents overwriting.
+    let existing_common = tempdir().unwrap();
+    fs::create_dir_all(existing_common.path().join("schemas")).unwrap();
+    fs::write(
+        existing_common.path().join("schemas/common.schema.json"),
+        "{}",
+    )
+    .unwrap();
+    assert!(config::write_defaults(existing_common.path()).is_err());
 }
 
 #[test]
@@ -679,11 +695,14 @@ fn rotation_to_a_larger_file_is_recognized_as_replacement() {
 fn committed_schemas_match_the_rust_types() {
     let directory = tempdir().unwrap();
     config::write_schemas(directory.path()).unwrap();
+    let committed_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("schemas");
+
+    let mut generated_files = BTreeSet::new();
     for entry in fs::read_dir(directory.path()).unwrap() {
         let entry = entry.unwrap();
-        let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("schemas")
-            .join(entry.file_name());
+        let file_name = entry.file_name();
+        generated_files.insert(file_name.clone());
+        let committed = committed_dir.join(&file_name);
         let generated: serde_json::Value =
             serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap();
         let checked_in: serde_json::Value =
@@ -692,6 +711,161 @@ fn committed_schemas_match_the_rust_types() {
             generated, checked_in,
             "Regenerate schemas after changing configuration types"
         );
+    }
+
+    let committed_files: BTreeSet<_> = fs::read_dir(&committed_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        committed_files, generated_files,
+        "Committed schemas directory has stale or missing schema files"
+    );
+}
+
+#[test]
+fn shared_schema_definitions_are_deduplicated_and_all_refs_resolve() {
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    fn collect_refs(value: &Value, refs: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
+                    refs.push(reference.to_string());
+                }
+                for child in map.values() {
+                    collect_refs(child, refs);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_refs(item, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let directory = tempdir().unwrap();
+    config::write_schemas(directory.path()).unwrap();
+
+    let mut schemas: BTreeMap<String, Value> = BTreeMap::new();
+    for entry in fs::read_dir(directory.path()).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let value: Value = serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap();
+        schemas.insert(name, value);
+    }
+
+    let common = schemas
+        .get("common.schema.json")
+        .expect("common.schema.json must be generated");
+    let common_defs = common["$defs"]
+        .as_object()
+        .expect("common.schema.json must define $defs");
+    for expected in ["HexColor", "Preset", "SearchConfig", "SearchMode"] {
+        assert!(
+            common_defs.contains_key(expected),
+            "common.schema.json missing shared definition {expected}"
+        );
+    }
+
+    // `search.schema.json` and `session.schema.json` must share `SearchConfig`, `Preset`, and
+    // `SearchMode` via `common.schema.json` without duplicating them locally.
+    let search = &schemas["search.schema.json"];
+    assert_eq!(search["$ref"], "common.schema.json#/$defs/SearchConfig");
+    assert_eq!(search["unevaluatedProperties"], false);
+    assert!(search.get("$defs").is_none());
+
+    let session = &schemas["session.schema.json"];
+    let session_defs = session["$defs"].as_object().unwrap();
+    assert!(!session_defs.contains_key("Preset"));
+    assert!(!session_defs.contains_key("SearchMode"));
+    assert_eq!(
+        session_defs["SearchConfig"]["$ref"],
+        "common.schema.json#/$defs/SearchConfig"
+    );
+    assert_eq!(session_defs["SearchConfig"]["unevaluatedProperties"], false);
+    assert!(session_defs["SearchConfig"]["required"].is_array());
+
+    // `appearance.schema.json` and `highlighting.schema.json` share `HexColor` via common schema,
+    // while `FontSize` stays local to `appearance.schema.json`.
+    let appearance = &schemas["appearance.schema.json"];
+    assert_eq!(
+        appearance["properties"]["background"]["$ref"],
+        "common.schema.json#/$defs/HexColor"
+    );
+    assert_eq!(
+        appearance["properties"]["ui_font_size"]["$ref"],
+        "#/$defs/FontSize"
+    );
+    assert_eq!(
+        appearance["properties"]["font_size"]["$ref"],
+        "#/$defs/FontSize"
+    );
+    assert!(
+        !appearance["$defs"]
+            .as_object()
+            .unwrap()
+            .contains_key("HexColor")
+    );
+
+    let highlighting = &schemas["highlighting.schema.json"];
+    assert_eq!(
+        highlighting["$defs"]["HighlightRule"]["properties"]["color"]["$ref"],
+        "common.schema.json#/$defs/HexColor"
+    );
+    assert!(
+        !highlighting["$defs"]
+            .as_object()
+            .unwrap()
+            .contains_key("HexColor")
+    );
+
+    // No `$defs` body may be duplicated across any two schema files.
+    let mut seen_defs: BTreeMap<String, (String, Value)> = BTreeMap::new();
+    for (file_name, schema) in &schemas {
+        if let Some(defs) = schema.get("$defs").and_then(Value::as_object) {
+            for (def_name, def_val) in defs {
+                if let Some((prev_file, prev_val)) = seen_defs.get(def_name) {
+                    assert_ne!(
+                        prev_val, def_val,
+                        "Duplicate $defs/{def_name} in {prev_file} and {file_name}"
+                    );
+                } else {
+                    seen_defs.insert(def_name.clone(), (file_name.clone(), def_val.clone()));
+                }
+            }
+        }
+    }
+
+    // Every `$ref` across every schema file must resolve to an existing `$defs` target.
+    for (file_name, schema) in &schemas {
+        let mut refs = Vec::new();
+        collect_refs(schema, &mut refs);
+        for reference in refs {
+            if let Some(local_name) = reference.strip_prefix("#/$defs/") {
+                assert!(
+                    schema["$defs"]
+                        .as_object()
+                        .is_some_and(|defs| defs.contains_key(local_name)),
+                    "Unresolved local $ref {reference:?} in {file_name}"
+                );
+            } else if let Some((target_file, local_name)) = reference.split_once("#/$defs/") {
+                let target_schema = schemas.get(target_file).unwrap_or_else(|| {
+                    panic!("Unresolved external schema file {target_file:?} in {file_name}")
+                });
+                assert!(
+                    target_schema["$defs"]
+                        .as_object()
+                        .is_some_and(|defs| defs.contains_key(local_name)),
+                    "Unresolved external $ref {reference:?} in {file_name}"
+                );
+            } else {
+                panic!("Unexpected $ref format {reference:?} in {file_name}");
+            }
+        }
     }
 }
 
@@ -819,7 +993,7 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     );
     assert!(report.added_fields > 0);
     assert!(report.added_bindings > 0);
-    assert_eq!(report.schemas_updated, config::DEFAULTS.len() + 1);
+    assert_eq!(report.schemas_updated, config::DEFAULTS.len() + 2);
 
     // Check window.json: `$schema` inserted first, existing + deprecated fields kept, missing added.
     let window: serde_json::Value =
@@ -943,7 +1117,7 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert!(second.updated_files.is_empty());
     assert_eq!(second.added_fields, 0);
     assert_eq!(second.added_bindings, 0);
-    assert_eq!(second.schemas_updated, config::DEFAULTS.len() + 1);
+    assert_eq!(second.schemas_updated, config::DEFAULTS.len() + 2);
 }
 
 #[test]

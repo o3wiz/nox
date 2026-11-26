@@ -135,7 +135,7 @@ Files and individual fields may be omitted. Objects overlay defaults; arrays rep
 | `files.json` | Startup paths, favorites, session restore/save, session path, recent-file limit |
 | `keyboard.json` | Key sequences, typed action names, and `Workspace`, `Log`, `FilterLog`, `Selection`, `TextSelected`, `TextSelected && RegexMode`, `RegexMode`, `TextInput`, `Search`, `FilePath`, `GoTo`, or `Presets` contexts |
 
-Each JSON file has a `$schema` link for editor completion and validation. Schemas are generated from the same Rust types used to deserialize configuration. Top-level properties are optional because files are overlays; objects inside replacement arrays require their fields. Additional semantic checks (for example regex syntax and shortcut conflicts) run in the application.
+Each JSON file has a `$schema` link for editor completion and validation. Schemas are generated from the same Rust types used to deserialize configuration, with shared definitions (such as `SearchConfig`, `SearchMode`, `Preset`, and `HexColor`) stored once in `schemas/common.schema.json` and referenced via `$ref`. Top-level properties are optional because files are overlays; objects inside replacement arrays require their fields. Additional semantic checks (for example regex syntax and shortcut conflicts) run in the application.
 
 Example partial overrides:
 
