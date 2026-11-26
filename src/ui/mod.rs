@@ -1764,7 +1764,7 @@ impl Workspace {
         }));
     }
 
-    fn copy_match_results(&mut self, cx: &mut Context<Self>) {
+    fn copy_match_results(&mut self, pane: Pane, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -1773,6 +1773,28 @@ impl Workspace {
         };
         if tab.results.matches.is_empty() {
             self.status = Some(StatusMessage::warning("No match results to copy"));
+            return;
+        }
+        if Self::selection_count(tab, pane) == 0 {
+            self.status = Some(StatusMessage::warning("No lines selected"));
+            return;
+        }
+        let selected_matches = match pane {
+            Pane::Main => search::selected_match_lines(
+                &tab.results.matches,
+                &tab.main_selection,
+                None,
+                log.len(),
+            ),
+            Pane::Results => search::selected_match_lines(
+                &tab.results.matches,
+                &tab.result_selection,
+                Some(&tab.results.visible),
+                log.len(),
+            ),
+        };
+        if selected_matches.is_empty() {
+            self.status = Some(StatusMessage::warning("No match results in selected lines"));
             return;
         }
         let compiled_fallback;
@@ -1790,7 +1812,7 @@ impl Workspace {
         };
         match search::extract_match_results(
             log,
-            &tab.results.matches,
+            &selected_matches,
             regex,
             &tab.options,
             MAX_COPY_BYTES,
@@ -2553,7 +2575,11 @@ impl Workspace {
                 self.active_pane = pane;
                 self.copy_selected_text(pane, cx);
             }
-            Command::CopyMatchResults => self.copy_match_results(cx),
+            Command::CopyMatchResults => {
+                let pane = self.active_pane_for(window);
+                self.active_pane = pane;
+                self.copy_match_results(pane, cx);
+            }
             Command::SearchSelectedText => {
                 let pane = self.active_pane_for(window);
                 self.active_pane = pane;
@@ -4548,6 +4574,26 @@ impl Workspace {
                                 )
                                 .debug_selector(|| "copy".into()),
                             )
+                            .child(
+                                self.cmd_icon(
+                                    "copy-matches",
+                                    Icon::CopyMatches,
+                                    if selected_count > 1 {
+                                        format!(
+                                            "Copy {} selected lines' match results",
+                                            format_count(selected_count)
+                                        )
+                                    } else if selected_count == 1 {
+                                        "Copy selected line's match results".to_owned()
+                                    } else {
+                                        "Copy selected lines' match results".to_owned()
+                                    },
+                                    Command::CopyMatchResults,
+                                    ButtonTone::Ghost,
+                                    cx,
+                                )
+                                .debug_selector(|| "copy-matches".into()),
+                            )
                             .child(toolbar_divider(t))
                             .child(self.render_zoom_button(
                                 "zoom-out",
@@ -5906,11 +5952,6 @@ impl Workspace {
             ButtonTone::Ghost
         };
 
-        let match_count = self
-            .tabs
-            .get(self.active)
-            .map_or(0, |tab| tab.results.matches.len());
-
         let mut bar = div()
             .h(px(44.))
             .flex_shrink_0()
@@ -5963,24 +6004,6 @@ impl Workspace {
                     cx,
                 )
                 .debug_selector(|| "search-apply".into()),
-            )
-            .child(toolbar_divider(t))
-            .child(
-                self.cmd_icon(
-                    "copy-matches",
-                    Icon::CopyMatches,
-                    if match_count == 1 {
-                        "Copy 1 match result".to_owned()
-                    } else if match_count > 1 {
-                        format!("Copy {} match results", format_count(match_count))
-                    } else {
-                        "Copy match results".to_owned()
-                    },
-                    Command::CopyMatchResults,
-                    ButtonTone::Ghost,
-                    cx,
-                )
-                .debug_selector(|| "copy-matches".into()),
             );
 
         if !self.config.search.presets.is_empty() {
@@ -11747,7 +11770,9 @@ mod tests {
         let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
 
         // 1. Default (0): stepping down through all initially visible rows does not scroll.
-        let default_config = Config::load(None).unwrap();
+        let mut default_config = Config::load(None).unwrap();
+        default_config.files.save_session = false;
+        default_config.files.restore_session = false;
         assert_eq!(default_config.viewer.cursor_surrounding_lines, 0);
         cx.update(|cx| {
             cx.bind_keys(text_input_default_bindings());
@@ -11795,6 +11820,8 @@ mod tests {
 
         // 2. Main pane with cursor_surrounding_lines = 4.
         let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
         config.viewer.cursor_surrounding_lines = 4;
         let (view, vcx) = cx.add_window_view(|window, cx| {
             let mut workspace = Workspace::new(config.clone(), Vec::new(), window, cx);
@@ -12080,6 +12107,8 @@ mod tests {
 
         // 1. Zooming scales the surrounding margin in rows (using zoomed line_height).
         let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
         config.viewer.cursor_surrounding_lines = 4;
         cx.update(|cx| {
             cx.bind_keys(text_input_default_bindings());
@@ -12125,6 +12154,8 @@ mod tests {
 
         // 2. Large cursor_surrounding_lines (larger than half viewport) centers cursor vertically.
         let mut center_config = Config::load(None).unwrap();
+        center_config.files.save_session = false;
+        center_config.files.restore_session = false;
         center_config.viewer.cursor_surrounding_lines = 500;
         let (center_view, center_cx) = cx.add_window_view(|window, cx| {
             let mut workspace = Workspace::new(center_config.clone(), Vec::new(), window, cx);
@@ -12170,6 +12201,8 @@ mod tests {
         });
         assert!(initial_edge_row >= 8);
         let mut init_config = Config::load(None).unwrap();
+        init_config.files.save_session = false;
+        init_config.files.restore_session = false;
         init_config.viewer.cursor_surrounding_lines = 5;
         let (init_view, init_cx) = cx.add_window_view(|window, cx| {
             let mut workspace = Workspace::new(init_config.clone(), Vec::new(), window, cx);
@@ -12886,7 +12919,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn copy_match_results_button_and_shortcut_copy_regex_highlights_and_literal_lines(
+    fn copy_match_results_button_and_shortcut_copy_selected_lines_in_both_panes(
         cx: &mut TestAppContext,
     ) {
         let mut config = Config::load(None).unwrap();
@@ -12939,36 +12972,42 @@ mod tests {
         cx.run_until_parked();
 
         let copy_bounds = cx.debug_bounds("copy").expect("copy button bounds");
-        let search_apply_bounds = cx
-            .debug_bounds("search-apply")
-            .expect("search-apply button bounds");
         let copy_matches_bounds = cx
             .debug_bounds("copy-matches")
             .expect("copy-matches button bounds");
-        let presets_bounds = cx
-            .debug_bounds("presets-trigger")
-            .expect("presets-trigger bounds");
-        assert!(
-            copy_bounds.bottom() < copy_matches_bounds.top(),
-            "copy-matches button should live in the filter bar below the header toolbar"
+        let zoom_out_bounds = cx.debug_bounds("zoom-out").expect("zoom-out button bounds");
+        let search_apply_bounds = cx
+            .debug_bounds("search-apply")
+            .expect("search-apply button bounds");
+        assert_eq!(
+            copy_bounds.top(),
+            copy_matches_bounds.top(),
+            "copy-matches button should sit in the header toolbar next to copy"
         );
         assert!(
-            search_apply_bounds.right() < copy_matches_bounds.left()
-                && copy_matches_bounds.right() < presets_bounds.left(),
-            "copy-matches button should sit between search navigation/apply buttons and Patterns"
+            copy_bounds.right() < copy_matches_bounds.left()
+                && copy_matches_bounds.right() < zoom_out_bounds.left(),
+            "copy-matches button should sit immediately to the right of copy before zoom controls"
+        );
+        assert!(
+            copy_matches_bounds.bottom() < search_apply_bounds.top(),
+            "copy-matches button should sit in the header toolbar above the filter bar"
         );
 
-        // Pressing `c` in the Main pane (Log context only, not FilterLog) does nothing.
+        // Pressing `c` in the Main pane (Log context) with no search matches warns without copying.
         cx.simulate_keystrokes("c");
         assert!(cx.read_from_clipboard().is_none());
         view.read_with(cx, |view, _| {
-            assert_eq!(view.status, None);
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No match results to copy"))
+            );
         });
 
-        // Focusing the Filter pane (Log + FilterLog) and pressing `c` with no matches warns
-        // without writing to the clipboard.
+        // Focusing the Filter pane and pressing `c` with no matches also warns without copying.
         view.update_in(cx, |view, window, cx| {
             view.focus_pane(Pane::Results, window, cx);
+            view.status = None;
         });
         cx.run_until_parked();
         cx.simulate_keystrokes("c");
@@ -12980,7 +13019,7 @@ mod tests {
             );
         });
 
-        // Typing `c` in the search input inserts text normally instead of triggering FilterLog.
+        // Typing `c` in the search input inserts text normally instead of triggering Log.
         view.update_in(cx, |view, window, cx| {
             view.command(Command::FocusSearch, window, cx);
         });
@@ -13005,20 +13044,31 @@ mod tests {
             assert_eq!(view.tabs[0].results.visible, vec![0, 1, 2, 3, 4]);
         });
 
-        // Pressing `c` while focused in the Main pane does NOT fire the FilterLog binding.
+        // In Main pane with only non-matching line 0 selected: warns and copies nothing.
         cx.simulate_keystrokes("c");
         assert!(cx.read_from_clipboard().is_none());
         view.read_with(cx, |view, _| {
-            assert_eq!(view.status, None);
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No match results in selected lines"))
+            );
         });
 
-        // Focusing the Filter pane and pressing `c` copies only capturing groups, space-separated
-        // per line, while `Log` shortcuts like `m` (bookmark) continue working in Filter pane.
-        view.update_in(cx, |view, window, cx| {
-            view.focus_pane(Pane::Results, window, cx);
+        // In Main pane with matching line 1 selected: pressing `c` copies only that line's captures.
+        cx.simulate_keystrokes("down c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::success("Copied 1 match result"))
+            );
         });
-        cx.run_until_parked();
-        cx.simulate_keystrokes("c");
+
+        // In Main pane with lines 1..=3 selected (includes non-matching line 2): copies lines 1 & 3.
+        cx.simulate_keystrokes("shift-down shift-down c");
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),
             Some("alice 200\nbob 503".to_owned())
@@ -13029,21 +13079,38 @@ mod tests {
                 Some(StatusMessage::success("Copied 2 match results"))
             );
         });
-        cx.simulate_keystrokes("down m");
+
+        // Empty selection in Main pane warns "No lines selected" and keeps clipboard intact.
+        view.update(cx, |view, cx| {
+            view.tabs[0].main_selection = LineSelection::empty();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200\nbob 503".to_owned())
+        );
         view.read_with(cx, |view, _| {
-            assert!(
-                view.tabs[0].bookmarks.contains(&1),
-                "Log context shortcuts must remain active in the Filter pane"
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No lines selected"))
             );
         });
-        cx.simulate_keystrokes("m");
 
         // Turning off highlight_matches in Regex mode still copies what would be highlighted
-        // when clicking the copy-matches button, even while the Main pane is focused.
+        // when clicking the copy-matches button for the active pane's selected lines.
+        let select_all_key = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
         view.update_in(cx, |view, window, cx| {
             view.command(Command::ToggleHighlightMatches, window, cx);
             assert!(!view.tabs[0].options.highlight_matches);
-            view.focus_pane(Pane::Main, window, cx);
+            view.tabs[0].main_selection.select_single(3);
+            view.tabs[0].selected = 3;
+            cx.notify();
         });
         cx.update(|_window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string("sentinel".to_owned()))
@@ -13055,11 +13122,59 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),
-            Some("alice 200\nbob 503".to_owned())
+            Some("bob 503".to_owned())
         );
 
+        // In Filter pane: row 0 is context/bookmark line 0 (not a match) -> warns, does not copy.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Results, window, cx);
+            view.tabs[0].result_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("bob 503".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::warning("No match results in selected lines"))
+            );
+        });
+
+        // In Filter pane: moving down to row 1 (match line 1) copies only row 1, and `m` still works.
+        cx.simulate_keystrokes("down c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200".to_owned())
+        );
+        cx.simulate_keystrokes("m");
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.tabs[0].bookmarks.contains(&1),
+                "Log context shortcuts must remain active in the Filter pane"
+            );
+        });
+        cx.simulate_keystrokes("m");
+
+        // In Filter pane: Select All copies all matches while skipping context & bookmark rows.
+        cx.simulate_keystrokes(select_all_key);
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice 200\nbob 503".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status,
+                Some(StatusMessage::success("Copied 2 match results"))
+            );
+        });
+
         // Regex without capturing groups copies full regex matches, space-separated per line,
-        // when pressing `c` in the Filter pane.
+        // for only the selected rows in the Filter pane.
         view.update_in(cx, |view, window, cx| {
             view.input
                 .update(cx, |input, cx| input.emplace(r"status=\d{3}", cx));
@@ -13067,13 +13182,19 @@ mod tests {
             view.focus_pane(Pane::Results, window, cx);
         });
         cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.tabs[0].result_selection = LineSelection::single(3); // visible[3] = line 3
+            cx.notify();
+        });
+        cx.run_until_parked();
         cx.simulate_keystrokes("c");
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),
-            Some("status=200\nstatus=503 status=504".to_owned())
+            Some("status=503 status=504".to_owned())
         );
 
-        // Switching to Literal mode copies full matched lines (excluding context and bookmarks).
+        // Switching to Literal mode copies full matched lines from the selected rows only
+        // (excluding context and bookmark rows even when selected via Select All).
         view.update_in(cx, |view, window, cx| {
             view.input
                 .update(cx, |input, cx| input.emplace("status=", cx));
@@ -13085,6 +13206,21 @@ mod tests {
             assert_eq!(view.tabs[0].results.matches, vec![1, 3]);
             assert_eq!(view.tabs[0].results.visible, vec![0, 1, 2, 3, 4]);
         });
+        // Select rows 0..=2 (bookmark/context 0, match 1, context 2) -> only line 1 is copied.
+        view.update(cx, |view, cx| {
+            view.tabs[0].result_selection = LineSelection::single(0);
+            view.tabs[0].result_selection.extend_to(2);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("WARN user=alice status=200 extra=ok".to_owned())
+        );
+
+        // Select All in Literal mode copies both matched lines without context/bookmarks.
+        cx.simulate_keystrokes(select_all_key);
         cx.simulate_keystrokes("c");
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),
@@ -13094,13 +13230,15 @@ mod tests {
             )
         );
 
-        // Regex mode with a non-participating optional capture group warns and keeps clipboard intact.
+        // Regex mode with a non-participating optional capture group on a selected matching line
+        // warns and keeps clipboard intact.
         view.update_in(cx, |view, window, cx| {
             view.input
                 .update(cx, |input, cx| input.emplace(r"INFO (missing)?", cx));
             view.command(Command::ToggleRegex, window, cx);
         });
         cx.run_until_parked();
+        // Line 0 ("INFO boot") matches `INFO (missing)?` and is row 0 in visible results.
         cx.simulate_keystrokes("c");
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),

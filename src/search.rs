@@ -1,6 +1,7 @@
 use crate::{
     config::{SearchConfig, SearchMode},
     logfile::LogFile,
+    selection::LineSelection,
 };
 use anyhow::{Result, ensure};
 use regex::{Regex, RegexBuilder};
@@ -283,7 +284,71 @@ pub enum MatchCopyResult {
     LimitExceeded,
 }
 
-/// Collects text to copy for all matched source lines in `matches`.
+/// Returns sorted, deduplicated source line indices that are both selected by `selection`
+/// and present in sorted `matches`.
+///
+/// - When `visible` is `None`, `selection` stores source line indices directly (`0..log_len`,
+///   for the main log pane).
+/// - When `visible` is `Some(rows)`, `selection` stores pane-local row indices into the
+///   sorted `rows` slice (for the filter pane).
+pub fn selected_match_lines(
+    matches: &[usize],
+    selection: &LineSelection,
+    visible: Option<&[usize]>,
+    log_len: usize,
+) -> Vec<usize> {
+    if matches.is_empty() || selection.is_empty() || log_len == 0 {
+        return Vec::new();
+    }
+    let last_line = log_len - 1;
+    let mut out = Vec::new();
+    match visible {
+        None => {
+            for &(start, end) in selection.ranges() {
+                if start > last_line {
+                    break;
+                }
+                let end = end.min(last_line);
+                let lo = matches.partition_point(|&line| line < start);
+                let hi = matches.partition_point(|&line| line <= end);
+                out.extend_from_slice(&matches[lo..hi]);
+            }
+        }
+        Some(visible_rows) => {
+            if visible_rows.is_empty() {
+                return out;
+            }
+            let last_row = visible_rows.len() - 1;
+            for &(start_row, end_row) in selection.ranges() {
+                if start_row > last_row {
+                    break;
+                }
+                let end_row = end_row.min(last_row);
+                let slice = &visible_rows[start_row..=end_row];
+                let first_line = slice[0];
+                if first_line > last_line {
+                    break;
+                }
+                let capped_last = slice[slice.len() - 1].min(last_line);
+                let lo = matches.partition_point(|&line| line < first_line);
+                let hi = matches.partition_point(|&line| line <= capped_last);
+                let mut rest = slice;
+                for &line in &matches[lo..hi] {
+                    if rest.first() == Some(&line) {
+                        out.push(line);
+                        rest = &rest[1..];
+                    } else if let Ok(idx) = rest.binary_search(&line) {
+                        out.push(line);
+                        rest = &rest[idx + 1..];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Collects text to copy for the given matched source lines in `matches`.
 ///
 /// - In `SearchMode::Regex` (when `options.invert` is false and `regex` is `Some`),
 ///   extracts only the spans that match highlighting would highlight
@@ -667,6 +732,90 @@ mod tests {
         assert_eq!(
             extract_match_results(&log, &[], Some(&re), &opts, 64).unwrap(),
             MatchCopyResult::Empty
+        );
+    }
+
+    #[test]
+    fn selected_match_lines_intersects_main_and_filter_selections() {
+        let matches = vec![1, 3, 6, 8];
+        let visible = vec![0, 1, 2, 3, 4, 6, 8, 9];
+
+        // Empty selection, empty matches, or empty log yields nothing.
+        assert!(selected_match_lines(&matches, &LineSelection::empty(), None, 10).is_empty());
+        assert!(selected_match_lines(&[], &LineSelection::single(1), None, 10).is_empty());
+        assert!(selected_match_lines(&matches, &LineSelection::single(1), None, 0).is_empty());
+
+        // Main pane: single matching vs non-matching line.
+        assert_eq!(
+            selected_match_lines(&matches, &LineSelection::single(1), None, 10),
+            vec![1]
+        );
+        assert!(selected_match_lines(&matches, &LineSelection::single(2), None, 10).is_empty());
+
+        // Main pane: multi-range non-contiguous selection and select-all.
+        let mut main_sel = LineSelection::single(0);
+        main_sel.extend_to(3); // lines 0..=3 -> matches 1, 3
+        main_sel.toggle(8); // + line 8 -> match 8
+        main_sel.toggle(9); // + line 9 -> non-match
+        assert_eq!(
+            selected_match_lines(&matches, &main_sel, None, 10),
+            vec![1, 3, 8]
+        );
+
+        let mut all_main = LineSelection::empty();
+        all_main.select_all(10_000_000);
+        assert_eq!(
+            selected_match_lines(&matches, &all_main, None, 10),
+            vec![1, 3, 6, 8]
+        );
+
+        // Main pane clamps to log_len.
+        assert_eq!(
+            selected_match_lines(&matches, &all_main, None, 5),
+            vec![1, 3]
+        );
+
+        // Filter pane: single context/bookmark row vs matching row.
+        assert!(
+            selected_match_lines(&matches, &LineSelection::single(0), Some(&visible), 10)
+                .is_empty()
+        );
+        assert_eq!(
+            selected_match_lines(&matches, &LineSelection::single(1), Some(&visible), 10),
+            vec![1]
+        );
+
+        // Filter pane: range spanning context, matches, and bookmarks, plus non-contiguous toggle.
+        let mut res_sel = LineSelection::single(0);
+        res_sel.extend_to(4); // visible[0..=4] = [0, 1, 2, 3, 4] -> matches 1, 3
+        res_sel.toggle(6); // visible[6] = 8 -> match 8
+        res_sel.toggle(7); // visible[7] = 9 -> bookmark only
+        assert_eq!(
+            selected_match_lines(&matches, &res_sel, Some(&visible), 10),
+            vec![1, 3, 8]
+        );
+
+        // Filter pane: select-all when visible equals matches and when context is present.
+        let mut all_res = LineSelection::empty();
+        all_res.select_all(visible.len());
+        assert_eq!(
+            selected_match_lines(&matches, &all_res, Some(&visible), 10),
+            vec![1, 3, 6, 8]
+        );
+        let mut all_exact = LineSelection::empty();
+        all_exact.select_all(matches.len());
+        assert_eq!(
+            selected_match_lines(&matches, &all_exact, Some(&matches), 10),
+            vec![1, 3, 6, 8]
+        );
+
+        // Filter pane: out-of-range selection rows and empty visible are handled safely.
+        assert!(
+            selected_match_lines(&matches, &LineSelection::single(99), Some(&visible), 10)
+                .is_empty()
+        );
+        assert!(
+            selected_match_lines(&matches, &LineSelection::single(0), Some(&[]), 10).is_empty()
         );
     }
 }

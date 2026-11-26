@@ -768,7 +768,7 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
         b["keys"] == "up" && b["context"] == "FilePath" && b["action"] == "previous_line"
     }));
     assert!(bindings.iter().any(|b| {
-        b["keys"] == "c" && b["context"] == "FilterLog" && b["action"] == "copy_match_results"
+        b["keys"] == "c" && b["context"] == "Log" && b["action"] == "copy_match_results"
     }));
 
     // Created missing files should point to local `schemas/`.
