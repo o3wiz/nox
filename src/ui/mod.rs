@@ -30,6 +30,7 @@ use nox::{
     search::{self, MatchCopyResult, SearchResults},
     selection::{LineSelection, TextPosition, TextSelection, word_range_at},
     session::{self, SavedTab, Session},
+    stdin::StdinSpool,
     zoom::{
         DEFAULT_ZOOM_PERCENT, MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, ZoomMetrics, clamp_zoom_percent,
         scaled_scroll_offset, zoom_in_percent, zoom_out_percent,
@@ -222,10 +223,17 @@ struct PendingReveal {
     strategy: RevealStrategy,
 }
 
+pub enum InputSource {
+    File(PathBuf),
+    Stdin(StdinSpool),
+}
+
 struct Tab {
     id: usize,
     path: PathBuf,
     log: Option<Arc<LogFile>>,
+    stdin: Option<StdinSpool>,
+    stdin_finished: bool,
     loading: bool,
     searching: bool,
     searching_since: Option<Instant>,
@@ -257,6 +265,8 @@ impl Tab {
             id,
             path,
             log: None,
+            stdin: None,
+            stdin_finished: false,
             loading: false,
             searching: false,
             searching_since: None,
@@ -302,6 +312,56 @@ impl Tab {
         self.selected = saved.selected;
         self.main_selection = LineSelection::single(saved.selected);
         self.follow = saved.follow;
+    }
+
+    fn is_stdin(&self) -> bool {
+        self.stdin.is_some()
+    }
+
+    fn is_streaming_stdin(&self) -> bool {
+        self.stdin
+            .as_ref()
+            .is_some_and(|spool| !spool.is_finished())
+    }
+
+    fn label(&self) -> String {
+        if self.is_stdin() {
+            "stdin".to_owned()
+        } else {
+            file_label(&self.path)
+        }
+    }
+
+    fn tooltip(&self) -> String {
+        if self.is_stdin() {
+            if self.is_streaming_stdin() {
+                "Standard input (streaming…)".to_owned()
+            } else {
+                "Standard input".to_owned()
+            }
+        } else {
+            self.path.display().to_string()
+        }
+    }
+
+    fn path_bar_text(&self) -> String {
+        if self.is_stdin() {
+            String::new()
+        } else {
+            self.path.display().to_string()
+        }
+    }
+
+    fn path_bar_placeholder(&self) -> &'static str {
+        if self.is_stdin() {
+            if self.is_streaming_stdin() {
+                "Standard input (streaming…)"
+            } else {
+                "Standard input"
+            }
+        } else {
+            "Enter file path…"
+        }
     }
 
     fn sync_highlight_regex(&mut self) {
@@ -446,6 +506,7 @@ pub struct Workspace {
     _timer: Task<()>,
     _subscriptions: Vec<Subscription>,
     state_path: Option<PathBuf>,
+    ephemeral_only: bool,
     recent: Vec<PathBuf>,
     show_files: bool,
     header_click_armed: bool,
@@ -456,9 +517,24 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    #[cfg(test)]
     fn new(
         config: Config,
         paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_inputs(
+            config,
+            paths.into_iter().map(InputSource::File).collect(),
+            window,
+            cx,
+        )
+    }
+
+    fn new_with_inputs(
+        config: Config,
+        inputs: Vec<InputSource>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -510,11 +586,19 @@ impl Workspace {
         } else {
             Session::default()
         };
-        let restore = paths.is_empty() && config.files.restore_session;
-        let paths = if restore {
-            saved.tabs.iter().map(|tab| tab.path.clone()).collect()
+        let restore = inputs.is_empty() && config.files.restore_session;
+        let ephemeral_only = !inputs.is_empty()
+            && inputs
+                .iter()
+                .all(|input| matches!(input, InputSource::Stdin(_)));
+        let inputs = if restore {
+            saved
+                .tabs
+                .iter()
+                .map(|tab| InputSource::File(tab.path.clone()))
+                .collect()
         } else {
-            paths
+            inputs
         };
         let results_height = if config.files.restore_session {
             saved.results_height.unwrap_or(config.window.results_height)
@@ -641,6 +725,7 @@ impl Workspace {
             } else {
                 None
             },
+            ephemeral_only,
             recent: saved.recent,
             show_files: false,
             header_click_armed: false,
@@ -649,8 +734,11 @@ impl Workspace {
             #[cfg(test)]
             quit_count: 0,
         };
-        for path in paths {
-            this.open(path, cx);
+        for input in inputs {
+            match input {
+                InputSource::File(path) => this.open(path, cx),
+                InputSource::Stdin(spool) => this.open_stdin(spool, cx),
+            }
         }
         if restore {
             for (tab, saved) in this.tabs.iter_mut().zip(saved.tabs) {
@@ -685,31 +773,38 @@ impl Workspace {
     }
 
     fn save_session(&self, cx: &App) {
-        if !self.config.files.save_session {
+        if !self.config.files.save_session || self.ephemeral_only {
             return;
         }
         let Some(path) = &self.state_path else {
             return;
         };
+        let mut persisted_tabs = Vec::new();
+        let mut persisted_active = 0;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if tab.is_stdin() {
+                continue;
+            }
+            if index == self.active {
+                persisted_active = persisted_tabs.len();
+            }
+            let query = if index == self.active {
+                self.input.read(cx).as_str().to_owned()
+            } else {
+                tab.query.clone()
+            };
+            persisted_tabs.push(tab.to_saved(query));
+        }
+        if !self.tabs.is_empty() && persisted_tabs.is_empty() {
+            return;
+        }
         let session = Session {
             version: 1,
-            active: self.active,
+            active: persisted_active,
             recent: self.recent.clone(),
             results_height: Some(self.target_results_height.round()),
             zoom_percent: (self.zoom_percent != DEFAULT_ZOOM_PERCENT).then_some(self.zoom_percent),
-            tabs: self
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(index, tab)| {
-                    let query = if index == self.active {
-                        self.input.read(cx).as_str().to_owned()
-                    } else {
-                        tab.query.clone()
-                    };
-                    tab.to_saved(query)
-                })
-                .collect(),
+            tabs: persisted_tabs,
         };
         if let Err(error) = session.save(path) {
             eprintln!("Cannot save session {}: {error}", path.display());
@@ -718,10 +813,15 @@ impl Workspace {
 
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let path = path.canonicalize().unwrap_or(path);
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| !tab.is_stdin() && tab.path == path)
+        {
             self.switch(index, cx);
             return;
         }
+        self.ephemeral_only = false;
         self.recent.retain(|recent| recent != &path);
         self.recent.insert(0, path.clone());
         self.recent.truncate(self.config.files.recent_limit);
@@ -733,6 +833,25 @@ impl Workspace {
             self.config.search.clone(),
             self.config.viewer.follow,
         ));
+        self.switch(self.tabs.len() - 1, cx);
+        self.load(self.active);
+        cx.notify();
+    }
+
+    fn open_stdin(&mut self, spool: StdinSpool, cx: &mut Context<Self>) {
+        let path = spool.path().to_path_buf();
+        let stdin_finished = spool.is_finished();
+        self.show_files = false;
+        self.next_id += 1;
+        let mut tab = Tab::new(
+            self.next_id,
+            path,
+            self.config.search.clone(),
+            self.config.viewer.follow,
+        );
+        tab.stdin = Some(spool);
+        tab.stdin_finished = stdin_finished;
+        self.tabs.push(tab);
         self.switch(self.tabs.len() - 1, cx);
         self.load(self.active);
         cx.notify();
@@ -769,6 +888,9 @@ impl Workspace {
     }
 
     fn record_closed_tab(&mut self, index: usize, tab: &Tab) {
+        if tab.is_stdin() {
+            return;
+        }
         self.closed_tabs
             .retain(|closed| closed.saved.path != tab.path);
         if self.closed_tabs.len() >= MAX_CLOSED_TABS {
@@ -785,7 +907,11 @@ impl Workspace {
             let Some(entry) = self.closed_tabs.pop_back() else {
                 return false;
             };
-            if !self.tabs.iter().any(|tab| tab.path == entry.saved.path) {
+            if !self
+                .tabs
+                .iter()
+                .any(|tab| !tab.is_stdin() && tab.path == entry.saved.path)
+            {
                 break entry;
             }
         };
@@ -793,6 +919,7 @@ impl Workspace {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         let path = closed.saved.path.clone();
+        self.ephemeral_only = false;
         self.recent.retain(|recent| recent != &path);
         self.recent.insert(0, path.clone());
         self.recent.truncate(self.config.files.recent_limit);
@@ -861,6 +988,7 @@ impl Workspace {
             return;
         }
         let path = path.canonicalize().unwrap_or(path);
+        self.ephemeral_only = false;
         self.recent.retain(|recent| recent != &path);
         self.recent.insert(0, path.clone());
         self.recent.truncate(self.config.files.recent_limit);
@@ -870,7 +998,7 @@ impl Workspace {
         self.close_path_completions();
 
         let active = self.active;
-        if self.tabs[active].path == path {
+        if !self.tabs[active].is_stdin() && self.tabs[active].path == path {
             self.sync_path_input(cx);
             self.load(active);
             cx.notify();
@@ -896,6 +1024,8 @@ impl Workspace {
         tab.id = new_id;
         tab.path = path;
         tab.log = None;
+        tab.stdin = None;
+        tab.stdin_finished = false;
         tab.loading = false;
         tab.searching = false;
         tab.searching_since = None;
@@ -972,7 +1102,7 @@ impl Workspace {
         let Some(log) = tab.log.clone() else {
             return;
         };
-        tab.error = None;
+        tab.error = tab.stdin.as_ref().and_then(StdinSpool::error);
         let marks = if include_bookmarks {
             tab.bookmarks.clone()
         } else {
@@ -1170,7 +1300,7 @@ impl Workspace {
                                 tab.bookmarks.retain(|&line| line < log.len());
                                 let non_empty = !log.is_empty();
                                 tab.log = Some(log);
-                                tab.error = None;
+                                tab.error = tab.stdin.as_ref().and_then(StdinSpool::error);
                                 if tab.follow {
                                     tab.pending_main_reveal = None;
                                     tab.scroll.scroll_to_bottom();
@@ -1199,14 +1329,44 @@ impl Workspace {
                 }
             }
         }
-        for tab in &mut self.tabs {
-            if tab.searching
-                && !tab.searching_visible
-                && tab
-                    .searching_since
-                    .is_some_and(|since| since.elapsed() >= SEARCH_INDICATOR_DELAY)
+        for index in 0..self.tabs.len() {
+            let mut reload_stdin_now = false;
             {
-                tab.searching_visible = true;
+                let tab = &mut self.tabs[index];
+                if tab.searching
+                    && !tab.searching_visible
+                    && tab
+                        .searching_since
+                        .is_some_and(|since| since.elapsed() >= SEARCH_INDICATOR_DELAY)
+                {
+                    tab.searching_visible = true;
+                    changed = true;
+                }
+                if let Some(spool) = &tab.stdin {
+                    let finished = spool.is_finished();
+                    if finished && !tab.stdin_finished {
+                        tab.stdin_finished = true;
+                        changed = true;
+                    }
+                    if let Some(error) = spool.error()
+                        && tab.error.is_none()
+                    {
+                        tab.error = Some(error);
+                        changed = true;
+                    }
+                    if !tab.loading
+                        && !tab.searching
+                        && let Some(log) = &tab.log
+                    {
+                        let written = spool.bytes_written();
+                        if written > log.stamp.len && (log.stamp.len == 0 || finished) {
+                            reload_stdin_now = true;
+                        }
+                    }
+                }
+            }
+            if reload_stdin_now {
+                self.load(index);
                 changed = true;
             }
         }
@@ -1218,16 +1378,23 @@ impl Workspace {
                     && !tab.searching
                     && let Some(log) = &tab.log
                 {
-                    match Stamp::read(&tab.path) {
-                        Ok(stamp) if stamp != log.stamp => {
+                    if let Some(spool) = &tab.stdin {
+                        if !spool.is_finished() && spool.bytes_written() > log.stamp.len {
                             self.load(index);
                             changed = true;
                         }
-                        Err(error) => {
-                            self.tabs[index].error = Some(format!("Watching file: {error}"));
-                            changed = true;
+                    } else {
+                        match Stamp::read(&tab.path) {
+                            Ok(stamp) if stamp != log.stamp => {
+                                self.load(index);
+                                changed = true;
+                            }
+                            Err(error) => {
+                                self.tabs[index].error = Some(format!("Watching file: {error}"));
+                                changed = true;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -1272,10 +1439,15 @@ impl Workspace {
             return;
         };
         let indices = tab.results.visible.clone();
-        let picker = cx.prompt_for_new_path(
-            log.path.parent().unwrap_or(Path::new(".")),
-            Some("nox-results.log"),
-        );
+        let default_dir = if tab.is_stdin() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            log.path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+        let picker = cx.prompt_for_new_path(&default_dir, Some("nox-results.log"));
         let sender = self.sender.clone();
         cx.spawn(async move |this, cx| match picker.await {
             Ok(Ok(Some(path))) => {
@@ -3020,7 +3192,7 @@ impl Workspace {
         let path = self
             .tabs
             .get(self.active)
-            .map(|tab| tab.path.display().to_string())
+            .map(Tab::path_bar_text)
             .unwrap_or_default();
         self.set_path_input_silently(&path, cx);
     }
@@ -4512,8 +4684,8 @@ impl Workspace {
 
         for (index, tab) in self.tabs.iter().enumerate() {
             let active = index == self.active;
-            let filename = file_label(&tab.path);
-            let full_path = SharedString::from(tab.path.display().to_string());
+            let filename = tab.label();
+            let full_path = SharedString::from(tab.tooltip());
             let tip_theme = t.clone();
             let close_theme = t.clone();
             let close_shortcut = if active {
@@ -5165,6 +5337,10 @@ impl Workspace {
     ) -> Div {
         let t = &self.theme;
         let path_focused = self.path_input_focused(window, cx);
+        let path_placeholder = self
+            .tabs
+            .get(self.active)
+            .map_or("Enter file path…", Tab::path_bar_placeholder);
         let bar_bounds = self.path_bar_bounds.clone();
         let bounds_tracker = canvas(
             move |bounds, _window, _cx| {
@@ -5245,7 +5421,7 @@ impl Workspace {
                             .debug_selector(|| "file-path-input".into())
                             .key_context(format!("{DEFAULT_INPUT_CONTEXT} FilePath").as_str())
                             .state(self.path_input.downgrade())
-                            .placeholder("Enter file path…")
+                            .placeholder(path_placeholder)
                             .caret_color(t.accent)
                             .placeholder_color(t.muted)
                             .font(t.mono_font_spec())
@@ -6319,6 +6495,15 @@ impl Workspace {
         let bookmarks = tab.map_or(0, |tab| tab.bookmarks.len());
         let bytes = tab.and_then(|tab| tab.log.as_ref()).map(|l| l.stamp.len);
         let follow = tab.is_some_and(|tab| tab.follow);
+        let stdin_suffix = tab
+            .and_then(|tab| {
+                tab.is_stdin().then_some(if tab.is_streaming_stdin() {
+                    " · Streaming"
+                } else {
+                    " · stdin"
+                })
+            })
+            .unwrap_or("");
 
         div()
             .h(px(26.))
@@ -6431,11 +6616,10 @@ impl Workspace {
                                     } else {
                                         t.muted.opacity(0.6)
                                     }))
-                                    .child(
-                                        div()
-                                            .font(t.mono_font_spec())
-                                            .child(format!("{} · UTF-8", format_bytes(len))),
-                                    ),
+                                    .child(div().font(t.mono_font_spec()).child(format!(
+                                        "{} · UTF-8{stdin_suffix}",
+                                        format_bytes(len)
+                                    ))),
                             )
                         })
                     })
@@ -7056,7 +7240,7 @@ fn parent_label(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-pub fn run(config: Config, paths: Vec<PathBuf>) -> anyhow::Result<()> {
+pub fn run(config: Config, inputs: Vec<InputSource>) -> anyhow::Result<()> {
     let bindings = keybindings(&config)?;
     gpui_platform::application()
         .with_quit_mode(QuitMode::LastWindowClosed)
@@ -7104,7 +7288,7 @@ pub fn run(config: Config, paths: Vec<PathBuf>) -> anyhow::Result<()> {
                         ..Default::default()
                     };
                     if let Err(error) = cx.open_window(options, |window, cx| {
-                        cx.new(|cx| Workspace::new(config, paths, window, cx))
+                        cx.new(|cx| Workspace::new_with_inputs(config, inputs, window, cx))
                     }) {
                         eprintln!("Cannot open window: {error}");
                         cx.quit();
@@ -15804,5 +15988,230 @@ mod tests {
             assert!(paths.contains(&third_canon));
             assert_eq!(view.tabs[view.active].path, second_canon);
         });
+    }
+
+    #[gpui::test]
+    fn stdin_tab_streams_live_input_preserves_bookmarks_and_cleans_up_on_replace(
+        cx: &mut TestAppContext,
+    ) {
+        use std::io::Write as _;
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.poll_interval_ms = 10;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let spool = StdinSpool::spawn_reader(reader).unwrap();
+        let spool_path = spool.path().to_path_buf();
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_inputs(config.clone(), vec![InputSource::Stdin(spool)], window, cx)
+        });
+        vcx.run_until_parked();
+
+        // Wait for initial load of the empty stream to complete.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while view.read_with(vcx, |view, _| view.tabs[0].log.is_none()) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for initial stdin load"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            view.update(vcx, |view, cx| view.tick(cx));
+            vcx.run_until_parked();
+        }
+
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            let tab = &view.tabs[0];
+            assert!(tab.is_stdin());
+            assert!(tab.is_streaming_stdin());
+            assert_eq!(tab.label(), "stdin");
+            assert_eq!(tab.path_bar_placeholder(), "Standard input (streaming…)");
+            assert_eq!(view.path_input.read(cx).as_str(), "");
+            assert!(view.recent.is_empty());
+            assert_eq!(tab.log.as_ref().unwrap().len(), 0);
+        });
+
+        // Write first chunk while keeping the pipe open.
+        writer.write_all(b"INFO boot\nERROR timeout\n").unwrap();
+        writer.flush().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while view.read_with(vcx, |view, _| {
+            view.tabs[0].log.as_ref().map_or(0, |log| log.len()) < 2
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for first streamed lines"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            view.update(vcx, |view, cx| view.tick(cx));
+            vcx.run_until_parked();
+        }
+
+        // Bookmark line 0 and search for ERROR.
+        view.update(vcx, |view, cx| {
+            view.tabs[0].bookmarks.insert(0);
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            view.start_search(0, cx);
+        });
+        vcx.run_until_parked();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while view.read_with(vcx, |view, _| view.tabs[0].searching) {
+            assert!(Instant::now() < deadline, "timed out waiting for search");
+            std::thread::sleep(Duration::from_millis(5));
+            vcx.run_until_parked();
+        }
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+        });
+
+        // Write second chunk and close the pipe (EOF).
+        writer.write_all(b"ERROR retry\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while view.read_with(vcx, |view, _| {
+            view.tabs[0].log.as_ref().map_or(0, |log| log.len()) < 3
+                || view.tabs[0].is_streaming_stdin()
+                || view.tabs[0].searching
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for EOF stdin reload"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            view.update(vcx, |view, cx| view.tick(cx));
+            vcx.run_until_parked();
+        }
+
+        view.read_with(vcx, |view, _| {
+            let tab = &view.tabs[0];
+            let log = tab.log.as_ref().unwrap();
+            assert_eq!(log.len(), 3);
+            assert_eq!(log.line(2, 100).unwrap(), "ERROR retry");
+            assert!(tab.bookmarks.contains(&0), "bookmark must survive append");
+            assert_eq!(tab.results.matches, vec![1, 2]);
+            assert!(!tab.is_streaming_stdin());
+            assert_eq!(tab.path_bar_placeholder(), "Standard input");
+        });
+
+        // Replacing the stdin tab with a regular file cleans up the temp spool file.
+        let dir = tempfile::tempdir().unwrap();
+        let real_path = dir.path().join("real.log");
+        std::fs::write(&real_path, "regular line\n").unwrap();
+        let canonical = real_path.canonicalize().unwrap_or(real_path.clone());
+
+        view.update(vcx, |view, cx| {
+            view.replace_active_tab(real_path, cx);
+        });
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, cx| {
+            let tab = &view.tabs[0];
+            assert!(!tab.is_stdin());
+            assert_eq!(tab.path, canonical);
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                canonical.display().to_string()
+            );
+            assert_eq!(view.recent, vec![canonical.clone()]);
+        });
+        assert!(
+            !spool_path.exists(),
+            "stdin temp file should be removed once replaced by a regular file"
+        );
+    }
+
+    #[gpui::test]
+    fn stdin_tabs_preserve_existing_session_and_are_excluded_from_saved_sessions(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("session.json");
+        let existing_path = dir.path().join("existing.log");
+        let real_path = dir.path().join("real.log");
+        std::fs::write(&existing_path, "old line\n").unwrap();
+        std::fs::write(&real_path, "real line\n").unwrap();
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = true;
+        config.files.restore_session = true;
+        config.files.state_file = Some(state_file.display().to_string());
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        // Seed an existing session with `existing.log`.
+        let initial_session = Session {
+            version: 1,
+            active: 0,
+            tabs: vec![SavedTab {
+                path: existing_path.clone(),
+                query: "old".into(),
+                options: config.search.clone(),
+                bookmarks: BTreeSet::new(),
+                selected: 0,
+                follow: false,
+            }],
+            recent: vec![existing_path.clone()],
+            results_height: None,
+            zoom_percent: None,
+        };
+        initial_session.save(&state_file).unwrap();
+
+        // Opening only piped stdin takes priority over restore_session and does not clobber session.json.
+        let spool = StdinSpool::spawn_reader(std::io::Cursor::new(b"piped\n".to_vec())).unwrap();
+        let (stdin_only_view, vcx1) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_inputs(config.clone(), vec![InputSource::Stdin(spool)], window, cx)
+        });
+        vcx1.run_until_parked();
+        stdin_only_view.read_with(vcx1, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert!(view.tabs[0].is_stdin());
+            view.save_session(cx);
+        });
+        let after_stdin_only = Session::load(&state_file, &config).unwrap();
+        assert_eq!(after_stdin_only.tabs.len(), 1);
+        assert_eq!(after_stdin_only.tabs[0].path, existing_path);
+
+        // Opening stdin + a real file excludes stdin from session.json and adjusts `active`.
+        let spool2 = StdinSpool::spawn_reader(std::io::Cursor::new(b"piped2\n".to_vec())).unwrap();
+        let spool2_path = spool2.path().to_path_buf();
+        let (mixed_view, vcx2) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_inputs(
+                config.clone(),
+                vec![
+                    InputSource::Stdin(spool2),
+                    InputSource::File(real_path.clone()),
+                ],
+                window,
+                cx,
+            )
+        });
+        vcx2.run_until_parked();
+        mixed_view.read_with(vcx2, |view, cx| {
+            assert_eq!(view.tabs.len(), 2);
+            assert!(view.tabs[0].is_stdin());
+            assert!(!view.tabs[1].is_stdin());
+            assert_eq!(view.active, 1);
+            view.save_session(cx);
+        });
+        let saved_mixed = Session::load(&state_file, &config).unwrap();
+        let canonical_real = real_path.canonicalize().unwrap_or(real_path);
+        assert_eq!(saved_mixed.tabs.len(), 1);
+        assert_eq!(saved_mixed.tabs[0].path, canonical_real);
+        assert_eq!(saved_mixed.active, 0);
+        assert!(!saved_mixed.recent.contains(&spool2_path));
+        assert_eq!(saved_mixed.recent.first(), Some(&canonical_real));
     }
 }
