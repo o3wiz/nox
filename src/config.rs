@@ -177,6 +177,25 @@ impl Preset {
             None
         }
     }
+
+    /// Returns the pattern text ready to be embedded in a regex search (escaping regex
+    /// metacharacters when `self.mode == SearchMode::Literal`) along with the mapped UTF-8
+    /// byte range of `select_text` within that returned string.
+    pub fn regex_pattern_and_select_range(&self) -> (String, Option<std::ops::Range<usize>>) {
+        if self.mode == SearchMode::Regex {
+            return (self.pattern.clone(), self.select_text_range());
+        }
+        if let Some(raw_range) = self.select_text_range() {
+            let before = regex::escape(&self.pattern[..raw_range.start]);
+            let selected = regex::escape(&self.pattern[raw_range.start..raw_range.end]);
+            let after = regex::escape(&self.pattern[raw_range.end..]);
+            let start = before.len();
+            let end = start + selected.len();
+            (format!("{before}{selected}{after}"), Some(start..end))
+        } else {
+            (regex::escape(&self.pattern), None)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -278,6 +297,7 @@ pub enum Command {
     SwapSelectionAnchor,
     TogglePresets,
     ApplyPreset,
+    AppendPreset,
     IncreaseFilterHeight,
     DecreaseFilterHeight,
     ZoomIn,
@@ -305,6 +325,8 @@ pub enum KeyContext {
     FilePath,
     GoTo,
     Presets,
+    #[serde(rename = "Presets && RegexMode")]
+    PresetsRegexMode,
 }
 impl KeyContext {
     pub fn as_str(self) -> &'static str {
@@ -321,12 +343,14 @@ impl KeyContext {
             Self::FilePath => "FilePath",
             Self::GoTo => "GoTo",
             Self::Presets => "Presets",
+            Self::PresetsRegexMode => "Presets && RegexMode",
         }
     }
 
     pub fn predicate(self) -> &'static str {
         match self {
             Self::TextSelectedRegexMode => "RegexMode > TextSelected",
+            Self::PresetsRegexMode => "RegexMode > Presets",
             Self::TextInput => "EditableText",
             other => other.as_str(),
         }
@@ -340,7 +364,7 @@ impl KeyContext {
             Self::FilterLog => 1,
             Self::Search | Self::FilePath | Self::GoTo | Self::Presets => 1,
             Self::Selection | Self::TextSelected => 1,
-            Self::TextSelectedRegexMode => 2,
+            Self::TextSelectedRegexMode | Self::PresetsRegexMode => 2,
         }
     }
 }

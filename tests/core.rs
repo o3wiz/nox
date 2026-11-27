@@ -1683,3 +1683,133 @@ fn restore_closed_tab_default_binding_and_migration() {
         Command::RestoreClosedTab
     ));
 }
+
+#[test]
+fn preset_regex_pattern_and_select_range_escapes_literal_presets_and_maps_selection() {
+    use nox::config::{Preset, SearchMode};
+
+    // Regex preset is returned verbatim with its raw select_text range.
+    let regex_preset = Preset {
+        name: "Port".into(),
+        pattern: r"GET .* port=(PORT_NUM)\b".into(),
+        mode: SearchMode::Regex,
+        highlight_match: true,
+        select_text: Some("PORT_NUM".into()),
+    };
+    let (pattern, range) = regex_preset.regex_pattern_and_select_range();
+    assert_eq!(pattern, regex_preset.pattern);
+    let range = range.expect("regex select range");
+    assert_eq!(&pattern[range], "PORT_NUM");
+
+    // Literal preset without select_text escapes all regex metacharacters.
+    let literal_plain = Preset {
+        name: "Literal".into(),
+        pattern: "[ERR] req(1.2)+$a|b".into(),
+        mode: SearchMode::Literal,
+        highlight_match: true,
+        select_text: None,
+    };
+    let (pattern, range) = literal_plain.regex_pattern_and_select_range();
+    assert_eq!(pattern, regex::escape("[ERR] req(1.2)+$a|b"));
+    assert_eq!(range, None);
+    assert!(
+        regex::Regex::new(&pattern)
+            .unwrap()
+            .is_match("[ERR] req(1.2)+$a|b")
+    );
+
+    // Literal preset with metacharacters before AND inside select_text maps offsets accurately.
+    let literal_selectable = Preset {
+        name: "LiteralHost".into(),
+        pattern: "req[0] host=<HOST.NAME>+".into(),
+        mode: SearchMode::Literal,
+        highlight_match: false,
+        select_text: Some("<HOST.NAME>".into()),
+    };
+    let (pattern, range) = literal_selectable.regex_pattern_and_select_range();
+    assert_eq!(pattern, regex::escape("req[0] host=<HOST.NAME>+"));
+    let range = range.expect("mapped literal select range");
+    assert_eq!(&pattern[range], r"<HOST\.NAME>");
+
+    // Unicode literal preset preserves UTF-8 boundaries when escaping.
+    let literal_unicode = Preset {
+        name: "Unicode".into(),
+        pattern: "[שלום](ID).log".into(),
+        mode: SearchMode::Literal,
+        highlight_match: true,
+        select_text: Some("ID".into()),
+    };
+    let (pattern, range) = literal_unicode.regex_pattern_and_select_range();
+    assert_eq!(pattern, regex::escape("[שלום](ID).log"));
+    let range = range.expect("unicode literal select range");
+    assert_eq!(&pattern[range], "ID");
+}
+
+#[test]
+fn append_preset_default_binding_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    assert!(has_binding(
+        &defaults,
+        "secondary-enter",
+        KeyContext::PresetsRegexMode,
+        Command::AppendPreset
+    ));
+
+    // Migrating an older keyboard.json with Presets bindings adds secondary-enter in Presets && RegexMode.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "enter", "context": "Presets", "action": "apply_preset" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    assert!(has_binding(
+        &upgraded,
+        "secondary-enter",
+        KeyContext::PresetsRegexMode,
+        Command::AppendPreset
+    ));
+
+    // Custom rebindings for append_preset are preserved without adding secondary-enter.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "alt-enter", "context": "Presets && RegexMode", "action": "append_preset" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "alt-enter",
+        KeyContext::PresetsRegexMode,
+        Command::AppendPreset
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-enter",
+        KeyContext::PresetsRegexMode,
+        Command::AppendPreset
+    ));
+}

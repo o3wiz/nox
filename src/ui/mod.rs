@@ -163,14 +163,26 @@ fn sanitize_single_line_search_text(text: &str) -> String {
     text.replace(['\r', '\n'], "")
 }
 
-fn append_regex_alternative(existing: &str, selected: &str) -> String {
+fn ends_with_unescaped_pipe(pattern: &str) -> bool {
+    let Some(prefix) = pattern.strip_suffix('|') else {
+        return false;
+    };
+    let trailing_backslashes = prefix.bytes().rev().take_while(|&b| b == b'\\').count();
+    trailing_backslashes.is_multiple_of(2)
+}
+
+fn append_regex_alternative_with_offset(existing: &str, addition: &str) -> (String, usize) {
     if existing.is_empty() {
-        selected.to_owned()
-    } else if existing.ends_with('|') {
-        format!("{existing}{selected}")
+        (addition.to_owned(), 0)
+    } else if ends_with_unescaped_pipe(existing) {
+        (format!("{existing}{addition}"), existing.len())
     } else {
-        format!("{existing}|{selected}")
+        (format!("{existing}|{addition}"), existing.len() + 1)
     }
+}
+
+fn append_regex_alternative(existing: &str, selected: &str) -> String {
+    append_regex_alternative_with_offset(existing, selected).0
 }
 
 fn utf16_range_for_utf8(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
@@ -2449,6 +2461,10 @@ impl Workspace {
                 self.apply_selected_preset(window, cx);
                 return;
             }
+            Command::AppendPreset => {
+                self.append_selected_preset(window, cx);
+                return;
+            }
             Command::NextLine
             | Command::PreviousLine
             | Command::FirstLine
@@ -3579,27 +3595,34 @@ impl Workspace {
         }
     }
 
-    fn apply_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(preset) = self.config.search.presets.get(index).cloned() else {
+    fn append_selected_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_presets {
             return;
-        };
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.options.mode = preset.mode;
-            tab.options.highlight_matches = preset.highlight_match;
         }
-        self.show_goto = false;
-        self.dismiss_presets(cx);
-        self.preset_index = index;
-        if preset.select_text.is_some() {
-            if let Some(range) = preset.select_text_range() {
+        if let Some(matched) = self.filtered_presets.get(self.preset_index) {
+            self.append_preset(matched.index, window, cx);
+        }
+    }
+
+    fn finish_preset_to_search(
+        &mut self,
+        pattern: String,
+        select_range: Option<std::ops::Range<usize>>,
+        has_select_text: bool,
+        select_warning: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if has_select_text {
+            if let Some(range) = select_range {
                 let version = self.input.update(cx, |input, cx| {
-                    input.emplace(&preset.pattern, cx);
+                    input.emplace(&pattern, cx);
                     input.move_to(range.start, cx);
                     input.select_to(range.end, cx);
                     input.version()
                 });
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
-                let expected_utf16 = utf16_range_for_utf8(&preset.pattern, range.clone());
+                let expected_utf16 = utf16_range_for_utf8(&pattern, range.clone());
                 cx.on_next_frame(window, move |this, window, cx| {
                     if !this.input.read(cx).focus_handle(cx).is_focused(window) {
                         return;
@@ -3621,11 +3644,11 @@ impl Workspace {
                 });
             } else {
                 self.input.update(cx, |input, cx| {
-                    input.emplace(&preset.pattern, cx);
-                    input.move_to(preset.pattern.len(), cx);
+                    input.emplace(&pattern, cx);
+                    input.move_to(pattern.len(), cx);
                 });
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
-                if let Some(warning) = preset.select_text_warning() {
+                if let Some(warning) = select_warning {
                     self.status = Some(StatusMessage::warning(warning));
                 }
             }
@@ -3633,9 +3656,77 @@ impl Workspace {
             return;
         }
         self.input
-            .update(cx, |input, cx| input.emplace(&preset.pattern, cx));
+            .update(cx, |input, cx| input.emplace(&pattern, cx));
         self.start_search(self.active, cx);
         self.focus_visible_pane(self.active_pane, window, cx);
+    }
+
+    fn apply_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preset) = self.config.search.presets.get(index).cloned() else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.options.mode = preset.mode;
+            tab.options.highlight_matches = preset.highlight_match;
+        }
+        self.show_goto = false;
+        self.dismiss_presets(cx);
+        self.preset_index = index;
+        let select_range = preset.select_text_range();
+        let has_select_text = preset.select_text.is_some();
+        let select_warning = preset.select_text_warning();
+        self.finish_preset_to_search(
+            preset.pattern,
+            select_range,
+            has_select_text,
+            select_warning,
+            window,
+            cx,
+        );
+    }
+
+    fn append_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.options.mode != SearchMode::Regex {
+            return;
+        }
+        let Some(preset) = self.config.search.presets.get(index).cloned() else {
+            return;
+        };
+        if preset.pattern.is_empty() {
+            self.status = Some(StatusMessage::warning(format!(
+                "Preset {:?} has an empty pattern",
+                preset.name
+            )));
+            self.dismiss_presets(cx);
+            cx.notify();
+            return;
+        }
+        let existing = self.input.read(cx).as_str().to_owned();
+        if existing.is_empty()
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.options.highlight_matches = preset.highlight_match;
+        }
+        let (addition, raw_select_range) = preset.regex_pattern_and_select_range();
+        let (combined, offset) = append_regex_alternative_with_offset(&existing, &addition);
+        let shifted_range =
+            raw_select_range.map(|range| (range.start + offset)..(range.end + offset));
+        self.show_goto = false;
+        self.dismiss_presets(cx);
+        self.preset_index = index;
+        let has_select_text = preset.select_text.is_some();
+        let select_warning = preset.select_text_warning();
+        self.finish_preset_to_search(
+            combined,
+            shifted_range,
+            has_select_text,
+            select_warning,
+            window,
+            cx,
+        );
     }
 
     fn navigate_presets(&mut self, command: Command, cx: &mut Context<Self>) {
@@ -5923,6 +6014,8 @@ impl Workspace {
             .child(trigger);
 
         if is_open {
+            let regex_mode = options.mode == SearchMode::Regex;
+            let append_shortcut = t.shortcut(Command::AppendPreset);
             let results_h = self.effective_results_height(window);
             let status_h = if self.config.window.show_status_bar {
                 26.0
@@ -6117,8 +6210,12 @@ impl Workspace {
                                     cx.notify();
                                 }
                             }))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.apply_preset(preset_index, window, cx);
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                if regex_mode && event.modifiers().secondary() {
+                                    this.append_preset(preset_index, window, cx);
+                                } else {
+                                    this.apply_preset(preset_index, window, cx);
+                                }
                             }))
                             .child(
                                 div()
@@ -6183,7 +6280,73 @@ impl Workspace {
                                                     .text_size(px(10.))
                                                     .text_color(t.muted)
                                                     .child(mode_label),
-                                            ),
+                                            )
+                                            .when(regex_mode, |el| {
+                                                let append_tip_theme = t.clone();
+                                                let append_tip_shortcut = append_shortcut.clone();
+                                                let append_hover_bg = t.accent_subtle;
+                                                let append_hover_border = t.accent_border;
+                                                let append_hover_fg = t.accent;
+                                                let append_group = SharedString::from(format!(
+                                                    "preset-append-{preset_index}"
+                                                ));
+                                                el.child(
+                                                    div()
+                                                        .id(("preset-append", preset_index))
+                                                        .group(append_group.clone())
+                                                        .debug_selector(move || {
+                                                            format!("preset-append-{preset_index}")
+                                                        })
+                                                        .size(px(20.))
+                                                        .rounded_sm()
+                                                        .border_1()
+                                                        .border_color(t.border)
+                                                        .bg(t.background)
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .cursor_pointer()
+                                                        .hover(move |s| {
+                                                            s.bg(append_hover_bg)
+                                                                .border_color(append_hover_border)
+                                                        })
+                                                        .child(
+                                                            Icon::Plus
+                                                                .element(px(11.), t.muted)
+                                                                .group_hover(
+                                                                    append_group,
+                                                                    move |s| {
+                                                                        s.text_color(
+                                                                            append_hover_fg,
+                                                                        )
+                                                                    },
+                                                                ),
+                                                        )
+                                                        .tooltip_show_delay(TOOLTIP_DELAY)
+                                                        .tooltip(move |_window, cx| {
+                                                            Tooltip::view(
+                                                                "Append to search (|)",
+                                                                append_tip_shortcut.clone(),
+                                                                append_tip_theme.clone(),
+                                                                cx,
+                                                            )
+                                                        })
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            |_, _, cx| cx.stop_propagation(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                cx.stop_propagation();
+                                                                this.append_preset(
+                                                                    preset_index,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                            }),
                                     ),
                             )
                             .child(
@@ -6262,10 +6425,19 @@ impl Workspace {
                         )
                         .child(
                             div()
+                                .debug_selector(|| "presets-header-hint".into())
                                 .font(t.mono_font_spec())
                                 .text_size(px(10.))
                                 .text_color(t.muted)
-                                .child("↑↓ ↵"),
+                                .child(if regex_mode {
+                                    if let Some(shortcut) = &append_shortcut {
+                                        SharedString::from(format!("↑↓ ↵ · {shortcut} +"))
+                                    } else {
+                                        SharedString::from("↑↓ ↵ · +")
+                                    }
+                                } else {
+                                    SharedString::from("↑↓ ↵")
+                                }),
                         ),
                 )
                 .child(search_field)
@@ -16213,5 +16385,462 @@ mod tests {
         assert_eq!(saved_mixed.active, 0);
         assert!(!saved_mixed.recent.contains(&spool2_path));
         assert_eq!(saved_mixed.recent.first(), Some(&canonical_real));
+    }
+
+    #[test]
+    fn append_regex_alternative_handles_empty_plain_and_escaped_trailing_pipes() {
+        assert_eq!(
+            append_regex_alternative_with_offset("", "foo"),
+            ("foo".into(), 0)
+        );
+        assert_eq!(
+            append_regex_alternative_with_offset("alpha", "beta"),
+            ("alpha|beta".into(), 6)
+        );
+        // Unescaped trailing pipe does not produce `||`.
+        assert_eq!(
+            append_regex_alternative_with_offset("alpha|", "beta"),
+            ("alpha|beta".into(), 6)
+        );
+        // Escaped literal trailing pipe (`\|`) MUST still get an alternation separator.
+        assert_eq!(
+            append_regex_alternative_with_offset(r"alpha\|", "beta"),
+            (r"alpha\||beta".into(), 8)
+        );
+        // Escaped backslash followed by real pipe (`\\|`) does not produce `||`.
+        assert_eq!(
+            append_regex_alternative_with_offset(r"alpha\\|", "beta"),
+            (r"alpha\\|beta".into(), 8)
+        );
+        // Three backslashes + pipe (`\\\|`) is an escaped pipe, so separator is added.
+        assert_eq!(
+            append_regex_alternative_with_offset(r"alpha\\\|", "beta"),
+            (r"alpha\\\||beta".into(), 10)
+        );
+    }
+
+    #[gpui::test]
+    fn appending_presets_in_regex_mode_escapes_literals_runs_search_and_respects_mode_and_ui(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        let literal_special = "[WARN] req(1.2)+$a|b";
+        config.search.presets = vec![
+            config::Preset {
+                name: "Errors".into(),
+                pattern: "ERROR|FATAL".into(),
+                mode: SearchMode::Regex,
+                highlight_match: false,
+                select_text: None,
+            },
+            config::Preset {
+                name: "SpecialWarn".into(),
+                pattern: literal_special.into(),
+                mode: SearchMode::Literal,
+                highlight_match: false,
+                select_text: None,
+            },
+            config::Preset {
+                name: "DebugTag".into(),
+                pattern: "DEBUG".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+                select_text: None,
+            },
+            config::Preset {
+                name: "Empty".into(),
+                pattern: String::new(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                select_text: None,
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("append-presets.log");
+        std::fs::write(
+            &path,
+            format!("INFO boot\nERROR fail\n{literal_special}\nDEBUG trace\nINFO a|b literal\n"),
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.tabs[0].options.highlight_matches = true;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.input.update(cx, |input, cx| input.emplace("INFO", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let (presets_key, append_key) = if cfg!(target_os = "macos") {
+            ("cmd-p", "cmd-enter")
+        } else {
+            ("ctrl-p", "ctrl-enter")
+        };
+
+        // 1. In Literal mode: inline `+` buttons are absent, secondary-enter is a no-op,
+        //    and secondary-click falls back to normal apply.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("preset-append-0").is_none());
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), "INFO");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+        });
+
+        // 2. Switch to Regex mode with active search "INFO" and highlight_matches = true.
+        //    Inline `+` buttons are now rendered, and secondary-enter appends "ERROR|FATAL",
+        //    runs the search immediately, closes dropdown, focuses log, and keeps highlight_matches = true.
+        view.update_in(cx, |view, window, cx| {
+            view.close_presets(window, cx);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.tabs[0].options.highlight_matches = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("preset-append-0").is_some());
+        assert!(cx.debug_bounds("presets-header-hint").is_some());
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), "INFO|ERROR|FATAL");
+            assert_eq!(view.tabs[0].query, "INFO|ERROR|FATAL");
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 4]);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(
+                view.tabs[0].options.highlight_matches,
+                "appending to non-empty search must preserve existing highlight_matches"
+            );
+            assert!(view.focus.is_focused(window));
+        });
+
+        // 3. Clicking the inline `+` button on a Literal preset escapes regex metacharacters
+        //    and appends it without triggering apply_preset.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        let plus_pos = cx
+            .debug_bounds("preset-append-1")
+            .expect("inline append button for literal preset")
+            .center();
+        cx.simulate_click(plus_pos, Modifiers::none());
+        cx.run_until_parked();
+        let escaped_special = regex::escape(literal_special);
+        let expected_after_plus = format!("INFO|ERROR|FATAL|{escaped_special}");
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), expected_after_plus);
+            assert_eq!(view.tabs[0].query, expected_after_plus);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2, 4]);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+
+        // 4. Secondary+Click on a preset row appends it cleanly.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        let item2_bounds = cx.debug_bounds("preset-item-2").expect("preset item 2");
+        // Click near the left side of the row (away from the inline `+` button).
+        let row_click = point(item2_bounds.origin.x + px(24.), item2_bounds.center().y);
+        cx.simulate_click(row_click, Modifiers::secondary_key());
+        cx.run_until_parked();
+        let expected_after_sec_click = format!("{expected_after_plus}|DEBUG");
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), expected_after_sec_click);
+            assert_eq!(view.tabs[0].query, expected_after_sec_click);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2, 3, 4]);
+        });
+
+        // 5. Appending into an empty search box inserts without leading `|`, still escapes
+        //    literal presets, keeps Regex mode, and adopts the preset's highlight_match.
+        view.update(cx, |view, cx| {
+            view.input.update(cx, |input, cx| input.emplace("", cx));
+            view.tabs[0].options.highlight_matches = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), escaped_special);
+            assert_eq!(view.tabs[0].query, escaped_special);
+            assert_eq!(view.tabs[0].results.matches, vec![2]);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(
+                !view.tabs[0].options.highlight_matches,
+                "appending into empty search should adopt preset highlight_match"
+            );
+        });
+
+        // 6. Escaped trailing pipe (`a\|`) gets a separator (`a\||DEBUG`), whereas unescaped
+        //    trailing pipe (`ERROR|`) does not produce `||`.
+        view.update(cx, |view, cx| {
+            view.input.update(cx, |input, cx| input.emplace(r"a\|", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(2, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), r"a\||DEBUG");
+            assert_eq!(view.tabs[0].results.matches, vec![2, 3, 4]);
+        });
+
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR|", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(2, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "ERROR|DEBUG");
+            assert_eq!(view.tabs[0].results.matches, vec![1, 3]);
+        });
+
+        // 7. Empty preset pattern is ignored safely with a warning and does not add trailing `|`.
+        view.update_in(cx, |view, window, cx| view.append_preset(3, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "ERROR|DEBUG");
+            assert!(
+                view.status
+                    .as_ref()
+                    .is_some_and(|s| s.tone == StatusTone::Warning)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn appending_selectable_preset_shifts_and_escapes_selection_and_defers_search(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "Port".into(),
+                pattern: "port=PORT_NUM".into(),
+                mode: SearchMode::Regex,
+                highlight_match: false,
+                select_text: Some("PORT_NUM".into()),
+            },
+            config::Preset {
+                name: "LiteralHost".into(),
+                pattern: "[שלום] host=<HOST.NAME>".into(),
+                mode: SearchMode::Literal,
+                highlight_match: false,
+                select_text: Some("<HOST.NAME>".into()),
+            },
+            config::Preset {
+                name: "BadSelect".into(),
+                pattern: "WARN".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                select_text: Some("MISSING".into()),
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("append-selectable-presets.log");
+        std::fs::write(
+            &path,
+            "ERROR init\nGET / port=8080\n[שלום] host=api.prod\nWARN disk\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.tabs[0].options.highlight_matches = true;
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+
+        let selected_range = |input: &Entity<EditableTextState>,
+                              window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        let (presets_key, append_key) = if cfg!(target_os = "macos") {
+            ("cmd-p", "cmd-enter")
+        } else {
+            ("ctrl-p", "ctrl-enter")
+        };
+
+        // 1. Append regex preset with `select_text`: shifts selection past "ERROR|",
+        //    focuses search box, keeps highlight_matches, and defers running search.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            let expected = "ERROR|port=PORT_NUM";
+            assert_eq!(view.input.read(cx).as_str(), expected);
+            assert_eq!(
+                selected_range(&view.input, window, cx),
+                utf16_range_for_utf8(expected, 11..19)
+            );
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+
+        // Typing replaces only the selected placeholder, and Enter runs the combined search.
+        cx.simulate_input("8080");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "ERROR|port=8080");
+            assert_eq!(view.tabs[0].query, "ERROR|port=8080");
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1]);
+        });
+
+        // 2. Append literal preset with Unicode + metacharacters before & inside `select_text`:
+        //    escapes literal pattern and selects the exact escaped placeholder range.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        let expected_combined = r"ERROR|port=8080|\[שלום\] host=<HOST\.NAME>";
+        let start = expected_combined.find(r"<HOST\.NAME>").unwrap();
+        let end = start + r"<HOST\.NAME>".len();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), expected_combined);
+            assert_eq!(
+                selected_range(&view.input, window, cx),
+                utf16_range_for_utf8(expected_combined, start..end)
+            );
+            assert_eq!(view.tabs[0].query, "ERROR|port=8080");
+        });
+
+        // Replacing the selected escaped placeholder and pressing Enter matches the Unicode line.
+        cx.simulate_input(r"api\.prod");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].query,
+                r"ERROR|port=8080|\[שלום\] host=api\.prod"
+            );
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2]);
+        });
+
+        // 3. Selectable preset with missing `select_text` appends, places caret at end, warns, and defers search.
+        view.update_in(cx, |view, window, cx| view.append_preset(2, window, cx));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let expected = r"ERROR|port=8080|\[שלום\] host=api\.prod|WARN";
+            assert_eq!(view.input.read(cx).as_str(), expected);
+            let end_utf16 = expected.encode_utf16().count();
+            assert_eq!(
+                selected_range(&view.input, window, cx),
+                end_utf16..end_utf16
+            );
+            assert!(
+                view.status
+                    .as_ref()
+                    .is_some_and(|s| s.tone == StatusTone::Warning)
+            );
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2]);
+        });
+    }
+
+    #[gpui::test]
+    fn presets_regex_mode_context_precedence_is_independent_of_binding_order(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Intentionally register `Presets && RegexMode` BEFORE `Presets` for the same key.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-enter".into(),
+            context: config::KeyContext::PresetsRegexMode,
+            action: Command::AppendPreset,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-enter".into(),
+            context: config::KeyContext::Presets,
+            action: Command::ApplyPreset,
+        });
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("presets-precedence.log");
+        std::fs::write(&path, "INFO boot\nERROR fail\nWARN disk\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.input.update(cx, |input, cx| input.emplace("INFO", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // In Regex mode, `Presets && RegexMode` (AppendPreset) wins over `Presets` (ApplyPreset).
+        view.update_in(cx, |view, window, cx| view.toggle_presets(window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "INFO|error|fatal|panic");
+        });
+
+        // In Literal mode, `Presets` (ApplyPreset) wins.
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.input.update(cx, |input, cx| input.emplace("INFO", cx));
+            view.toggle_presets(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "error|fatal|panic");
+        });
     }
 }

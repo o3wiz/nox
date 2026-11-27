@@ -332,6 +332,11 @@
       "context": "Presets"
     },
     {
+      "keys": "secondary-enter",
+      "action": "append_preset",
+      "context": "Presets && RegexMode"
+    },
+    {
       "keys": "escape",
       "action": "focus_log",
       "context": "Presets"
