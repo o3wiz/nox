@@ -17,6 +17,11 @@
       "context": "Workspace"
     },
     {
+      "keys": "secondary-shift-t",
+      "action": "restore_closed_tab",
+      "context": "Workspace"
+    },
+    {
       "keys": "ctrl-tab",
       "action": "next_tab",
       "context": "Workspace"

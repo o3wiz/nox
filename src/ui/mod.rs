@@ -50,7 +50,7 @@ use selectable_text::{RowLayoutCache, SelectableRowText, TextPressEvent};
 use serde::Deserialize;
 use std::{
     cell::Cell,
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashSet, VecDeque},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -181,6 +181,7 @@ fn utf16_range_for_utf8(text: &str, range: std::ops::Range<usize>) -> std::ops::
 const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BULK_BOOKMARK_LINES: usize = 100_000;
 const SEARCH_INDICATOR_DELAY: Duration = Duration::from_millis(150);
+const MAX_CLOSED_TABS: usize = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
@@ -251,6 +252,58 @@ struct Tab {
 }
 
 impl Tab {
+    fn new(id: usize, path: PathBuf, options: SearchConfig, follow: bool) -> Self {
+        Self {
+            id,
+            path,
+            log: None,
+            loading: false,
+            searching: false,
+            searching_since: None,
+            searching_visible: false,
+            load_cancel: Arc::new(AtomicBool::new(false)),
+            search_cancel: Arc::new(AtomicBool::new(false)),
+            revision: 0,
+            query: String::new(),
+            options,
+            highlight_regex: None,
+            results: SearchResults::default(),
+            bookmarks: BTreeSet::new(),
+            selected: 0,
+            main_selection: LineSelection::single(0),
+            result_selection: LineSelection::empty(),
+            main_text_selection: None,
+            result_text_selection: None,
+            follow,
+            scroll: UniformListScrollHandle::new(),
+            result_scroll: UniformListScrollHandle::new(),
+            pending_main_reveal: None,
+            pending_results_reveal: None,
+            error: None,
+        }
+    }
+
+    fn to_saved(&self, query: String) -> SavedTab {
+        SavedTab {
+            path: self.path.clone(),
+            query,
+            options: self.options.clone(),
+            bookmarks: self.bookmarks.clone(),
+            selected: self.selected,
+            follow: self.follow,
+        }
+    }
+
+    fn apply_saved(&mut self, saved: SavedTab) {
+        self.query = saved.query;
+        self.options = saved.options;
+        self.sync_highlight_regex();
+        self.bookmarks = saved.bookmarks;
+        self.selected = saved.selected;
+        self.main_selection = LineSelection::single(saved.selected);
+        self.follow = saved.follow;
+    }
+
     fn sync_highlight_regex(&mut self) {
         self.highlight_regex = if self.query.is_empty() || self.options.invert {
             None
@@ -284,6 +337,11 @@ impl Drop for Tab {
         self.load_cancel.store(true, Ordering::Relaxed);
         self.search_cancel.store(true, Ordering::Relaxed);
     }
+}
+
+struct ClosedTab {
+    index: usize,
+    saved: SavedTab,
 }
 
 enum Message {
@@ -340,6 +398,7 @@ pub struct Workspace {
     theme: Theme,
     highlights: Vec<(Regex, u32)>,
     tabs: Vec<Tab>,
+    closed_tabs: VecDeque<ClosedTab>,
     active: usize,
     next_id: usize,
     input: Entity<EditableTextState>,
@@ -530,6 +589,7 @@ impl Workspace {
             config,
             highlights,
             tabs: Vec::new(),
+            closed_tabs: VecDeque::new(),
             active: 0,
             next_id: 0,
             input: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
@@ -594,13 +654,7 @@ impl Workspace {
         }
         if restore {
             for (tab, saved) in this.tabs.iter_mut().zip(saved.tabs) {
-                tab.query = saved.query;
-                tab.options = saved.options;
-                tab.sync_highlight_regex();
-                tab.bookmarks = saved.bookmarks;
-                tab.selected = saved.selected;
-                tab.main_selection = LineSelection::single(saved.selected);
-                tab.follow = saved.follow;
+                tab.apply_saved(saved);
             }
             this.active = saved.active.min(this.tabs.len().saturating_sub(1));
             let query = this
@@ -647,17 +701,13 @@ impl Workspace {
                 .tabs
                 .iter()
                 .enumerate()
-                .map(|(index, tab)| SavedTab {
-                    path: tab.path.clone(),
-                    query: if index == self.active {
+                .map(|(index, tab)| {
+                    let query = if index == self.active {
                         self.input.read(cx).as_str().to_owned()
                     } else {
                         tab.query.clone()
-                    },
-                    options: tab.options.clone(),
-                    bookmarks: tab.bookmarks.clone(),
-                    selected: tab.selected,
-                    follow: tab.follow,
+                    };
+                    tab.to_saved(query)
                 })
                 .collect(),
         };
@@ -677,41 +727,23 @@ impl Workspace {
         self.recent.truncate(self.config.files.recent_limit);
         self.show_files = false;
         self.next_id += 1;
-        self.tabs.push(Tab {
-            id: self.next_id,
+        self.tabs.push(Tab::new(
+            self.next_id,
             path,
-            log: None,
-            loading: false,
-            searching: false,
-            searching_since: None,
-            searching_visible: false,
-            load_cancel: Arc::new(AtomicBool::new(false)),
-            search_cancel: Arc::new(AtomicBool::new(false)),
-            revision: 0,
-            query: String::new(),
-            options: self.config.search.clone(),
-            highlight_regex: None,
-            results: SearchResults::default(),
-            bookmarks: BTreeSet::new(),
-            selected: 0,
-            main_selection: LineSelection::single(0),
-            result_selection: LineSelection::empty(),
-            main_text_selection: None,
-            result_text_selection: None,
-            follow: self.config.viewer.follow,
-            scroll: UniformListScrollHandle::new(),
-            result_scroll: UniformListScrollHandle::new(),
-            pending_main_reveal: None,
-            pending_results_reveal: None,
-            error: None,
-        });
+            self.config.search.clone(),
+            self.config.viewer.follow,
+        ));
         self.switch(self.tabs.len() - 1, cx);
         self.load(self.active);
         cx.notify();
     }
 
     fn switch(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
+        self.activate_tab(index, true, cx);
+    }
+
+    fn activate_tab(&mut self, index: usize, save_current_query: bool, cx: &mut Context<Self>) {
+        if save_current_query && let Some(tab) = self.tabs.get_mut(self.active) {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.active = index;
@@ -736,13 +768,56 @@ impl Workspace {
         cx.notify();
     }
 
+    fn record_closed_tab(&mut self, index: usize, tab: &Tab) {
+        self.closed_tabs
+            .retain(|closed| closed.saved.path != tab.path);
+        if self.closed_tabs.len() >= MAX_CLOSED_TABS {
+            self.closed_tabs.pop_front();
+        }
+        self.closed_tabs.push_back(ClosedTab {
+            index,
+            saved: tab.to_saved(tab.query.clone()),
+        });
+    }
+
+    fn restore_closed_tab(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = loop {
+            let Some(entry) = self.closed_tabs.pop_back() else {
+                return false;
+            };
+            if !self.tabs.iter().any(|tab| tab.path == entry.saved.path) {
+                break entry;
+            }
+        };
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.query = self.input.read(cx).as_str().to_string();
+        }
+        let path = closed.saved.path.clone();
+        self.recent.retain(|recent| recent != &path);
+        self.recent.insert(0, path.clone());
+        self.recent.truncate(self.config.files.recent_limit);
+        self.show_files = false;
+        self.show_goto = false;
+        self.next_id += 1;
+        let mut tab = Tab::new(
+            self.next_id,
+            path,
+            self.config.search.clone(),
+            self.config.viewer.follow,
+        );
+        tab.apply_saved(closed.saved);
+        let insert_index = closed.index.min(self.tabs.len());
+        self.tabs.insert(insert_index, tab);
+        self.activate_tab(insert_index, false, cx);
+        self.load(insert_index);
+        true
+    }
+
     fn close_tab_at(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
-        if index != self.active
-            && let Some(tab) = self.tabs.get_mut(self.active)
-        {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.header_click_armed = false;
@@ -756,7 +831,8 @@ impl Workspace {
         self.clear_row_layouts();
         self.dismiss_presets(cx);
         self.close_path_completions();
-        self.tabs.remove(index);
+        let removed = self.tabs.remove(index);
+        self.record_closed_tab(index, &removed);
         if self.tabs.is_empty() {
             self.active = 0;
             self.active_pane = Pane::Main;
@@ -2538,6 +2614,9 @@ impl Workspace {
                 if self.tabs.is_empty() {
                     self.focus.focus(window, cx);
                 }
+            }
+            Command::RestoreClosedTab => {
+                self.restore_closed_tab(cx);
             }
             Command::NextTab => {
                 if !self.tabs.is_empty() {
@@ -15503,6 +15582,227 @@ mod tests {
                     < 0.5,
                 "cmd-left in Search input must not reset log horizontal scroll"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn restore_closed_tab_reopens_closed_tabs_in_lifo_order_with_state_and_position(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let restore_key = if cfg!(target_os = "macos") {
+            "cmd-shift-t"
+        } else {
+            "ctrl-shift-t"
+        };
+        let close_key = if cfg!(target_os = "macos") {
+            "cmd-w"
+        } else {
+            "ctrl-w"
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        let third = directory.path().join("third.log");
+        std::fs::write(&first, "alpha\nERROR one\nomega\n").unwrap();
+        std::fs::write(&second, "beta\nWARN two\nWARN three\n").unwrap();
+        std::fs::write(&third, "gamma\nINFO four\n").unwrap();
+        let first_canon = first.canonicalize().unwrap();
+        let second_canon = second.canonicalize().unwrap();
+        let third_canon = third.canonicalize().unwrap();
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(
+                config,
+                vec![first.clone(), second.clone(), third.clone()],
+                window,
+                cx,
+            )
+        });
+        for index in 0..3 {
+            wait_for_tab_loaded(&view, index, cx);
+        }
+
+        // Default shortcut label is populated for RestoreClosedTab.
+        view.read_with(cx, |view, _| {
+            let expected = if cfg!(target_os = "macos") {
+                "⌘⇧T"
+            } else {
+                "Ctrl+Shift+T"
+            };
+            assert_eq!(
+                view.theme.shortcut(Command::RestoreClosedTab).as_deref(),
+                Some(expected)
+            );
+        });
+
+        // No-op when no tab has been closed yet.
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 3);
+            assert_eq!(view.active, 2);
+        });
+
+        // Customize state on all three tabs and make tab 1 (second.log) active.
+        view.update(cx, |view, cx| {
+            view.tabs[0].query = "ERROR".into();
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.tabs[0].options.case_sensitive = true;
+            view.tabs[0].bookmarks = BTreeSet::from([0, 2]);
+            view.tabs[0].selected = 1;
+            view.tabs[0].follow = false;
+
+            view.tabs[1].query = "WARN".into();
+            view.tabs[1].options.mode = SearchMode::Regex;
+            view.tabs[1].options.whole_word = true;
+            view.tabs[1].options.invert = false;
+            view.tabs[1].options.highlight_matches = false;
+            view.tabs[1].bookmarks = BTreeSet::from([2]);
+            view.tabs[1].selected = 2;
+            view.tabs[1].follow = true;
+
+            view.tabs[2].query = "INFO".into();
+            view.tabs[2].selected = 1;
+
+            view.switch(1, cx);
+            // Edit the active tab's search input without committing a search yet to ensure
+            // closing captures the live input value.
+            view.input.update(cx, |input, cx| input.emplace("WARN", cx));
+        });
+        cx.run_until_parked();
+
+        // Close middle tab (index 1, second.log) with secondary-w.
+        cx.simulate_keystrokes(close_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, third_canon);
+        });
+
+        // Switch to first.log (index 0), type an updated query in search input, and close it.
+        view.update(cx, |view, cx| {
+            view.switch(0, cx);
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].path, third_canon);
+        });
+
+        // First secondary-shift-t restores first.log (LIFO) at its original index 0 with state.
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, third_canon);
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.input.read(cx).as_str(), "ERROR");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                first_canon.display().to_string()
+            );
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.case_sensitive);
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0, 2]));
+            assert_eq!(view.tabs[0].selected, 1);
+            assert!(!view.tabs[0].follow);
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+        });
+
+        // Works while search input is focused (Workspace context): second secondary-shift-t
+        // restores second.log at its original index 1 between first.log and third.log.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 1, cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 3);
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, second_canon);
+            assert_eq!(view.tabs[2].path, third_canon);
+            assert_eq!(view.tabs[1].query, "WARN");
+            assert_eq!(view.input.read(cx).as_str(), "WARN");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                second_canon.display().to_string()
+            );
+            assert_eq!(view.tabs[1].options.mode, SearchMode::Regex);
+            assert!(view.tabs[1].options.whole_word);
+            assert!(!view.tabs[1].options.highlight_matches);
+            assert_eq!(view.tabs[1].bookmarks, BTreeSet::from([2]));
+            assert_eq!(view.tabs[1].selected, 2);
+            assert!(view.tabs[1].follow);
+            assert_eq!(view.tabs[1].results.matches, vec![1, 2]);
+            // Previously active tab's query (first.log) was preserved when switching.
+            assert_eq!(view.tabs[0].query, "ERROR");
+        });
+
+        // Close all remaining tabs down to the empty workspace, then restore from empty state.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Main, window, cx);
+        });
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.simulate_keystrokes(close_key);
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs.is_empty());
+            assert_eq!(view.input.read(cx).as_str(), "");
+        });
+
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.input.read(cx).as_str(), "ERROR");
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+        });
+
+        // If a closed tab was manually reopened in the meantime, RestoreClosedTab skips it and
+        // restores the next still-closed tab without duplicating the already-open file.
+        // Remaining closed stack has [second.log, third.log] (third.log on top).
+        view.update(cx, |view, cx| {
+            view.open(third.clone(), cx);
+        });
+        wait_for_tab_loaded(&view, 1, cx);
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 3);
+            let paths: Vec<_> = view.tabs.iter().map(|tab| tab.path.clone()).collect();
+            assert!(paths.contains(&first_canon));
+            assert!(paths.contains(&second_canon));
+            assert!(paths.contains(&third_canon));
+            assert_eq!(view.tabs[view.active].path, second_canon);
         });
     }
 }

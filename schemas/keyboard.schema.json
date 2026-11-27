@@ -57,6 +57,7 @@
       "enum": [
         "open",
         "close_tab",
+        "restore_closed_tab",
         "next_tab",
         "previous_tab",
         "search",

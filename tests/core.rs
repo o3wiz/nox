@@ -1614,3 +1614,72 @@ fn reset_horizontal_scroll_default_binding_and_migration() {
         Command::ResetHorizontalScroll
     ));
 }
+
+#[test]
+fn restore_closed_tab_default_binding_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    assert!(has_binding(
+        &defaults,
+        "secondary-shift-t",
+        KeyContext::Workspace,
+        Command::RestoreClosedTab
+    ));
+
+    // Migrating an older keyboard.json with close_tab adds secondary-shift-t -> restore_closed_tab.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "secondary-w", "context": "Workspace", "action": "close_tab" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    assert!(has_binding(
+        &upgraded,
+        "secondary-shift-t",
+        KeyContext::Workspace,
+        Command::RestoreClosedTab
+    ));
+
+    // Custom rebindings for restore_closed_tab are preserved without adding secondary-shift-t.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "secondary-alt-t", "context": "Workspace", "action": "restore_closed_tab" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "secondary-alt-t",
+        KeyContext::Workspace,
+        Command::RestoreClosedTab
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-shift-t",
+        KeyContext::Workspace,
+        Command::RestoreClosedTab
+    ));
+}

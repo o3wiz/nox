@@ -225,6 +225,7 @@ pub struct FilesConfig {
 pub enum Command {
     Open,
     CloseTab,
+    RestoreClosedTab,
     NextTab,
     PreviousTab,
     Search,
