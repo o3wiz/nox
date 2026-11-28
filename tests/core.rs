@@ -1828,11 +1828,11 @@ fn tab_switch_and_move_default_bindings_and_migration() {
 
     for (keys, action) in [
         ("ctrl-tab", Command::NextTab),
-        ("ctrl-pageup", Command::NextTab),
+        ("ctrl-pagedown", Command::NextTab),
         ("ctrl-shift-tab", Command::PreviousTab),
-        ("ctrl-pagedown", Command::PreviousTab),
-        ("ctrl-shift-pageup", Command::MoveTabNext),
-        ("ctrl-shift-pagedown", Command::MoveTabPrevious),
+        ("ctrl-pageup", Command::PreviousTab),
+        ("ctrl-shift-pagedown", Command::MoveTabNext),
+        ("ctrl-shift-pageup", Command::MoveTabPrevious),
     ] {
         assert!(
             has_binding(&defaults, keys, KeyContext::Workspace, action),
@@ -1840,8 +1840,8 @@ fn tab_switch_and_move_default_bindings_and_migration() {
         );
     }
 
-    // Migrating an older keyboard.json with ctrl-tab/ctrl-shift-tab adds ctrl-pageup/ctrl-pagedown
-    // for tab switching and ctrl-shift-pageup/ctrl-shift-pagedown for tab relocation.
+    // Migrating an older keyboard.json with ctrl-tab/ctrl-shift-tab adds ctrl-pagedown/ctrl-pageup
+    // for tab switching and ctrl-shift-pagedown/ctrl-shift-pageup for tab relocation.
     let upgrade_dir = tempdir().unwrap();
     fs::write(
         upgrade_dir.path().join("keyboard.json"),
@@ -1859,11 +1859,11 @@ fn tab_switch_and_move_default_bindings_and_migration() {
     let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
     for (keys, action) in [
         ("ctrl-tab", Command::NextTab),
-        ("ctrl-pageup", Command::NextTab),
+        ("ctrl-pagedown", Command::NextTab),
         ("ctrl-shift-tab", Command::PreviousTab),
-        ("ctrl-pagedown", Command::PreviousTab),
-        ("ctrl-shift-pageup", Command::MoveTabNext),
-        ("ctrl-shift-pagedown", Command::MoveTabPrevious),
+        ("ctrl-pageup", Command::PreviousTab),
+        ("ctrl-shift-pagedown", Command::MoveTabNext),
+        ("ctrl-shift-pageup", Command::MoveTabPrevious),
     ] {
         assert!(
             has_binding(&upgraded, keys, KeyContext::Workspace, action),
@@ -1880,8 +1880,8 @@ fn tab_switch_and_move_default_bindings_and_migration() {
   "bindings": [
     { "keys": "alt-]", "context": "Workspace", "action": "next_tab" },
     { "keys": "alt-[", "context": "Workspace", "action": "previous_tab" },
-    { "keys": "alt-pageup", "context": "Workspace", "action": "move_tab_next" },
-    { "keys": "alt-pagedown", "context": "Workspace", "action": "move_tab_previous" }
+    { "keys": "alt-pagedown", "context": "Workspace", "action": "move_tab_next" },
+    { "keys": "alt-pageup", "context": "Workspace", "action": "move_tab_previous" }
   ]
 }"#,
     )
@@ -1891,8 +1891,8 @@ fn tab_switch_and_move_default_bindings_and_migration() {
     for (keys, action) in [
         ("alt-]", Command::NextTab),
         ("alt-[", Command::PreviousTab),
-        ("alt-pageup", Command::MoveTabNext),
-        ("alt-pagedown", Command::MoveTabPrevious),
+        ("alt-pagedown", Command::MoveTabNext),
+        ("alt-pageup", Command::MoveTabPrevious),
     ] {
         assert!(has_binding(
             &custom_migrated,
@@ -1902,10 +1902,10 @@ fn tab_switch_and_move_default_bindings_and_migration() {
         ));
     }
     for (keys, action) in [
-        ("ctrl-pageup", Command::NextTab),
-        ("ctrl-pagedown", Command::PreviousTab),
-        ("ctrl-shift-pageup", Command::MoveTabNext),
-        ("ctrl-shift-pagedown", Command::MoveTabPrevious),
+        ("ctrl-pagedown", Command::NextTab),
+        ("ctrl-pageup", Command::PreviousTab),
+        ("ctrl-shift-pagedown", Command::MoveTabNext),
+        ("ctrl-shift-pageup", Command::MoveTabPrevious),
     ] {
         assert!(!has_binding(
             &custom_migrated,

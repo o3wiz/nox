@@ -11872,43 +11872,43 @@ mod tests {
             assert_eq!(view.input.read(cx).as_str(), "q0");
         });
 
-        // Ctrl+PageUp cycles forward (0 -> 1 -> 2 -> 0) and Ctrl+PageDown cycles backward (0 -> 2 -> 1 -> 0).
-        cx.simulate_keystrokes("ctrl-pageup");
+        // Ctrl+PageDown cycles forward (0 -> 1 -> 2 -> 0) and Ctrl+PageUp cycles backward (0 -> 2 -> 1 -> 0).
+        cx.simulate_keystrokes("ctrl-pagedown");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 1);
             assert_eq!(view.input.read(cx).as_str(), "q1");
         });
 
-        cx.simulate_keystrokes("ctrl-pageup");
+        cx.simulate_keystrokes("ctrl-pagedown");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 2);
             assert_eq!(view.input.read(cx).as_str(), "q2");
         });
 
-        cx.simulate_keystrokes("ctrl-pageup");
+        cx.simulate_keystrokes("ctrl-pagedown");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 0);
             assert_eq!(view.input.read(cx).as_str(), "q0");
         });
 
-        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.simulate_keystrokes("ctrl-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 2);
             assert_eq!(view.input.read(cx).as_str(), "q2");
         });
 
-        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.simulate_keystrokes("ctrl-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 1);
             assert_eq!(view.input.read(cx).as_str(), "q1");
         });
 
-        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.simulate_keystrokes("ctrl-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 0);
@@ -17146,14 +17146,14 @@ mod tests {
         // Default shortcut labels are populated for MoveTabNext and MoveTabPrevious.
         view.read_with(cx, |view, _| {
             let expected_next = if cfg!(target_os = "macos") {
-                "⌃⇧PgUp"
-            } else {
-                "Ctrl+Shift+PgUp"
-            };
-            let expected_prev = if cfg!(target_os = "macos") {
                 "⌃⇧PgDn"
             } else {
                 "Ctrl+Shift+PgDn"
+            };
+            let expected_prev = if cfg!(target_os = "macos") {
+                "⌃⇧PgUp"
+            } else {
+                "Ctrl+Shift+PgUp"
             };
             assert_eq!(
                 view.theme.shortcut(Command::MoveTabNext).as_deref(),
@@ -17169,8 +17169,8 @@ mod tests {
             view.tabs.iter().map(|tab| tab.path.clone()).collect()
         };
 
-        // At index 0, Ctrl+Shift+PageDown is a non-cyclic no-op.
-        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        // At index 0, Ctrl+Shift+PageUp is a non-cyclic no-op.
+        cx.simulate_keystrokes("ctrl-shift-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 0);
@@ -17185,8 +17185,8 @@ mod tests {
             assert_eq!(view.input.read(cx).as_str(), "q0");
         });
 
-        // Ctrl+Shift+PageUp moves tab 0 -> 1, preserving active input, path, and bookmarks.
-        cx.simulate_keystrokes("ctrl-shift-pageup");
+        // Ctrl+Shift+PageDown moves tab 0 -> 1, preserving active input, path, and bookmarks.
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 1);
@@ -17208,8 +17208,8 @@ mod tests {
             assert_eq!(view.tabs[2].query, "q2");
         });
 
-        // Ctrl+Shift+PageUp moves tab 1 -> 2.
-        cx.simulate_keystrokes("ctrl-shift-pageup");
+        // Ctrl+Shift+PageDown moves tab 1 -> 2.
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 2);
@@ -17224,8 +17224,8 @@ mod tests {
             assert_eq!(view.input.read(cx).as_str(), "q0");
         });
 
-        // At the last tab, Ctrl+Shift+PageUp is a non-cyclic no-op (must NOT wrap to index 0).
-        cx.simulate_keystrokes("ctrl-shift-pageup");
+        // At the last tab, Ctrl+Shift+PageDown is a non-cyclic no-op (must NOT wrap to index 0).
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 2);
@@ -17245,7 +17245,7 @@ mod tests {
             view.command(Command::FocusSearch, window, cx);
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.simulate_keystrokes("ctrl-shift-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 1);
@@ -17260,7 +17260,7 @@ mod tests {
             assert_eq!(view.input.read(cx).as_str(), "q0");
         });
 
-        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.simulate_keystrokes("ctrl-shift-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 0);
@@ -17278,7 +17278,7 @@ mod tests {
         // Relocating another tab and saving session persists the new tab order and active index.
         view.update(cx, |view, cx| view.switch(2, cx));
         cx.run_until_parked();
-        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.simulate_keystrokes("ctrl-shift-pageup");
         cx.run_until_parked();
         let saved = view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 1);
@@ -17304,8 +17304,8 @@ mod tests {
             view.close_tab_at(0, cx);
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes("ctrl-shift-pageup");
         cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.simulate_keystrokes("ctrl-shift-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.tabs.len(), 1);
@@ -17317,8 +17317,8 @@ mod tests {
             view.close_tab_at(0, cx);
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes("ctrl-shift-pageup");
         cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.simulate_keystrokes("ctrl-shift-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.tabs.is_empty());
@@ -17363,7 +17363,7 @@ mod tests {
         cx.run_until_parked();
 
         // Replaced default shortcuts no longer trigger tab relocation.
-        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.active, 0);
