@@ -886,6 +886,27 @@ impl Workspace {
         self.activate_tab(index, true, cx);
     }
 
+    fn move_active_tab(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        if self.tabs.len() <= 1 || self.active >= self.tabs.len() {
+            return false;
+        }
+        let target = if forward {
+            if self.active + 1 >= self.tabs.len() {
+                return false;
+            }
+            self.active + 1
+        } else {
+            if self.active == 0 {
+                return false;
+            }
+            self.active - 1
+        };
+        self.tabs.swap(self.active, target);
+        self.active = target;
+        cx.notify();
+        true
+    }
+
     fn activate_tab(&mut self, index: usize, save_current_query: bool, cx: &mut Context<Self>) {
         if save_current_query && let Some(tab) = self.tabs.get_mut(self.active) {
             tab.query = self.input.read(cx).as_str().to_string();
@@ -2827,6 +2848,14 @@ impl Workspace {
                     let len = self.tabs.len();
                     self.switch((self.active + len - 1) % len, cx);
                 }
+            }
+            Command::MoveTabNext => {
+                self.move_active_tab(true, cx);
+                return;
+            }
+            Command::MoveTabPrevious => {
+                self.move_active_tab(false, cx);
+                return;
             }
             Command::ToggleFollow => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -11843,6 +11872,49 @@ mod tests {
             assert_eq!(view.input.read(cx).as_str(), "q0");
         });
 
+        // Ctrl+PageUp cycles forward (0 -> 1 -> 2 -> 0) and Ctrl+PageDown cycles backward (0 -> 2 -> 1 -> 0).
+        cx.simulate_keystrokes("ctrl-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.input.read(cx).as_str(), "q1");
+        });
+
+        cx.simulate_keystrokes("ctrl-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(view.input.read(cx).as_str(), "q2");
+        });
+
+        cx.simulate_keystrokes("ctrl-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(view.input.read(cx).as_str(), "q2");
+        });
+
+        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.input.read(cx).as_str(), "q1");
+        });
+
+        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
         // With a single tab, PreviousTab keeps index 0 and preserves its query.
         view.update(cx, |view, cx| {
             view.close_tab_at(2, cx);
@@ -17029,6 +17101,305 @@ mod tests {
             assert!(!tab.searching);
             assert!(!tab.show_searching_indicator());
             assert_eq!(view.empty_results_message(Some(tab)), "No matches");
+        });
+    }
+
+    #[gpui::test]
+    fn move_tab_shortcuts_relocate_active_tab_without_wrapping_and_preserve_state(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let state_file = directory.path().join("session.json");
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = true;
+        config.files.restore_session = false;
+        config.files.state_file = Some(state_file.display().to_string());
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        let third = directory.path().join("third.log");
+        std::fs::write(&first, "one\ntwo\n").unwrap();
+        std::fs::write(&second, "alpha\nbeta\n").unwrap();
+        std::fs::write(&third, "red\nblue\n").unwrap();
+        let first_canon = first.canonicalize().unwrap_or_else(|_| first.clone());
+        let second_canon = second.canonicalize().unwrap_or_else(|_| second.clone());
+        let third_canon = third.canonicalize().unwrap_or_else(|_| third.clone());
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(config, vec![first, second, third], window, cx)
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.switch(0, cx);
+            view.tabs[0].bookmarks.insert(1);
+            view.tabs[1].query = "q1".into();
+            view.tabs[2].query = "q2".into();
+            view.input.update(cx, |input, cx| input.emplace("q0", cx));
+        });
+        cx.run_until_parked();
+
+        // Default shortcut labels are populated for MoveTabNext and MoveTabPrevious.
+        view.read_with(cx, |view, _| {
+            let expected_next = if cfg!(target_os = "macos") {
+                "⌃⇧PgUp"
+            } else {
+                "Ctrl+Shift+PgUp"
+            };
+            let expected_prev = if cfg!(target_os = "macos") {
+                "⌃⇧PgDn"
+            } else {
+                "Ctrl+Shift+PgDn"
+            };
+            assert_eq!(
+                view.theme.shortcut(Command::MoveTabNext).as_deref(),
+                Some(expected_next)
+            );
+            assert_eq!(
+                view.theme.shortcut(Command::MoveTabPrevious).as_deref(),
+                Some(expected_prev)
+            );
+        });
+
+        let tab_paths = |view: &Workspace| -> Vec<PathBuf> {
+            view.tabs.iter().map(|tab| tab.path.clone()).collect()
+        };
+
+        // At index 0, Ctrl+Shift+PageDown is a non-cyclic no-op.
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    first_canon.clone(),
+                    second_canon.clone(),
+                    third_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // Ctrl+Shift+PageUp moves tab 0 -> 1, preserving active input, path, and bookmarks.
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    second_canon.clone(),
+                    first_canon.clone(),
+                    third_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                first_canon.display().to_string()
+            );
+            assert!(view.tabs[1].bookmarks.contains(&1));
+            assert_eq!(view.tabs[0].query, "q1");
+            assert_eq!(view.tabs[2].query, "q2");
+        });
+
+        // Ctrl+Shift+PageUp moves tab 1 -> 2.
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    second_canon.clone(),
+                    third_canon.clone(),
+                    first_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // At the last tab, Ctrl+Shift+PageUp is a non-cyclic no-op (must NOT wrap to index 0).
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    second_canon.clone(),
+                    third_canon.clone(),
+                    first_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // Works while search input has focus (Workspace context), moving backward 2 -> 1 -> 0.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    second_canon.clone(),
+                    first_canon.clone(),
+                    third_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    first_canon.clone(),
+                    second_canon.clone(),
+                    third_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // Relocating another tab and saving session persists the new tab order and active index.
+        view.update(cx, |view, cx| view.switch(2, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        let saved = view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    first_canon.clone(),
+                    third_canon.clone(),
+                    second_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q2");
+            view.save_session(cx);
+            Session::load(&state_file, &view.config).unwrap()
+        });
+        assert_eq!(saved.active, 1);
+        let saved_paths: Vec<PathBuf> = saved.tabs.into_iter().map(|t| t.path).collect();
+        assert_eq!(saved_paths, vec![first_canon, third_canon, second_canon]);
+
+        // With a single tab, both move shortcuts are safe no-ops.
+        view.update(cx, |view, cx| {
+            view.close_tab_at(2, cx);
+            view.close_tab_at(0, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.active, 0);
+        });
+
+        // With no tabs open, both move shortcuts are safe no-ops.
+        view.update(cx, |view, cx| {
+            view.close_tab_at(0, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs.is_empty());
+            assert_eq!(view.active, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn move_tab_shortcuts_respect_custom_keyboard_bindings(cx: &mut TestAppContext) {
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_dir.path().join("keyboard.json"),
+            r#"{
+  "bindings": [
+    { "keys": "alt-right", "context": "Workspace", "action": "move_tab_next" },
+    { "keys": "alt-left", "context": "Workspace", "action": "move_tab_previous" }
+  ]
+}"#,
+        )
+        .unwrap();
+        let mut config = Config::load(Some(config_dir.path())).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        std::fs::write(&first, "one\n").unwrap();
+        std::fs::write(&second, "two\n").unwrap();
+        let first_canon = first.canonicalize().unwrap_or_else(|_| first.clone());
+        let second_canon = second.canonicalize().unwrap_or_else(|_| second.clone());
+
+        let (view, cx) = cx
+            .add_window_view(|window, cx| Workspace::new(config, vec![first, second], window, cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| view.switch(0, cx));
+        cx.run_until_parked();
+
+        // Replaced default shortcuts no longer trigger tab relocation.
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, second_canon);
+        });
+
+        // Custom bindings relocate tabs forward and backward without wrapping.
+        cx.simulate_keystrokes("alt-right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[0].path, second_canon);
+            assert_eq!(view.tabs[1].path, first_canon);
+        });
+
+        cx.simulate_keystrokes("alt-right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[1].path, first_canon);
+        });
+
+        cx.simulate_keystrokes("alt-left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, second_canon);
+        });
+
+        cx.simulate_keystrokes("alt-left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
         });
     }
 }

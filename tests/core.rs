@@ -1813,3 +1813,105 @@ fn append_preset_default_binding_and_migration() {
         Command::AppendPreset
     ));
 }
+
+#[test]
+fn tab_switch_and_move_default_bindings_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    for (keys, action) in [
+        ("ctrl-tab", Command::NextTab),
+        ("ctrl-pageup", Command::NextTab),
+        ("ctrl-shift-tab", Command::PreviousTab),
+        ("ctrl-pagedown", Command::PreviousTab),
+        ("ctrl-shift-pageup", Command::MoveTabNext),
+        ("ctrl-shift-pagedown", Command::MoveTabPrevious),
+    ] {
+        assert!(
+            has_binding(&defaults, keys, KeyContext::Workspace, action),
+            "missing default Workspace binding {keys} -> {action:?}"
+        );
+    }
+
+    // Migrating an older keyboard.json with ctrl-tab/ctrl-shift-tab adds ctrl-pageup/ctrl-pagedown
+    // for tab switching and ctrl-shift-pageup/ctrl-shift-pagedown for tab relocation.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "ctrl-tab", "context": "Workspace", "action": "next_tab" },
+    { "keys": "ctrl-shift-tab", "context": "Workspace", "action": "previous_tab" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    for (keys, action) in [
+        ("ctrl-tab", Command::NextTab),
+        ("ctrl-pageup", Command::NextTab),
+        ("ctrl-shift-tab", Command::PreviousTab),
+        ("ctrl-pagedown", Command::PreviousTab),
+        ("ctrl-shift-pageup", Command::MoveTabNext),
+        ("ctrl-shift-pagedown", Command::MoveTabPrevious),
+    ] {
+        assert!(
+            has_binding(&upgraded, keys, KeyContext::Workspace, action),
+            "expected migrated Workspace binding {keys} -> {action:?}"
+        );
+    }
+
+    // Custom rebindings for tab switching and tab relocation are preserved without adding defaults.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "alt-]", "context": "Workspace", "action": "next_tab" },
+    { "keys": "alt-[", "context": "Workspace", "action": "previous_tab" },
+    { "keys": "alt-pageup", "context": "Workspace", "action": "move_tab_next" },
+    { "keys": "alt-pagedown", "context": "Workspace", "action": "move_tab_previous" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    for (keys, action) in [
+        ("alt-]", Command::NextTab),
+        ("alt-[", Command::PreviousTab),
+        ("alt-pageup", Command::MoveTabNext),
+        ("alt-pagedown", Command::MoveTabPrevious),
+    ] {
+        assert!(has_binding(
+            &custom_migrated,
+            keys,
+            KeyContext::Workspace,
+            action
+        ));
+    }
+    for (keys, action) in [
+        ("ctrl-pageup", Command::NextTab),
+        ("ctrl-pagedown", Command::PreviousTab),
+        ("ctrl-shift-pageup", Command::MoveTabNext),
+        ("ctrl-shift-pagedown", Command::MoveTabPrevious),
+    ] {
+        assert!(!has_binding(
+            &custom_migrated,
+            keys,
+            KeyContext::Workspace,
+            action
+        ));
+    }
+}

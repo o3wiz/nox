@@ -27,8 +27,28 @@
       "context": "Workspace"
     },
     {
+      "keys": "ctrl-pageup",
+      "action": "next_tab",
+      "context": "Workspace"
+    },
+    {
       "keys": "ctrl-shift-tab",
       "action": "previous_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-pagedown",
+      "action": "previous_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-shift-pageup",
+      "action": "move_tab_next",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-shift-pagedown",
+      "action": "move_tab_previous",
       "context": "Workspace"
     },
     {

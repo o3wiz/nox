@@ -61,6 +61,8 @@
         "restore_closed_tab",
         "next_tab",
         "previous_tab",
+        "move_tab_next",
+        "move_tab_previous",
         "search",
         "toggle_regex",
         "toggle_case_sensitive",

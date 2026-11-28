@@ -247,6 +247,8 @@ pub enum Command {
     RestoreClosedTab,
     NextTab,
     PreviousTab,
+    MoveTabNext,
+    MoveTabPrevious,
     Search,
     ToggleRegex,
     ToggleCaseSensitive,
