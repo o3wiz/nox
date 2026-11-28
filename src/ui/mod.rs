@@ -250,6 +250,7 @@ struct Tab {
     searching: bool,
     searching_since: Option<Instant>,
     searching_visible: bool,
+    refreshing_search: bool,
     load_cancel: Arc<AtomicBool>,
     search_cancel: Arc<AtomicBool>,
     revision: usize,
@@ -283,6 +284,7 @@ impl Tab {
             searching: false,
             searching_since: None,
             searching_visible: false,
+            refreshing_search: false,
             load_cancel: Arc::new(AtomicBool::new(false)),
             search_cancel: Arc::new(AtomicBool::new(false)),
             revision: 0,
@@ -374,6 +376,17 @@ impl Tab {
         } else {
             "Enter file path…"
         }
+    }
+
+    fn clear_searching(&mut self) {
+        self.searching = false;
+        self.searching_since = None;
+        self.searching_visible = false;
+        self.refreshing_search = false;
+    }
+
+    fn show_searching_indicator(&self) -> bool {
+        self.searching_visible && !self.query.is_empty()
     }
 
     fn sync_highlight_regex(&mut self) {
@@ -1039,9 +1052,7 @@ impl Workspace {
         tab.stdin = None;
         tab.stdin_finished = false;
         tab.loading = false;
-        tab.searching = false;
-        tab.searching_since = None;
-        tab.searching_visible = false;
+        tab.clear_searching();
         tab.load_cancel = Arc::new(AtomicBool::new(false));
         tab.search_cancel = Arc::new(AtomicBool::new(false));
         tab.revision += 1;
@@ -1073,9 +1084,7 @@ impl Workspace {
         tab.loading = true;
         tab.search_cancel.store(true, Ordering::Relaxed);
         tab.revision += 1;
-        tab.searching = false;
-        tab.searching_since = None;
-        tab.searching_visible = false;
+        tab.clear_searching();
         let (id, path, cancel, sender) = (
             tab.id,
             tab.path.clone(),
@@ -1104,6 +1113,7 @@ impl Workspace {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
+        let previous_query = tab.query.clone();
         if index == self.active {
             tab.query = self.input.read(cx).as_str().to_string();
         }
@@ -1114,16 +1124,17 @@ impl Workspace {
         let Some(log) = tab.log.clone() else {
             return;
         };
-        tab.error = tab.stdin.as_ref().and_then(StdinSpool::error);
+        let previous_error = std::mem::replace(
+            &mut tab.error,
+            tab.stdin.as_ref().and_then(StdinSpool::error),
+        );
         let marks = if include_bookmarks {
             tab.bookmarks.clone()
         } else {
             BTreeSet::new()
         };
         if tab.query.is_empty() {
-            tab.searching = false;
-            tab.searching_since = None;
-            tab.searching_visible = false;
+            tab.clear_searching();
             let (visible, widest_row) =
                 search::visible_rows(&log, &[], tab.options.context_lines, &marks);
             let results = SearchResults {
@@ -1154,6 +1165,8 @@ impl Workspace {
         tab.searching = true;
         tab.searching_since = Some(Instant::now());
         tab.searching_visible = false;
+        tab.refreshing_search =
+            preserve_selection && previous_query == tab.query && previous_error.is_none();
         let (id, revision, query, options, cancel) = (
             tab.id,
             tab.revision,
@@ -1193,9 +1206,7 @@ impl Workspace {
         else {
             return;
         };
-        tab.searching = false;
-        tab.searching_since = None;
-        tab.searching_visible = false;
+        tab.clear_searching();
         match result {
             Ok(mut results) => {
                 tab.sync_highlight_regex();
@@ -6842,6 +6853,26 @@ impl Workspace {
                 )
             })
     }
+    fn empty_results_message(&self, tab: Option<&Tab>) -> &'static str {
+        let Some(tab) = tab else {
+            return "";
+        };
+        if tab.show_searching_indicator() {
+            "Searching…"
+        } else if tab.error.is_some() {
+            "Results unavailable"
+        } else if tab.query.is_empty() {
+            if self.config.viewer.include_bookmarks {
+                "Search above or click the gutter to bookmark lines"
+            } else {
+                "Enter a query above to filter lines"
+            }
+        } else if (tab.searching && !tab.refreshing_search) || (tab.loading && tab.log.is_none()) {
+            ""
+        } else {
+            "No matches"
+        }
+    }
 }
 
 impl Render for Workspace {
@@ -6866,8 +6897,7 @@ impl Render for Workspace {
         let result_count = tab.map_or(0, |tab| tab.results.visible.len());
         let results_limited = tab.is_some_and(|tab| tab.results.limited);
         let loading = tab.is_some_and(|tab| tab.loading);
-        let searching = tab.is_some_and(|tab| tab.searching);
-        let show_searching = tab.is_some_and(|tab| tab.searching_visible);
+        let show_searching = tab.is_some_and(Tab::show_searching_indicator);
         let tab_error = tab.and_then(|tab| tab.error.clone());
         let options = tab
             .map(|tab| tab.options.clone())
@@ -6909,21 +6939,7 @@ impl Render for Workspace {
         let main_area = if self.tabs.is_empty() {
             self.render_welcome(cx)
         } else {
-            let empty_results = if show_searching || loading {
-                "Searching…"
-            } else if searching {
-                ""
-            } else if tab_error.is_some() {
-                "Results unavailable"
-            } else if tab.is_some_and(|tab| tab.query.is_empty()) {
-                if self.config.viewer.include_bookmarks {
-                    "Search above or click the gutter to bookmark lines"
-                } else {
-                    "Enter a query above to filter lines"
-                }
-            } else {
-                "No matches"
-            };
+            let empty_results = self.empty_results_message(tab);
 
             let source_log_area = div().key_context("Log").flex().flex_1().min_h_0().child(
                 div()
@@ -16841,6 +16857,178 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.input.read(cx).as_str(), "error|fatal|panic");
+        });
+    }
+
+    #[gpui::test]
+    fn empty_query_never_shows_searching_while_loading_or_reloading(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.include_bookmarks = true;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.log");
+        std::fs::write(&path, "line 1\nline 2\n").unwrap();
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path.clone()], window, cx));
+
+        // Initial load with empty query must not display "Searching…".
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.loading);
+            assert!(tab.query.is_empty());
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(
+                view.empty_results_message(Some(tab)),
+                "Search above or click the gutter to bookmark lines"
+            );
+        });
+
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // Background reload (e.g., live file growth / poll) with empty query must not flicker "Searching…".
+        std::fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.load(0);
+            cx.notify();
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.loading);
+            assert!(tab.log.is_some());
+            assert!(tab.query.is_empty());
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(
+                view.empty_results_message(Some(tab)),
+                "Search above or click the gutter to bookmark lines"
+            );
+        });
+
+        // With include_bookmarks disabled, the empty-query prompt still shows cleanly during reload.
+        view.update(cx, |view, _| {
+            view.config.viewer.include_bookmarks = false;
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert_eq!(
+                view.empty_results_message(Some(tab)),
+                "Enter a query above to filter lines"
+            );
+        });
+
+        wait_for_tab_loaded(&view, 0, cx);
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(!tab.loading);
+            assert!(!tab.searching);
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(
+                view.empty_results_message(Some(tab)),
+                "Enter a query above to filter lines"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn non_empty_query_results_empty_message_avoids_flicker_across_reload(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live_query.log");
+        std::fs::write(&path, "info startup\ninfo ready\n").unwrap();
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path.clone()], window, cx));
+
+        // Initial load with a non-empty query stays blank instead of flashing "Searching…" or "No matches".
+        view.update(cx, |view, _| {
+            view.tabs[0].query = "FATAL".into();
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.loading);
+            assert!(tab.log.is_none());
+            assert_eq!(view.empty_results_message(Some(tab)), "");
+        });
+
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // Submit a non-empty query with no matches.
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("FATAL", cx));
+            view.start_search(0, cx);
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.searching);
+            assert!(!tab.refreshing_search);
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "");
+        });
+
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(!tab.searching);
+            assert_eq!(view.empty_results_message(Some(tab)), "No matches");
+        });
+
+        // Reloading the live file keeps "No matches" steady instead of flickering "Searching…" or blank.
+        std::fs::write(&path, "info startup\ninfo ready\ninfo tick\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.load(0);
+            cx.notify();
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.loading);
+            assert!(tab.log.is_some());
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "No matches");
+        });
+
+        // A background refresh search (< SEARCH_INDICATOR_DELAY) also keeps "No matches" steady.
+        wait_for_tab_loaded(&view, 0, cx);
+        view.update(cx, |view, cx| {
+            view.start_search_preserving(0, true, cx);
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.searching);
+            assert!(tab.refreshing_search);
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "No matches");
+        });
+
+        // Once a search actually exceeds SEARCH_INDICATOR_DELAY, both header and body show "Searching…".
+        view.update(cx, |view, _| {
+            view.tabs[0].searching_visible = true;
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "Searching…");
+        });
+
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(!tab.searching);
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "No matches");
         });
     }
 }
