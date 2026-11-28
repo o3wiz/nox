@@ -1,16 +1,125 @@
 use crate::{
-    config::{SearchConfig, SearchMode},
+    config::{Preset, PresetToggle, SearchConfig, SearchMode},
     logfile::LogFile,
     selection::LineSelection,
 };
 use anyhow::{Result, ensure};
 use regex::{Regex, RegexBuilder};
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     io::BufRead,
     ops::Range,
     sync::atomic::{AtomicBool, Ordering},
 };
+
+fn ends_with_unescaped_pipe(pattern: &str) -> bool {
+    let Some(prefix) = pattern.strip_suffix('|') else {
+        return false;
+    };
+    let trailing_backslashes = prefix.bytes().rev().take_while(|&b| b == b'\\').count();
+    trailing_backslashes.is_multiple_of(2)
+}
+
+/// Appends `addition` to `existing` as a regex `|` alternative, avoiding duplicate `||` when
+/// `existing` already ends with an unescaped `|`. Returns the combined pattern and the UTF-8 byte
+/// offset where `addition` starts inside it.
+pub fn append_regex_alternative_with_offset(existing: &str, addition: &str) -> (String, usize) {
+    if existing.is_empty() {
+        (addition.to_owned(), 0)
+    } else if ends_with_unescaped_pipe(existing) {
+        (format!("{existing}{addition}"), existing.len())
+    } else {
+        (format!("{existing}|{addition}"), existing.len() + 1)
+    }
+}
+
+/// Appends `addition` to `existing` as a regex `|` alternative.
+pub fn append_regex_alternative(existing: &str, addition: &str) -> String {
+    append_regex_alternative_with_offset(existing, addition).0
+}
+
+/// Result of composing a [`Preset`] onto an existing `SearchMode::Regex` search pattern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendPresetResult {
+    pub pattern: String,
+    pub select_range: Option<Range<usize>>,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub highlight_matches: bool,
+}
+
+/// Composes `preset` onto `existing` for an active `SearchMode::Regex` search while preserving
+/// exact matching semantics across `mode`, `match_case`, `whole_word`, and `select_text`.
+pub fn append_preset_to_regex(
+    existing: &str,
+    active: &SearchConfig,
+    preset: &Preset,
+) -> AppendPresetResult {
+    let (raw_addition, raw_select_range) = preset.regex_pattern_and_select_range();
+    if existing.is_empty() {
+        let mut case_sensitive = active.case_sensitive;
+        let mut whole_word = active.whole_word;
+        preset.match_case.apply_to(&mut case_sensitive);
+        preset.whole_word.apply_to(&mut whole_word);
+        return AppendPresetResult {
+            pattern: raw_addition,
+            select_range: raw_select_range,
+            case_sensitive,
+            whole_word,
+            highlight_matches: preset.highlight_match,
+        };
+    }
+
+    let case_sensitive = active.case_sensitive;
+    let (base_existing, whole_word) = if active.whole_word && preset.whole_word == PresetToggle::Off
+    {
+        let core = if ends_with_unescaped_pipe(existing) && existing.len() > 1 {
+            &existing[..existing.len() - 1]
+        } else {
+            existing
+        };
+        (Cow::Owned(format!(r"\b(?:{core})\b")), false)
+    } else {
+        (Cow::Borrowed(existing), active.whole_word)
+    };
+
+    let case_override = preset
+        .match_case
+        .forced_value()
+        .filter(|&wanted| wanted != case_sensitive);
+    let wrap_word = preset.whole_word == PresetToggle::On && !whole_word;
+
+    let (prefix, suffix) = match (case_override, wrap_word) {
+        (None, false) => ("", ""),
+        (Some(true), false) => ("(?-i:", ")"),
+        (Some(false), false) => ("(?i:", ")"),
+        (None, true) => (r"\b(?:", r")\b"),
+        (Some(true), true) => (r"\b(?-i:", r")\b"),
+        (Some(false), true) => (r"\b(?i:", r")\b"),
+    };
+
+    let wrapped_addition = if prefix.is_empty() {
+        raw_addition
+    } else {
+        format!("{prefix}{raw_addition}{suffix}")
+    };
+    let wrapped_select_range =
+        raw_select_range.map(|range| (range.start + prefix.len())..(range.end + prefix.len()));
+
+    let (combined, offset) =
+        append_regex_alternative_with_offset(&base_existing, &wrapped_addition);
+    let select_range =
+        wrapped_select_range.map(|range| (range.start + offset)..(range.end + offset));
+
+    AppendPresetResult {
+        pattern: combined,
+        select_range,
+        case_sensitive,
+        whole_word,
+        highlight_matches: active.highlight_matches,
+    }
+}
 
 pub fn compile(pattern: &str, options: &SearchConfig) -> Result<Regex> {
     let pattern = if options.mode == SearchMode::Literal {
@@ -817,5 +926,293 @@ mod tests {
         assert!(
             selected_match_lines(&matches, &LineSelection::single(0), Some(&[]), 10).is_empty()
         );
+    }
+
+    #[test]
+    fn append_preset_to_regex_preserves_exact_semantics_across_all_combinations() {
+        let base_opts = Config::load(None).unwrap().search;
+        let corpus = [
+            "err",
+            "ERR",
+            "error",
+            "ERROR",
+            "warn",
+            "WARN",
+            "warning",
+            "Foo",
+            "foo",
+            "FOO",
+            "myFoo",
+            "Foobar",
+            "Bar",
+            "bar",
+            "BAR",
+            "foobar",
+            "foo.bar",
+            "FOO.BAR",
+            "fooXbar",
+            "x foo.bar y",
+            "afoo.bar",
+            "foo.barz",
+            "err|warn",
+            "ERR|WARN",
+            "x err|warn y",
+            "a|",
+            "A|",
+            "xa|y",
+            r"a\",
+            r"A\",
+            r"xa\y",
+            "code=ERR",
+            "code=err",
+            "mycode=ERR",
+            "code=ERR1",
+            "code=404",
+            "code=404x",
+            "unrelated line 123",
+        ];
+
+        // `(input_in_search_box, semantic_existing_regex_when_non_empty)`
+        let existing_cases: &[(&str, Option<&str>)] = &[
+            ("", None),
+            ("err", Some("err")),
+            ("err|warn", Some("err|warn")),
+            ("err|", Some("err")),
+            (r"a\|", Some(r"a\|")),
+            (r"a\\|", Some(r"a\\")),
+        ];
+
+        // `(mode, pattern, expected_capture_groups)`
+        let preset_patterns: &[(SearchMode, &str, usize)] = &[
+            (SearchMode::Literal, "Foo", 0),
+            (SearchMode::Literal, "foo.bar", 0),
+            (SearchMode::Literal, "err|warn", 0),
+            (SearchMode::Regex, "Foo|Bar", 0),
+            (SearchMode::Regex, r"code=(\d+|ERR)", 1),
+        ];
+
+        let toggles = [PresetToggle::Leave, PresetToggle::Off, PresetToggle::On];
+
+        for &(existing, semantic_existing) in existing_cases {
+            for active_case in [false, true] {
+                for active_word in [false, true] {
+                    for &(preset_mode, preset_pattern, preset_captures) in preset_patterns {
+                        for match_case in toggles {
+                            for whole_word in toggles {
+                                for highlight_match in [false, true] {
+                                    let mut active = base_opts.clone();
+                                    active.mode = SearchMode::Regex;
+                                    active.case_sensitive = active_case;
+                                    active.whole_word = active_word;
+                                    active.highlight_matches = !highlight_match;
+
+                                    let preset = Preset {
+                                        name: "Combo".into(),
+                                        pattern: preset_pattern.into(),
+                                        mode: preset_mode,
+                                        highlight_match,
+                                        match_case,
+                                        whole_word,
+                                        select_text: None,
+                                    };
+
+                                    let result = append_preset_to_regex(existing, &active, &preset);
+
+                                    // Highlight adoption on empty, preservation on non-empty.
+                                    if existing.is_empty() {
+                                        assert_eq!(result.highlight_matches, highlight_match);
+                                    } else {
+                                        assert_eq!(
+                                            result.highlight_matches,
+                                            active.highlight_matches
+                                        );
+                                    }
+
+                                    // Compile combined search with resulting tab options.
+                                    let mut combined_opts = active.clone();
+                                    combined_opts.case_sensitive = result.case_sensitive;
+                                    combined_opts.whole_word = result.whole_word;
+                                    combined_opts.highlight_matches = result.highlight_matches;
+                                    let combined_re =
+                                        compile(&result.pattern, &combined_opts).unwrap_or_else(
+                                            |err| {
+                                                panic!(
+                                                    "failed to compile {:?} (existing={existing:?}, active_case={active_case}, active_word={active_word}, mode={preset_mode:?}, preset={preset_pattern:?}, match_case={match_case:?}, whole_word={whole_word:?}): {err}",
+                                                    result.pattern
+                                                )
+                                            },
+                                        );
+
+                                    // Wrappers must never introduce spurious capturing groups.
+                                    assert_eq!(
+                                        combined_re.captures_len(),
+                                        1 + preset_captures,
+                                        "unexpected capture group count for {:?}",
+                                        result.pattern
+                                    );
+
+                                    // Semantic oracle: existing branch + preset branch with its effective flags.
+                                    let existing_re =
+                                        semantic_existing.map(|pat| compile(pat, &active).unwrap());
+                                    let mut preset_opts = active.clone();
+                                    preset_opts.mode = preset_mode;
+                                    match_case.apply_to(&mut preset_opts.case_sensitive);
+                                    whole_word.apply_to(&mut preset_opts.whole_word);
+                                    let preset_re = compile(preset_pattern, &preset_opts).unwrap();
+
+                                    for line in corpus {
+                                        let expected = existing_re
+                                            .as_ref()
+                                            .is_some_and(|re| re.is_match(line))
+                                            || preset_re.is_match(line);
+                                        assert_eq!(
+                                            combined_re.is_match(line),
+                                            expected,
+                                            "mismatch on line {line:?} for combined={:?} (res_case={}, res_word={}) from existing={existing:?} (case={active_case}, word={active_word}) + preset=({preset_mode:?}, {preset_pattern:?}, match_case={match_case:?}, whole_word={whole_word:?})",
+                                            result.pattern,
+                                            result.case_sensitive,
+                                            result.whole_word
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Degenerate single `|` with active whole_word=true and preset whole_word=Off lifts safely.
+        let mut active = base_opts;
+        active.mode = SearchMode::Regex;
+        active.whole_word = true;
+        let preset = Preset {
+            name: "Warn".into(),
+            pattern: "warn".into(),
+            mode: SearchMode::Literal,
+            highlight_match: true,
+            match_case: PresetToggle::On,
+            whole_word: PresetToggle::Off,
+            select_text: None,
+        };
+        let result = append_preset_to_regex("|", &active, &preset);
+        assert_eq!(result.pattern, r"\b(?:|)\b|(?-i:warn)");
+        assert!(!result.whole_word);
+        let mut opts = active;
+        opts.whole_word = result.whole_word;
+        assert!(compile(&result.pattern, &opts).is_ok());
+    }
+
+    #[test]
+    fn append_preset_to_regex_handles_chained_appends_and_select_text_offsets() {
+        let base_opts = Config::load(None).unwrap().search;
+
+        // Multi-step chain starting from case-sensitive + whole-word active search:
+        // 1. Lift whole-word + add case-insensitive non-whole-word literal preset
+        // 2. Append case-sensitive whole-word regex preset (inherits active case_sensitive=true)
+        // 3. Append case-insensitive whole-word literal preset with metacharacters
+        let mut opts = base_opts.clone();
+        opts.mode = SearchMode::Regex;
+        opts.case_sensitive = true;
+        opts.whole_word = true;
+
+        let p1 = Preset {
+            name: "Timeout".into(),
+            pattern: "timeout".into(),
+            mode: SearchMode::Literal,
+            highlight_match: true,
+            match_case: PresetToggle::Off,
+            whole_word: PresetToggle::Off,
+            select_text: None,
+        };
+        let p2 = Preset {
+            name: "Verbs".into(),
+            pattern: "GET|POST".into(),
+            mode: SearchMode::Regex,
+            highlight_match: true,
+            match_case: PresetToggle::Leave,
+            whole_word: PresetToggle::On,
+            select_text: None,
+        };
+        let p3 = Preset {
+            name: "Status".into(),
+            pattern: "err=5xx".into(),
+            mode: SearchMode::Literal,
+            highlight_match: true,
+            match_case: PresetToggle::Off,
+            whole_word: PresetToggle::On,
+            select_text: None,
+        };
+
+        let s1 = append_preset_to_regex("ERR", &opts, &p1);
+        assert_eq!(s1.pattern, r"\b(?:ERR)\b|(?i:timeout)");
+        assert!(s1.case_sensitive);
+        assert!(!s1.whole_word);
+        opts.case_sensitive = s1.case_sensitive;
+        opts.whole_word = s1.whole_word;
+
+        let s2 = append_preset_to_regex(&s1.pattern, &opts, &p2);
+        assert_eq!(s2.pattern, r"\b(?:ERR)\b|(?i:timeout)|\b(?:GET|POST)\b");
+        assert!(s2.case_sensitive);
+        assert!(!s2.whole_word);
+
+        let s3 = append_preset_to_regex(&s2.pattern, &opts, &p3);
+        assert_eq!(
+            s3.pattern,
+            r"\b(?:ERR)\b|(?i:timeout)|\b(?:GET|POST)\b|\b(?i:err=5xx)\b"
+        );
+        let re = compile(&s3.pattern, &opts).unwrap();
+        assert!(re.is_match("ERR failed"));
+        assert!(!re.is_match("err failed"));
+        assert!(!re.is_match("ERROR failed"));
+        assert!(re.is_match("ReadTimeoutException"));
+        assert!(re.is_match("GET /api"));
+        assert!(!re.is_match("get /api"));
+        assert!(!re.is_match("TARGET /api"));
+        assert!(re.is_match("x ERR=5XX y"));
+        assert!(!re.is_match("x myERR=5XX y"));
+
+        // Verify `select_text` range slicing across every wrapper combination + whole-word lift + Unicode.
+        let literal_sel = Preset {
+            name: "UnicodeHost".into(),
+            pattern: "[שלום] host=<HOST.NAME>".into(),
+            mode: SearchMode::Literal,
+            highlight_match: false,
+            match_case: PresetToggle::On,
+            whole_word: PresetToggle::On,
+            select_text: Some("<HOST.NAME>".into()),
+        };
+        let regex_sel = Preset {
+            name: "RegexPort".into(),
+            pattern: "port=PORT_NUM".into(),
+            mode: SearchMode::Regex,
+            highlight_match: false,
+            match_case: PresetToggle::Off,
+            whole_word: PresetToggle::Off,
+            select_text: Some("PORT_NUM".into()),
+        };
+
+        for existing in ["", "INFO", "INFO|"] {
+            for active_case in [false, true] {
+                for active_word in [false, true] {
+                    let mut active = base_opts.clone();
+                    active.mode = SearchMode::Regex;
+                    active.case_sensitive = active_case;
+                    active.whole_word = active_word;
+
+                    for (preset, expected_sel) in
+                        [(&literal_sel, r"<HOST\.NAME>"), (&regex_sel, "PORT_NUM")]
+                    {
+                        let res = append_preset_to_regex(existing, &active, preset);
+                        let range = res.select_range.expect("expected mapped select range");
+                        assert_eq!(
+                            &res.pattern[range], expected_sel,
+                            "wrong select slice for pattern {:?} (existing={existing:?}, case={active_case}, word={active_word})",
+                            res.pattern
+                        );
+                    }
+                }
+            }
+        }
     }
 }

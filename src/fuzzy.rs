@@ -306,7 +306,7 @@ pub fn filter_presets(presets: &[Preset], query: &str) -> Vec<PresetMatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SearchMode;
+    use crate::config::{PresetToggle, SearchMode};
 
     fn preset(name: &str, pattern: &str) -> Preset {
         Preset {
@@ -314,6 +314,8 @@ mod tests {
             pattern: pattern.to_owned(),
             mode: SearchMode::Regex,
             highlight_match: true,
+            match_case: PresetToggle::Leave,
+            whole_word: PresetToggle::Leave,
             select_text: None,
         }
     }

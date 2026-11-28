@@ -134,6 +134,44 @@ pub enum SearchMode {
     Literal,
     Regex,
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PresetToggle {
+    #[default]
+    Leave,
+    Off,
+    On,
+}
+
+impl PresetToggle {
+    /// Applies this tri-state setting to a search option boolean.
+    pub fn apply_to(self, target: &mut bool) {
+        match self {
+            Self::Leave => {}
+            Self::Off => *target = false,
+            Self::On => *target = true,
+        }
+    }
+
+    /// Returns the forced boolean value for `On`/`Off`, or `None` for `Leave`.
+    pub fn forced_value(self) -> Option<bool> {
+        match self {
+            Self::Leave => None,
+            Self::Off => Some(false),
+            Self::On => Some(true),
+        }
+    }
+
+    /// Returns `true` when `current` satisfies this preset setting.
+    pub fn matches(self, current: bool) -> bool {
+        match self {
+            Self::Leave => true,
+            Self::Off => !current,
+            Self::On => current,
+        }
+    }
+}
+
 fn default_highlight_matches() -> bool {
     true
 }
@@ -146,11 +184,21 @@ pub struct Preset {
     pub mode: SearchMode,
     #[serde(default = "default_highlight_matches")]
     pub highlight_match: bool,
+    #[serde(default)]
+    pub match_case: PresetToggle,
+    #[serde(default)]
+    pub whole_word: PresetToggle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub select_text: Option<String>,
 }
 
 impl Preset {
+    /// Returns the number of explicit (`on` / `off`) search toggle constraints on this preset.
+    pub fn option_specificity(&self) -> u8 {
+        u8::from(self.match_case != PresetToggle::Leave)
+            + u8::from(self.whole_word != PresetToggle::Leave)
+    }
+
     /// Returns the UTF-8 byte range of the first occurrence of `select_text` within `pattern`
     /// when `select_text` is configured, non-empty, and contained in `pattern`.
     pub fn select_text_range(&self) -> Option<std::ops::Range<usize>> {
@@ -544,7 +592,14 @@ impl Config {
         }
         for preset in &s.presets {
             if preset.mode == SearchMode::Regex {
-                regex::Regex::new(&preset.pattern)
+                let pattern = if preset.whole_word == PresetToggle::On {
+                    format!(r"\b(?:{})\b", preset.pattern)
+                } else {
+                    preset.pattern.clone()
+                };
+                regex::RegexBuilder::new(&pattern)
+                    .case_insensitive(preset.match_case == PresetToggle::Off)
+                    .build()
                     .with_context(|| format!("Invalid preset: {}", preset.name))?;
             }
         }

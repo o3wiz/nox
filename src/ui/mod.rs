@@ -20,14 +20,16 @@ use gpui_ce_elements::editable_text::{
 };
 use icons::Icon;
 use nox::{
-    config::{self, Command, Config, SearchConfig, SearchMode},
+    config::{self, Command, Config, PresetToggle, SearchConfig, SearchMode},
     fuzzy::{self, PresetMatch},
     logfile::{LogFile, Stamp},
     path_complete::{
         CompletionResult, PathCompletion, complete_path, ensure_trailing_separator, home_dir,
         resolve_input_path,
     },
-    search::{self, MatchCopyResult, SearchResults},
+    search::{
+        self, MatchCopyResult, SearchResults, append_preset_to_regex, append_regex_alternative,
+    },
     selection::{LineSelection, TextPosition, TextSelection, word_range_at},
     session::{self, SavedTab, Session},
     stdin::StdinSpool,
@@ -161,28 +163,6 @@ fn text_input_default_bindings() -> Vec<KeyBinding> {
 
 fn sanitize_single_line_search_text(text: &str) -> String {
     text.replace(['\r', '\n'], "")
-}
-
-fn ends_with_unescaped_pipe(pattern: &str) -> bool {
-    let Some(prefix) = pattern.strip_suffix('|') else {
-        return false;
-    };
-    let trailing_backslashes = prefix.bytes().rev().take_while(|&b| b == b'\\').count();
-    trailing_backslashes.is_multiple_of(2)
-}
-
-fn append_regex_alternative_with_offset(existing: &str, addition: &str) -> (String, usize) {
-    if existing.is_empty() {
-        (addition.to_owned(), 0)
-    } else if ends_with_unescaped_pipe(existing) {
-        (format!("{existing}{addition}"), existing.len())
-    } else {
-        (format!("{existing}|{addition}"), existing.len() + 1)
-    }
-}
-
-fn append_regex_alternative(existing: &str, selected: &str) -> String {
-    append_regex_alternative_with_offset(existing, selected).0
 }
 
 fn utf16_range_for_utf8(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
@@ -3514,11 +3494,20 @@ impl Workspace {
     }
 
     fn matching_preset_index(&self, current_input: &str, options: &SearchConfig) -> Option<usize> {
-        self.config.search.presets.iter().position(|preset| {
-            preset.pattern == current_input
-                && preset.mode == options.mode
-                && preset.highlight_match == options.highlight_matches
-        })
+        self.config
+            .search
+            .presets
+            .iter()
+            .enumerate()
+            .filter(|(_, preset)| {
+                preset.pattern == current_input
+                    && preset.mode == options.mode
+                    && preset.highlight_match == options.highlight_matches
+                    && preset.match_case.matches(options.case_sensitive)
+                    && preset.whole_word.matches(options.whole_word)
+            })
+            .max_by_key(|(idx, preset)| (preset.option_specificity(), std::cmp::Reverse(*idx)))
+            .map(|(idx, _)| idx)
     }
 
     fn active_preset_index(&self, cx: &App) -> Option<usize> {
@@ -3708,6 +3697,8 @@ impl Workspace {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.options.mode = preset.mode;
             tab.options.highlight_matches = preset.highlight_match;
+            preset.match_case.apply_to(&mut tab.options.case_sensitive);
+            preset.whole_word.apply_to(&mut tab.options.whole_word);
         }
         self.show_goto = false;
         self.dismiss_presets(cx);
@@ -3745,23 +3736,20 @@ impl Workspace {
             return;
         }
         let existing = self.input.read(cx).as_str().to_owned();
-        if existing.is_empty()
-            && let Some(tab) = self.tabs.get_mut(self.active)
-        {
-            tab.options.highlight_matches = preset.highlight_match;
+        let appended = append_preset_to_regex(&existing, &tab.options, &preset);
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.options.case_sensitive = appended.case_sensitive;
+            tab.options.whole_word = appended.whole_word;
+            tab.options.highlight_matches = appended.highlight_matches;
         }
-        let (addition, raw_select_range) = preset.regex_pattern_and_select_range();
-        let (combined, offset) = append_regex_alternative_with_offset(&existing, &addition);
-        let shifted_range =
-            raw_select_range.map(|range| (range.start + offset)..(range.end + offset));
         self.show_goto = false;
         self.dismiss_presets(cx);
         self.preset_index = index;
         let has_select_text = preset.select_text.is_some();
         let select_warning = preset.select_text_warning();
         self.finish_preset_to_search(
-            combined,
-            shifted_range,
+            appended.pattern,
+            appended.select_range,
             has_select_text,
             select_warning,
             window,
@@ -6217,6 +6205,59 @@ impl Workspace {
                         };
                     let select_warning = preset.select_text_warning();
                     let warning_tip_theme = t.clone();
+                    let render_option_badge = |id_prefix: &'static str,
+                                               icon: Icon,
+                                               label: &'static str,
+                                               toggle: PresetToggle|
+                     -> Option<Stateful<Div>> {
+                        let (is_on, tip_text) = match toggle {
+                            PresetToggle::Leave => return None,
+                            PresetToggle::On => (true, format!("{label}: on")),
+                            PresetToggle::Off => (false, format!("{label}: off")),
+                        };
+                        let tip_theme = t.clone();
+                        let badge = div()
+                            .id((id_prefix, preset_index))
+                            .debug_selector(move || format!("{id_prefix}-{preset_index}"))
+                            .h(px(20.))
+                            .rounded_sm()
+                            .border_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .tooltip_show_delay(TOOLTIP_DELAY)
+                            .tooltip(move |_window, cx| {
+                                Tooltip::view(tip_text.clone(), None, tip_theme.clone(), cx)
+                            });
+                        let badge = if is_on {
+                            badge
+                                .w(px(20.))
+                                .bg(t.accent_subtle)
+                                .border_color(t.accent_border)
+                                .child(icon.element(px(12.), t.accent))
+                        } else {
+                            badge
+                                .px_1()
+                                .gap_0p5()
+                                .bg(t.background)
+                                .border_color(t.border)
+                                .child(icon.element(px(11.), t.muted))
+                                .child(Icon::Close.element(px(8.), t.muted))
+                        };
+                        Some(badge)
+                    };
+                    let match_case_badge = render_option_badge(
+                        "preset-match-case",
+                        Icon::CaseSensitive,
+                        "Match case",
+                        preset.match_case,
+                    );
+                    let whole_word_badge = render_option_badge(
+                        "preset-whole-word",
+                        Icon::WholeWord,
+                        "Whole words",
+                        preset.whole_word,
+                    );
 
                     list = list.child(
                         div()
@@ -6307,6 +6348,12 @@ impl Workspace {
                                                             )
                                                         }),
                                                 )
+                                            })
+                                            .when_some(match_case_badge, |el, badge| {
+                                                el.child(badge)
+                                            })
+                                            .when_some(whole_word_badge, |el, badge| {
+                                                el.child(badge)
                                             })
                                             .child(
                                                 div()
@@ -8397,6 +8444,8 @@ mod tests {
                 pattern: "error|fatal|panic".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -8404,6 +8453,8 @@ mod tests {
                 pattern: "warn".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -8411,6 +8462,8 @@ mod tests {
                 pattern: "GET|POST|PUT|DELETE".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -8418,6 +8471,8 @@ mod tests {
                 pattern: "HTTP 5\\d\\d".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -8425,6 +8480,8 @@ mod tests {
                 pattern: "401|403|unauthorized".into(),
                 mode: SearchMode::Regex,
                 highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
         ];
@@ -8647,6 +8704,8 @@ mod tests {
                 pattern: "ERROR".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -8654,6 +8713,8 @@ mod tests {
                 pattern: "GET .* port PORT_NUMBER".into(),
                 mode: SearchMode::Regex,
                 highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("PORT_NUMBER".into()),
             },
             config::Preset {
@@ -8661,6 +8722,8 @@ mod tests {
                 pattern: "user=שלום_NAME!".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("שלום_NAME".into()),
             },
         ];
@@ -8795,6 +8858,8 @@ mod tests {
                 pattern: "GET .* port 8080".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("PORT_NUMBER".into()),
             },
             config::Preset {
@@ -8802,6 +8867,8 @@ mod tests {
                 pattern: "warn".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some(String::new()),
             },
         ];
@@ -15138,6 +15205,8 @@ mod tests {
             pattern: "HTTP 5\\d\\d".into(),
             mode: SearchMode::Regex,
             highlight_match: true,
+            match_case: PresetToggle::Leave,
+            whole_word: PresetToggle::Leave,
             select_text: None,
         });
         config.search.presets.push(config::Preset {
@@ -15145,6 +15214,8 @@ mod tests {
             pattern: "401|403".into(),
             mode: SearchMode::Regex,
             highlight_match: true,
+            match_case: PresetToggle::Leave,
+            whole_word: PresetToggle::Leave,
             select_text: None,
         });
         cx.update(|cx| {
@@ -16478,31 +16549,31 @@ mod tests {
     #[test]
     fn append_regex_alternative_handles_empty_plain_and_escaped_trailing_pipes() {
         assert_eq!(
-            append_regex_alternative_with_offset("", "foo"),
+            search::append_regex_alternative_with_offset("", "foo"),
             ("foo".into(), 0)
         );
         assert_eq!(
-            append_regex_alternative_with_offset("alpha", "beta"),
+            search::append_regex_alternative_with_offset("alpha", "beta"),
             ("alpha|beta".into(), 6)
         );
         // Unescaped trailing pipe does not produce `||`.
         assert_eq!(
-            append_regex_alternative_with_offset("alpha|", "beta"),
+            search::append_regex_alternative_with_offset("alpha|", "beta"),
             ("alpha|beta".into(), 6)
         );
         // Escaped literal trailing pipe (`\|`) MUST still get an alternation separator.
         assert_eq!(
-            append_regex_alternative_with_offset(r"alpha\|", "beta"),
+            search::append_regex_alternative_with_offset(r"alpha\|", "beta"),
             (r"alpha\||beta".into(), 8)
         );
         // Escaped backslash followed by real pipe (`\\|`) does not produce `||`.
         assert_eq!(
-            append_regex_alternative_with_offset(r"alpha\\|", "beta"),
+            search::append_regex_alternative_with_offset(r"alpha\\|", "beta"),
             (r"alpha\\|beta".into(), 8)
         );
         // Three backslashes + pipe (`\\\|`) is an escaped pipe, so separator is added.
         assert_eq!(
-            append_regex_alternative_with_offset(r"alpha\\\|", "beta"),
+            search::append_regex_alternative_with_offset(r"alpha\\\|", "beta"),
             (r"alpha\\\||beta".into(), 10)
         );
     }
@@ -16521,6 +16592,8 @@ mod tests {
                 pattern: "ERROR|FATAL".into(),
                 mode: SearchMode::Regex,
                 highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -16528,6 +16601,8 @@ mod tests {
                 pattern: literal_special.into(),
                 mode: SearchMode::Literal,
                 highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -16535,6 +16610,8 @@ mod tests {
                 pattern: "DEBUG".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -16542,6 +16619,8 @@ mod tests {
                 pattern: String::new(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
         ];
@@ -16733,6 +16812,8 @@ mod tests {
                 pattern: "port=PORT_NUM".into(),
                 mode: SearchMode::Regex,
                 highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("PORT_NUM".into()),
             },
             config::Preset {
@@ -16740,6 +16821,8 @@ mod tests {
                 pattern: "[שלום] host=<HOST.NAME>".into(),
                 mode: SearchMode::Literal,
                 highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("<HOST.NAME>".into()),
             },
             config::Preset {
@@ -16747,6 +16830,8 @@ mod tests {
                 pattern: "WARN".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("MISSING".into()),
             },
         ];
@@ -17400,6 +17485,353 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.active, 0);
             assert_eq!(view.tabs[0].path, first_canon);
+        });
+    }
+
+    #[gpui::test]
+    fn applying_presets_respects_match_case_whole_word_specificity_and_dropdown_badges(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "AnyError".into(),
+                pattern: "err".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: None,
+            },
+            config::Preset {
+                name: "ExactErrWord".into(),
+                pattern: "err".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::On,
+                whole_word: PresetToggle::On,
+                select_text: None,
+            },
+            config::Preset {
+                name: "RegexRelaxed".into(),
+                pattern: "err|warn".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+                match_case: PresetToggle::Off,
+                whole_word: PresetToggle::Off,
+                select_text: None,
+            },
+            config::Preset {
+                name: "KeepCaseForceWord".into(),
+                pattern: "warn".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::On,
+                select_text: None,
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preset-options.log");
+        std::fs::write(
+            &path,
+            "err exact\nERR upper\nerror sub\nwarn exact\nWARN upper\nwarning sub\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Opening the Patterns dropdown renders option badges only for non-`leave` toggles.
+        view.update_in(cx, |view, window, cx| view.toggle_presets(window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("preset-match-case-0").is_none());
+        assert!(cx.debug_bounds("preset-whole-word-0").is_none());
+        assert!(cx.debug_bounds("preset-match-case-1").is_some());
+        assert!(cx.debug_bounds("preset-whole-word-1").is_some());
+        assert!(cx.debug_bounds("preset-match-case-2").is_some());
+        assert!(cx.debug_bounds("preset-whole-word-2").is_some());
+        assert!(cx.debug_bounds("preset-match-case-3").is_none());
+        assert!(cx.debug_bounds("preset-whole-word-3").is_some());
+
+        // 1. Apply Literal case-sensitive + whole-word preset: sets both toggles, matches only line 0,
+        //    and beats the less-specific `AnyError` preset with the same pattern/mode.
+        view.update_in(cx, |view, window, cx| view.apply_preset(1, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert_eq!(view.active_preset_index(cx), Some(1));
+        });
+
+        // Turning off whole_word detaches `ExactErrWord` (On) and falls back to `AnyError` (Leave).
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleWholeWord, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 2]);
+            assert_eq!(view.active_preset_index(cx), Some(0));
+        });
+
+        // 2. Apply Regex case-insensitive + non-whole-word preset (from Literal case-sensitive):
+        //    clears both toggles and matches all 6 lines.
+        view.update_in(cx, |view, window, cx| view.apply_preset(2, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(!view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2, 3, 4, 5]);
+            assert_eq!(view.active_preset_index(cx), Some(2));
+        });
+
+        // Manually toggling case_sensitive ON detaches `RegexRelaxed` (match_case: Off).
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleCaseSensitive, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].options.case_sensitive);
+            assert_eq!(view.active_preset_index(cx), None);
+        });
+
+        // 3. Apply `KeepCaseForceWord` (match_case: Leave, whole_word: On): preserves case_sensitive=true,
+        //    enables whole_word=true, and matches only lowercase whole-word "warn" (line 3).
+        view.update_in(cx, |view, window, cx| view.apply_preset(3, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![3]);
+            assert_eq!(view.active_preset_index(cx), Some(3));
+        });
+
+        // Toggling case_sensitive OFF keeps `KeepCaseForceWord` active since match_case is Leave.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleCaseSensitive, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.tabs[0].options.case_sensitive);
+            assert!(view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![3, 4]);
+            assert_eq!(view.active_preset_index(cx), Some(3));
+        });
+    }
+
+    #[gpui::test]
+    fn appending_presets_preserves_match_case_whole_word_and_select_text_across_combinations(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "LitExact".into(),
+                pattern: "ERROR".into(),
+                mode: SearchMode::Literal,
+                highlight_match: false,
+                match_case: PresetToggle::On,
+                whole_word: PresetToggle::On,
+                select_text: None,
+            },
+            config::Preset {
+                name: "LitRelaxed".into(),
+                pattern: "warn".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::Off,
+                whole_word: PresetToggle::Off,
+                select_text: None,
+            },
+            config::Preset {
+                name: "RegexWordCase".into(),
+                pattern: "GET|POST".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+                match_case: PresetToggle::On,
+                whole_word: PresetToggle::On,
+                select_text: None,
+            },
+            config::Preset {
+                name: "SelectLiteral".into(),
+                pattern: "[שלום] host=<HOST.NAME>".into(),
+                mode: SearchMode::Literal,
+                highlight_match: false,
+                match_case: PresetToggle::On,
+                whole_word: PresetToggle::Off,
+                select_text: Some("<HOST.NAME>".into()),
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("append-preset-options.log");
+        std::fs::write(
+            &path,
+            concat!(
+                "INFO boot\n",               // 0
+                "info ready\n",              // 1
+                "ERROR fail\n",              // 2
+                "error lower\n",             // 3
+                "ERRORS plural\n",           // 4
+                "WARNING disk\n",            // 5
+                "GET /health\n",             // 6
+                "get /health\n",             // 7
+                "TARGET /health\n",          // 8
+                "[שלום] host=api.prod ok\n", // 9
+                "[שלום] HOST=api.prod ok\n", // 10
+            ),
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.tabs[0].options.case_sensitive = false;
+            view.tabs[0].options.whole_word = false;
+            view.tabs[0].options.highlight_matches = true;
+            view.input.update(cx, |input, cx| input.emplace("info", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+
+        // 1. Active Regex case-insensitive non-whole-word ("info") + append Literal case-sensitive whole-word ("ERROR"):
+        //    wraps preset as `\b(?-i:ERROR)\b`, keeps global toggles off, matches lines 0, 1, 2 (NOT 3 or 4).
+        view.update_in(cx, |view, window, cx| view.append_preset(0, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), r"info|\b(?-i:ERROR)\b");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(!view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert!(view.tabs[0].options.highlight_matches);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2]);
+        });
+
+        // 2. Active Regex case-sensitive + whole-word ("ERROR") + append Literal case-insensitive non-whole-word ("warn"):
+        //    lifts existing to `\b(?:ERROR)\b`, turns global whole_word off, wraps preset as `(?i:warn)`,
+        //    matches lines 2 (exact whole word ERROR) and 5 (case-insensitive substring WARNING), NOT 3 or 4.
+        view.update(cx, |view, cx| {
+            view.tabs[0].options.case_sensitive = true;
+            view.tabs[0].options.whole_word = true;
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(1, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), r"\b(?:ERROR)\b|(?i:warn)");
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![2, 5]);
+        });
+
+        // 3. Chain-append Regex `match_case=On, whole_word=On` ("GET|POST") when global `case_sensitive=true`:
+        //    adds `\b(?:GET|POST)\b` without redundant `-i`, matching line 6 (NOT 7 or 8).
+        view.update_in(cx, |view, window, cx| view.append_preset(2, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.input.read(cx).as_str(),
+                r"\b(?:ERROR)\b|(?i:warn)|\b(?:GET|POST)\b"
+            );
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![2, 5, 6]);
+        });
+
+        // 4. Empty search in Regex mode + append Literal preset (`match_case=On, whole_word=On, highlight_match=false`):
+        //    adopts toggles directly with no inline wrappers and keeps Regex mode.
+        view.update(cx, |view, cx| {
+            view.input.update(cx, |input, cx| input.emplace("", cx));
+            view.tabs[0].options.case_sensitive = false;
+            view.tabs[0].options.whole_word = false;
+            view.tabs[0].options.highlight_matches = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(0, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "ERROR");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(view.tabs[0].options.whole_word);
+            assert!(!view.tabs[0].options.highlight_matches);
+            assert_eq!(view.tabs[0].results.matches, vec![2]);
+        });
+
+        // 5. Selectable literal preset with `match_case=On, whole_word=Off` appended onto case-insensitive
+        //    whole-word search: lifts existing, wraps preset in `(?-i:...)`, selects exact escaped placeholder,
+        //    defers search, and after typing replacement + Enter matches case-sensitively (line 9, NOT line 10).
+        let selected_range = |input: &Entity<EditableTextState>,
+                              window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+        view.update(cx, |view, cx| {
+            view.tabs[0].options.case_sensitive = false;
+            view.tabs[0].options.whole_word = true;
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(3, window, cx));
+        cx.run_until_parked();
+        let expected_before_edit = r"\b(?:ERROR)\b|(?-i:\[שלום\] host=<HOST\.NAME>)";
+        let start = expected_before_edit.find(r"<HOST\.NAME>").unwrap();
+        let end = start + r"<HOST\.NAME>".len();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), expected_before_edit);
+            assert_eq!(
+                selected_range(&view.input, window, cx),
+                utf16_range_for_utf8(expected_before_edit, start..end)
+            );
+            assert!(!view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.tabs[0].results.matches, vec![2, 3]);
+        });
+        cx.simulate_input(r"api\.prod");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].query,
+                r"\b(?:ERROR)\b|(?-i:\[שלום\] host=api\.prod)"
+            );
+            assert_eq!(view.tabs[0].results.matches, vec![2, 3, 9]);
         });
     }
 }

@@ -245,6 +245,68 @@ fn presets_parse_highlight_match_default_true_and_reject_non_booleans() {
 }
 
 #[test]
+fn presets_parse_match_case_and_whole_word_default_leave_and_reject_invalid_values() {
+    use nox::config::PresetToggle;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search.json");
+    fs::write(
+        &path,
+        r#"{
+            "presets": [
+                { "name": "Defaulted", "pattern": "err", "mode": "regex" },
+                { "name": "ExplicitLeave", "pattern": "info", "mode": "literal", "match_case": "leave", "whole_word": "leave" },
+                { "name": "OnOff", "pattern": "WARN", "mode": "literal", "match_case": "on", "whole_word": "off" },
+                { "name": "OffOn", "pattern": "GET|POST", "mode": "regex", "match_case": "off", "whole_word": "on" }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let config = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(config.search.presets.len(), 4);
+    assert_eq!(config.search.presets[0].match_case, PresetToggle::Leave);
+    assert_eq!(config.search.presets[0].whole_word, PresetToggle::Leave);
+    assert_eq!(config.search.presets[1].match_case, PresetToggle::Leave);
+    assert_eq!(config.search.presets[1].whole_word, PresetToggle::Leave);
+    assert_eq!(config.search.presets[2].match_case, PresetToggle::On);
+    assert_eq!(config.search.presets[2].whole_word, PresetToggle::Off);
+    assert_eq!(config.search.presets[3].match_case, PresetToggle::Off);
+    assert_eq!(config.search.presets[3].whole_word, PresetToggle::On);
+
+    // Invalid regex is still rejected when match_case / whole_word are specified.
+    fs::write(
+        &path,
+        r#"{"presets":[{"name":"BadRegex","pattern":"[","mode":"regex","match_case":"off","whole_word":"on"}]}"#,
+    )
+    .unwrap();
+    assert!(Config::load(Some(dir.path())).is_err());
+
+    // Strict enum rejects booleans, null, numbers, and unrecognized or miscased strings.
+    for field in ["match_case", "whole_word"] {
+        for bad_val in [
+            "true",
+            "false",
+            "null",
+            "1",
+            r#""yes""#,
+            r#""ON""#,
+            r#""Leave""#,
+            r#""""#,
+        ] {
+            let json = format!(
+                r#"{{"presets":[{{"name":"Bad","pattern":"err","mode":"regex","{field}":{bad_val}}}]}}"#
+            );
+            fs::write(&path, &json).unwrap();
+            assert!(
+                Config::load(Some(dir.path())).is_err(),
+                "accepted invalid preset {field}={bad_val}"
+            );
+        }
+    }
+}
+
+#[test]
 fn presets_parse_select_text_and_report_validation_warnings() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("search.json");
@@ -595,7 +657,10 @@ fn legacy_session_without_highlight_matches_or_results_height_loads_and_rejects_
         .as_array_mut()
         .unwrap()
     {
-        preset.as_object_mut().unwrap().remove("highlight_match");
+        let obj = preset.as_object_mut().unwrap();
+        obj.remove("highlight_match");
+        obj.remove("match_case");
+        obj.remove("whole_word");
     }
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
@@ -607,7 +672,9 @@ fn legacy_session_without_highlight_matches_or_results_height_loads_and_rejects_
             .options
             .presets
             .iter()
-            .all(|preset| preset.highlight_match)
+            .all(|preset| preset.highlight_match
+                && preset.match_case == nox::config::PresetToggle::Leave
+                && preset.whole_word == nox::config::PresetToggle::Leave)
     );
     assert_eq!(restored.results_height, None);
     assert_eq!(restored.zoom_percent, None);
@@ -764,15 +831,21 @@ fn shared_schema_definitions_are_deduplicated_and_all_refs_resolve() {
     let common_defs = common["$defs"]
         .as_object()
         .expect("common.schema.json must define $defs");
-    for expected in ["HexColor", "Preset", "SearchConfig", "SearchMode"] {
+    for expected in [
+        "HexColor",
+        "Preset",
+        "PresetToggle",
+        "SearchConfig",
+        "SearchMode",
+    ] {
         assert!(
             common_defs.contains_key(expected),
             "common.schema.json missing shared definition {expected}"
         );
     }
 
-    // `search.schema.json` and `session.schema.json` must share `SearchConfig`, `Preset`, and
-    // `SearchMode` via `common.schema.json` without duplicating them locally.
+    // `search.schema.json` and `session.schema.json` must share `SearchConfig`, `Preset`,
+    // `PresetToggle`, and `SearchMode` via `common.schema.json` without duplicating them locally.
     let search = &schemas["search.schema.json"];
     assert_eq!(search["$ref"], "common.schema.json#/$defs/SearchConfig");
     assert_eq!(search["unevaluatedProperties"], false);
@@ -781,6 +854,7 @@ fn shared_schema_definitions_are_deduplicated_and_all_refs_resolve() {
     let session = &schemas["session.schema.json"];
     let session_defs = session["$defs"].as_object().unwrap();
     assert!(!session_defs.contains_key("Preset"));
+    assert!(!session_defs.contains_key("PresetToggle"));
     assert!(!session_defs.contains_key("SearchMode"));
     assert_eq!(
         session_defs["SearchConfig"]["$ref"],
@@ -907,8 +981,8 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     )
     .unwrap();
 
-    // Partial search.json with custom presets: one missing `highlight_match` + deprecated key,
-    // one explicitly disabling `highlight_match`.
+    // Partial search.json with custom presets: one missing `highlight_match`/`match_case`/`whole_word`
+    // + deprecated key, one explicitly setting `highlight_match`/`match_case`/`whole_word`.
     fs::write(
         dir.path().join("search.json"),
         r#"{
@@ -925,7 +999,9 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
       "name": "NoHighlight",
       "pattern": "debug",
       "mode": "regex",
-      "highlight_match": false
+      "highlight_match": false,
+      "match_case": "on",
+      "whole_word": "off"
     }
   ]
 }
@@ -1039,10 +1115,14 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert_eq!(presets.len(), 2);
     assert_eq!(presets[0]["name"], "Custom");
     assert_eq!(presets[0]["highlight_match"], true);
+    assert_eq!(presets[0]["match_case"], "leave");
+    assert_eq!(presets[0]["whole_word"], "leave");
     assert_eq!(presets[0]["deprecated_priority"], 3);
     assert!(presets[0].get("select_text").is_none());
     assert_eq!(presets[1]["name"], "NoHighlight");
     assert_eq!(presets[1]["highlight_match"], false);
+    assert_eq!(presets[1]["match_case"], "on");
+    assert_eq!(presets[1]["whole_word"], "off");
     assert!(presets[1].get("select_text").is_none());
 
     // Check keyboard.json: custom & deprecated preserved, conflicts skipped, missing added.
@@ -1686,7 +1766,7 @@ fn restore_closed_tab_default_binding_and_migration() {
 
 #[test]
 fn preset_regex_pattern_and_select_range_escapes_literal_presets_and_maps_selection() {
-    use nox::config::{Preset, SearchMode};
+    use nox::config::{Preset, PresetToggle, SearchMode};
 
     // Regex preset is returned verbatim with its raw select_text range.
     let regex_preset = Preset {
@@ -1694,6 +1774,8 @@ fn preset_regex_pattern_and_select_range_escapes_literal_presets_and_maps_select
         pattern: r"GET .* port=(PORT_NUM)\b".into(),
         mode: SearchMode::Regex,
         highlight_match: true,
+        match_case: PresetToggle::Leave,
+        whole_word: PresetToggle::Leave,
         select_text: Some("PORT_NUM".into()),
     };
     let (pattern, range) = regex_preset.regex_pattern_and_select_range();
@@ -1707,6 +1789,8 @@ fn preset_regex_pattern_and_select_range_escapes_literal_presets_and_maps_select
         pattern: "[ERR] req(1.2)+$a|b".into(),
         mode: SearchMode::Literal,
         highlight_match: true,
+        match_case: PresetToggle::Leave,
+        whole_word: PresetToggle::Leave,
         select_text: None,
     };
     let (pattern, range) = literal_plain.regex_pattern_and_select_range();
@@ -1724,6 +1808,8 @@ fn preset_regex_pattern_and_select_range_escapes_literal_presets_and_maps_select
         pattern: "req[0] host=<HOST.NAME>+".into(),
         mode: SearchMode::Literal,
         highlight_match: false,
+        match_case: PresetToggle::Leave,
+        whole_word: PresetToggle::Leave,
         select_text: Some("<HOST.NAME>".into()),
     };
     let (pattern, range) = literal_selectable.regex_pattern_and_select_range();
@@ -1737,6 +1823,8 @@ fn preset_regex_pattern_and_select_range_escapes_literal_presets_and_maps_select
         pattern: "[שלום](ID).log".into(),
         mode: SearchMode::Literal,
         highlight_match: true,
+        match_case: PresetToggle::Leave,
+        whole_word: PresetToggle::Leave,
         select_text: Some("ID".into()),
     };
     let (pattern, range) = literal_unicode.regex_pattern_and_select_range();
