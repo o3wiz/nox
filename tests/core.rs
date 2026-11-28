@@ -245,6 +245,68 @@ fn presets_parse_highlight_match_default_true_and_reject_non_booleans() {
 }
 
 #[test]
+fn presets_parse_match_case_and_whole_word_default_leave_and_reject_invalid_values() {
+    use nox::config::PresetToggle;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search.json");
+    fs::write(
+        &path,
+        r#"{
+            "presets": [
+                { "name": "Defaulted", "pattern": "err", "mode": "regex" },
+                { "name": "ExplicitLeave", "pattern": "info", "mode": "literal", "match_case": "leave", "whole_word": "leave" },
+                { "name": "OnOff", "pattern": "WARN", "mode": "literal", "match_case": "on", "whole_word": "off" },
+                { "name": "OffOn", "pattern": "GET|POST", "mode": "regex", "match_case": "off", "whole_word": "on" }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let config = Config::load(Some(dir.path())).unwrap();
+    assert_eq!(config.search.presets.len(), 4);
+    assert_eq!(config.search.presets[0].match_case, PresetToggle::Leave);
+    assert_eq!(config.search.presets[0].whole_word, PresetToggle::Leave);
+    assert_eq!(config.search.presets[1].match_case, PresetToggle::Leave);
+    assert_eq!(config.search.presets[1].whole_word, PresetToggle::Leave);
+    assert_eq!(config.search.presets[2].match_case, PresetToggle::On);
+    assert_eq!(config.search.presets[2].whole_word, PresetToggle::Off);
+    assert_eq!(config.search.presets[3].match_case, PresetToggle::Off);
+    assert_eq!(config.search.presets[3].whole_word, PresetToggle::On);
+
+    // Invalid regex is still rejected when match_case / whole_word are specified.
+    fs::write(
+        &path,
+        r#"{"presets":[{"name":"BadRegex","pattern":"[","mode":"regex","match_case":"off","whole_word":"on"}]}"#,
+    )
+    .unwrap();
+    assert!(Config::load(Some(dir.path())).is_err());
+
+    // Strict enum rejects booleans, null, numbers, and unrecognized or miscased strings.
+    for field in ["match_case", "whole_word"] {
+        for bad_val in [
+            "true",
+            "false",
+            "null",
+            "1",
+            r#""yes""#,
+            r#""ON""#,
+            r#""Leave""#,
+            r#""""#,
+        ] {
+            let json = format!(
+                r#"{{"presets":[{{"name":"Bad","pattern":"err","mode":"regex","{field}":{bad_val}}}]}}"#
+            );
+            fs::write(&path, &json).unwrap();
+            assert!(
+                Config::load(Some(dir.path())).is_err(),
+                "accepted invalid preset {field}={bad_val}"
+            );
+        }
+    }
+}
+
+#[test]
 fn presets_parse_select_text_and_report_validation_warnings() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("search.json");
@@ -595,7 +657,10 @@ fn legacy_session_without_highlight_matches_or_results_height_loads_and_rejects_
         .as_array_mut()
         .unwrap()
     {
-        preset.as_object_mut().unwrap().remove("highlight_match");
+        let obj = preset.as_object_mut().unwrap();
+        obj.remove("highlight_match");
+        obj.remove("match_case");
+        obj.remove("whole_word");
     }
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
@@ -607,7 +672,9 @@ fn legacy_session_without_highlight_matches_or_results_height_loads_and_rejects_
             .options
             .presets
             .iter()
-            .all(|preset| preset.highlight_match)
+            .all(|preset| preset.highlight_match
+                && preset.match_case == nox::config::PresetToggle::Leave
+                && preset.whole_word == nox::config::PresetToggle::Leave)
     );
     assert_eq!(restored.results_height, None);
     assert_eq!(restored.zoom_percent, None);
@@ -764,15 +831,21 @@ fn shared_schema_definitions_are_deduplicated_and_all_refs_resolve() {
     let common_defs = common["$defs"]
         .as_object()
         .expect("common.schema.json must define $defs");
-    for expected in ["HexColor", "Preset", "SearchConfig", "SearchMode"] {
+    for expected in [
+        "HexColor",
+        "Preset",
+        "PresetToggle",
+        "SearchConfig",
+        "SearchMode",
+    ] {
         assert!(
             common_defs.contains_key(expected),
             "common.schema.json missing shared definition {expected}"
         );
     }
 
-    // `search.schema.json` and `session.schema.json` must share `SearchConfig`, `Preset`, and
-    // `SearchMode` via `common.schema.json` without duplicating them locally.
+    // `search.schema.json` and `session.schema.json` must share `SearchConfig`, `Preset`,
+    // `PresetToggle`, and `SearchMode` via `common.schema.json` without duplicating them locally.
     let search = &schemas["search.schema.json"];
     assert_eq!(search["$ref"], "common.schema.json#/$defs/SearchConfig");
     assert_eq!(search["unevaluatedProperties"], false);
@@ -781,6 +854,7 @@ fn shared_schema_definitions_are_deduplicated_and_all_refs_resolve() {
     let session = &schemas["session.schema.json"];
     let session_defs = session["$defs"].as_object().unwrap();
     assert!(!session_defs.contains_key("Preset"));
+    assert!(!session_defs.contains_key("PresetToggle"));
     assert!(!session_defs.contains_key("SearchMode"));
     assert_eq!(
         session_defs["SearchConfig"]["$ref"],
@@ -907,8 +981,8 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     )
     .unwrap();
 
-    // Partial search.json with custom presets: one missing `highlight_match` + deprecated key,
-    // one explicitly disabling `highlight_match`.
+    // Partial search.json with custom presets: one missing `highlight_match`/`match_case`/`whole_word`
+    // + deprecated key, one explicitly setting `highlight_match`/`match_case`/`whole_word`.
     fs::write(
         dir.path().join("search.json"),
         r#"{
@@ -925,7 +999,9 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
       "name": "NoHighlight",
       "pattern": "debug",
       "mode": "regex",
-      "highlight_match": false
+      "highlight_match": false,
+      "match_case": "on",
+      "whole_word": "off"
     }
   ]
 }
@@ -1039,10 +1115,14 @@ fn migrate_config_adds_missing_files_fields_preset_defaults_bindings_and_updates
     assert_eq!(presets.len(), 2);
     assert_eq!(presets[0]["name"], "Custom");
     assert_eq!(presets[0]["highlight_match"], true);
+    assert_eq!(presets[0]["match_case"], "leave");
+    assert_eq!(presets[0]["whole_word"], "leave");
     assert_eq!(presets[0]["deprecated_priority"], 3);
     assert!(presets[0].get("select_text").is_none());
     assert_eq!(presets[1]["name"], "NoHighlight");
     assert_eq!(presets[1]["highlight_match"], false);
+    assert_eq!(presets[1]["match_case"], "on");
+    assert_eq!(presets[1]["whole_word"], "off");
     assert!(presets[1].get("select_text").is_none());
 
     // Check keyboard.json: custom & deprecated preserved, conflicts skipped, missing added.
@@ -1613,4 +1693,313 @@ fn reset_horizontal_scroll_default_binding_and_migration() {
         KeyContext::Log,
         Command::ResetHorizontalScroll
     ));
+}
+
+#[test]
+fn restore_closed_tab_default_binding_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    assert!(has_binding(
+        &defaults,
+        "secondary-shift-t",
+        KeyContext::Workspace,
+        Command::RestoreClosedTab
+    ));
+
+    // Migrating an older keyboard.json with close_tab adds secondary-shift-t -> restore_closed_tab.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "secondary-w", "context": "Workspace", "action": "close_tab" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    assert!(has_binding(
+        &upgraded,
+        "secondary-shift-t",
+        KeyContext::Workspace,
+        Command::RestoreClosedTab
+    ));
+
+    // Custom rebindings for restore_closed_tab are preserved without adding secondary-shift-t.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "secondary-alt-t", "context": "Workspace", "action": "restore_closed_tab" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "secondary-alt-t",
+        KeyContext::Workspace,
+        Command::RestoreClosedTab
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-shift-t",
+        KeyContext::Workspace,
+        Command::RestoreClosedTab
+    ));
+}
+
+#[test]
+fn preset_regex_pattern_and_select_range_escapes_literal_presets_and_maps_selection() {
+    use nox::config::{Preset, PresetToggle, SearchMode};
+
+    // Regex preset is returned verbatim with its raw select_text range.
+    let regex_preset = Preset {
+        name: "Port".into(),
+        pattern: r"GET .* port=(PORT_NUM)\b".into(),
+        mode: SearchMode::Regex,
+        highlight_match: true,
+        match_case: PresetToggle::Leave,
+        whole_word: PresetToggle::Leave,
+        select_text: Some("PORT_NUM".into()),
+    };
+    let (pattern, range) = regex_preset.regex_pattern_and_select_range();
+    assert_eq!(pattern, regex_preset.pattern);
+    let range = range.expect("regex select range");
+    assert_eq!(&pattern[range], "PORT_NUM");
+
+    // Literal preset without select_text escapes all regex metacharacters.
+    let literal_plain = Preset {
+        name: "Literal".into(),
+        pattern: "[ERR] req(1.2)+$a|b".into(),
+        mode: SearchMode::Literal,
+        highlight_match: true,
+        match_case: PresetToggle::Leave,
+        whole_word: PresetToggle::Leave,
+        select_text: None,
+    };
+    let (pattern, range) = literal_plain.regex_pattern_and_select_range();
+    assert_eq!(pattern, regex::escape("[ERR] req(1.2)+$a|b"));
+    assert_eq!(range, None);
+    assert!(
+        regex::Regex::new(&pattern)
+            .unwrap()
+            .is_match("[ERR] req(1.2)+$a|b")
+    );
+
+    // Literal preset with metacharacters before AND inside select_text maps offsets accurately.
+    let literal_selectable = Preset {
+        name: "LiteralHost".into(),
+        pattern: "req[0] host=<HOST.NAME>+".into(),
+        mode: SearchMode::Literal,
+        highlight_match: false,
+        match_case: PresetToggle::Leave,
+        whole_word: PresetToggle::Leave,
+        select_text: Some("<HOST.NAME>".into()),
+    };
+    let (pattern, range) = literal_selectable.regex_pattern_and_select_range();
+    assert_eq!(pattern, regex::escape("req[0] host=<HOST.NAME>+"));
+    let range = range.expect("mapped literal select range");
+    assert_eq!(&pattern[range], r"<HOST\.NAME>");
+
+    // Unicode literal preset preserves UTF-8 boundaries when escaping.
+    let literal_unicode = Preset {
+        name: "Unicode".into(),
+        pattern: "[שלום](ID).log".into(),
+        mode: SearchMode::Literal,
+        highlight_match: true,
+        match_case: PresetToggle::Leave,
+        whole_word: PresetToggle::Leave,
+        select_text: Some("ID".into()),
+    };
+    let (pattern, range) = literal_unicode.regex_pattern_and_select_range();
+    assert_eq!(pattern, regex::escape("[שלום](ID).log"));
+    let range = range.expect("unicode literal select range");
+    assert_eq!(&pattern[range], "ID");
+}
+
+#[test]
+fn append_preset_default_binding_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    assert!(has_binding(
+        &defaults,
+        "secondary-enter",
+        KeyContext::PresetsRegexMode,
+        Command::AppendPreset
+    ));
+
+    // Migrating an older keyboard.json with Presets bindings adds secondary-enter in Presets && RegexMode.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "enter", "context": "Presets", "action": "apply_preset" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    assert!(has_binding(
+        &upgraded,
+        "secondary-enter",
+        KeyContext::PresetsRegexMode,
+        Command::AppendPreset
+    ));
+
+    // Custom rebindings for append_preset are preserved without adding secondary-enter.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "alt-enter", "context": "Presets && RegexMode", "action": "append_preset" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    assert!(has_binding(
+        &custom_migrated,
+        "alt-enter",
+        KeyContext::PresetsRegexMode,
+        Command::AppendPreset
+    ));
+    assert!(!has_binding(
+        &custom_migrated,
+        "secondary-enter",
+        KeyContext::PresetsRegexMode,
+        Command::AppendPreset
+    ));
+}
+
+#[test]
+fn tab_switch_and_move_default_bindings_and_migration() {
+    use nox::config::{Command, KeyContext};
+
+    let defaults = Config::load(None).unwrap();
+    let has_binding = |cfg: &Config, keys: &str, context: KeyContext, action: Command| {
+        cfg.keyboard
+            .bindings
+            .iter()
+            .any(|b| b.keys == keys && b.context == context && b.action == action)
+    };
+
+    for (keys, action) in [
+        ("ctrl-tab", Command::NextTab),
+        ("ctrl-pagedown", Command::NextTab),
+        ("ctrl-shift-tab", Command::PreviousTab),
+        ("ctrl-pageup", Command::PreviousTab),
+        ("ctrl-shift-pagedown", Command::MoveTabNext),
+        ("ctrl-shift-pageup", Command::MoveTabPrevious),
+    ] {
+        assert!(
+            has_binding(&defaults, keys, KeyContext::Workspace, action),
+            "missing default Workspace binding {keys} -> {action:?}"
+        );
+    }
+
+    // Migrating an older keyboard.json with ctrl-tab/ctrl-shift-tab adds ctrl-pagedown/ctrl-pageup
+    // for tab switching and ctrl-shift-pagedown/ctrl-shift-pageup for tab relocation.
+    let upgrade_dir = tempdir().unwrap();
+    fs::write(
+        upgrade_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "ctrl-tab", "context": "Workspace", "action": "next_tab" },
+    { "keys": "ctrl-shift-tab", "context": "Workspace", "action": "previous_tab" }
+  ]
+}"#,
+    )
+    .unwrap();
+    let report = config::migrate_config(upgrade_dir.path()).unwrap();
+    assert!(report.added_bindings > 0);
+    let upgraded = Config::load(Some(upgrade_dir.path())).unwrap();
+    for (keys, action) in [
+        ("ctrl-tab", Command::NextTab),
+        ("ctrl-pagedown", Command::NextTab),
+        ("ctrl-shift-tab", Command::PreviousTab),
+        ("ctrl-pageup", Command::PreviousTab),
+        ("ctrl-shift-pagedown", Command::MoveTabNext),
+        ("ctrl-shift-pageup", Command::MoveTabPrevious),
+    ] {
+        assert!(
+            has_binding(&upgraded, keys, KeyContext::Workspace, action),
+            "expected migrated Workspace binding {keys} -> {action:?}"
+        );
+    }
+
+    // Custom rebindings for tab switching and tab relocation are preserved without adding defaults.
+    let custom_dir = tempdir().unwrap();
+    fs::write(
+        custom_dir.path().join("keyboard.json"),
+        r#"{
+  "$schema": "schemas/keyboard.schema.json",
+  "bindings": [
+    { "keys": "alt-]", "context": "Workspace", "action": "next_tab" },
+    { "keys": "alt-[", "context": "Workspace", "action": "previous_tab" },
+    { "keys": "alt-pagedown", "context": "Workspace", "action": "move_tab_next" },
+    { "keys": "alt-pageup", "context": "Workspace", "action": "move_tab_previous" }
+  ]
+}"#,
+    )
+    .unwrap();
+    config::migrate_config(custom_dir.path()).unwrap();
+    let custom_migrated = Config::load(Some(custom_dir.path())).unwrap();
+    for (keys, action) in [
+        ("alt-]", Command::NextTab),
+        ("alt-[", Command::PreviousTab),
+        ("alt-pagedown", Command::MoveTabNext),
+        ("alt-pageup", Command::MoveTabPrevious),
+    ] {
+        assert!(has_binding(
+            &custom_migrated,
+            keys,
+            KeyContext::Workspace,
+            action
+        ));
+    }
+    for (keys, action) in [
+        ("ctrl-pagedown", Command::NextTab),
+        ("ctrl-pageup", Command::PreviousTab),
+        ("ctrl-shift-pagedown", Command::MoveTabNext),
+        ("ctrl-shift-pageup", Command::MoveTabPrevious),
+    ] {
+        assert!(!has_binding(
+            &custom_migrated,
+            keys,
+            KeyContext::Workspace,
+            action
+        ));
+    }
 }

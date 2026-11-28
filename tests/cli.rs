@@ -1,4 +1,7 @@
-use std::process::Command;
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
 
 #[test]
 fn help_version_and_configuration_validation_do_not_require_a_window() {
@@ -11,6 +14,8 @@ fn help_version_and_configuration_validation_do_not_require_a_window() {
     assert!(help_stdout.contains("--config-dir"));
     assert!(help_stdout.contains("--migrate-config"));
     assert!(help_stdout.contains("--version"));
+    assert!(help_stdout.contains("[FILE | - ...]"));
+    assert!(help_stdout.contains("standard input"));
 
     for flag in ["--version", "-V"] {
         let version = Command::new(env!("CARGO_BIN_EXE_nox"))
@@ -319,4 +324,38 @@ fn ignores_macos_launch_services_psn_argument() {
         .unwrap();
     assert!(check.status.success());
     assert!(String::from_utf8_lossy(&check.stdout).contains("Configuration valid"));
+}
+
+#[test]
+fn non_gui_cli_flags_succeed_when_stdin_is_piped_and_migrate_rejects_dash() {
+    for args in [vec!["--help"], vec!["--version"], vec!["--check-config"]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_nox"))
+            .env_remove("NOX_CONFIG_DIR")
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = stdin.write_all(b"piped log line\n");
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "args {args:?} failed with piped stdin: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let invalid = Command::new(env!("CARGO_BIN_EXE_nox"))
+        .env_remove("NOX_CONFIG_DIR")
+        .args(["--migrate-config", "-"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr)
+            .contains("--migrate-config accepts at most one directory")
+    );
 }

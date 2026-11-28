@@ -20,16 +20,19 @@ use gpui_ce_elements::editable_text::{
 };
 use icons::Icon;
 use nox::{
-    config::{self, Command, Config, SearchConfig, SearchMode},
+    config::{self, Command, Config, PresetToggle, SearchConfig, SearchMode},
     fuzzy::{self, PresetMatch},
     logfile::{LogFile, Stamp},
     path_complete::{
         CompletionResult, PathCompletion, complete_path, ensure_trailing_separator, home_dir,
         resolve_input_path,
     },
-    search::{self, MatchCopyResult, SearchResults},
+    search::{
+        self, MatchCopyResult, SearchResults, append_preset_to_regex, append_regex_alternative,
+    },
     selection::{LineSelection, TextPosition, TextSelection, word_range_at},
     session::{self, SavedTab, Session},
+    stdin::StdinSpool,
     zoom::{
         DEFAULT_ZOOM_PERCENT, MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, ZoomMetrics, clamp_zoom_percent,
         scaled_scroll_offset, zoom_in_percent, zoom_out_percent,
@@ -50,7 +53,7 @@ use selectable_text::{RowLayoutCache, SelectableRowText, TextPressEvent};
 use serde::Deserialize;
 use std::{
     cell::Cell,
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashSet, VecDeque},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -162,16 +165,6 @@ fn sanitize_single_line_search_text(text: &str) -> String {
     text.replace(['\r', '\n'], "")
 }
 
-fn append_regex_alternative(existing: &str, selected: &str) -> String {
-    if existing.is_empty() {
-        selected.to_owned()
-    } else if existing.ends_with('|') {
-        format!("{existing}{selected}")
-    } else {
-        format!("{existing}|{selected}")
-    }
-}
-
 fn utf16_range_for_utf8(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
     let start = text[..range.start].encode_utf16().count();
     let end = start + text[range.start..range.end].encode_utf16().count();
@@ -181,6 +174,7 @@ fn utf16_range_for_utf8(text: &str, range: std::ops::Range<usize>) -> std::ops::
 const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BULK_BOOKMARK_LINES: usize = 100_000;
 const SEARCH_INDICATOR_DELAY: Duration = Duration::from_millis(150);
+const MAX_CLOSED_TABS: usize = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
@@ -221,14 +215,22 @@ struct PendingReveal {
     strategy: RevealStrategy,
 }
 
+pub enum InputSource {
+    File(PathBuf),
+    Stdin(StdinSpool),
+}
+
 struct Tab {
     id: usize,
     path: PathBuf,
     log: Option<Arc<LogFile>>,
+    stdin: Option<StdinSpool>,
+    stdin_finished: bool,
     loading: bool,
     searching: bool,
     searching_since: Option<Instant>,
     searching_visible: bool,
+    refreshing_search: bool,
     load_cancel: Arc<AtomicBool>,
     search_cancel: Arc<AtomicBool>,
     revision: usize,
@@ -251,6 +253,122 @@ struct Tab {
 }
 
 impl Tab {
+    fn new(id: usize, path: PathBuf, options: SearchConfig, follow: bool) -> Self {
+        Self {
+            id,
+            path,
+            log: None,
+            stdin: None,
+            stdin_finished: false,
+            loading: false,
+            searching: false,
+            searching_since: None,
+            searching_visible: false,
+            refreshing_search: false,
+            load_cancel: Arc::new(AtomicBool::new(false)),
+            search_cancel: Arc::new(AtomicBool::new(false)),
+            revision: 0,
+            query: String::new(),
+            options,
+            highlight_regex: None,
+            results: SearchResults::default(),
+            bookmarks: BTreeSet::new(),
+            selected: 0,
+            main_selection: LineSelection::single(0),
+            result_selection: LineSelection::empty(),
+            main_text_selection: None,
+            result_text_selection: None,
+            follow,
+            scroll: UniformListScrollHandle::new(),
+            result_scroll: UniformListScrollHandle::new(),
+            pending_main_reveal: None,
+            pending_results_reveal: None,
+            error: None,
+        }
+    }
+
+    fn to_saved(&self, query: String) -> SavedTab {
+        SavedTab {
+            path: self.path.clone(),
+            query,
+            options: self.options.clone(),
+            bookmarks: self.bookmarks.clone(),
+            selected: self.selected,
+            follow: self.follow,
+        }
+    }
+
+    fn apply_saved(&mut self, saved: SavedTab) {
+        self.query = saved.query;
+        self.options = saved.options;
+        self.sync_highlight_regex();
+        self.bookmarks = saved.bookmarks;
+        self.selected = saved.selected;
+        self.main_selection = LineSelection::single(saved.selected);
+        self.follow = saved.follow;
+    }
+
+    fn is_stdin(&self) -> bool {
+        self.stdin.is_some()
+    }
+
+    fn is_streaming_stdin(&self) -> bool {
+        self.stdin
+            .as_ref()
+            .is_some_and(|spool| !spool.is_finished())
+    }
+
+    fn label(&self) -> String {
+        if self.is_stdin() {
+            "stdin".to_owned()
+        } else {
+            file_label(&self.path)
+        }
+    }
+
+    fn tooltip(&self) -> String {
+        if self.is_stdin() {
+            if self.is_streaming_stdin() {
+                "Standard input (streaming…)".to_owned()
+            } else {
+                "Standard input".to_owned()
+            }
+        } else {
+            self.path.display().to_string()
+        }
+    }
+
+    fn path_bar_text(&self) -> String {
+        if self.is_stdin() {
+            String::new()
+        } else {
+            self.path.display().to_string()
+        }
+    }
+
+    fn path_bar_placeholder(&self) -> &'static str {
+        if self.is_stdin() {
+            if self.is_streaming_stdin() {
+                "Standard input (streaming…)"
+            } else {
+                "Standard input"
+            }
+        } else {
+            "Enter file path…"
+        }
+    }
+
+    fn clear_searching(&mut self) {
+        self.searching = false;
+        self.searching_since = None;
+        self.searching_visible = false;
+        self.refreshing_search = false;
+    }
+
+    fn show_searching_indicator(&self) -> bool {
+        self.searching_visible && !self.query.is_empty()
+    }
+
     fn sync_highlight_regex(&mut self) {
         self.highlight_regex = if self.query.is_empty() || self.options.invert {
             None
@@ -284,6 +402,11 @@ impl Drop for Tab {
         self.load_cancel.store(true, Ordering::Relaxed);
         self.search_cancel.store(true, Ordering::Relaxed);
     }
+}
+
+struct ClosedTab {
+    index: usize,
+    saved: SavedTab,
 }
 
 enum Message {
@@ -340,6 +463,7 @@ pub struct Workspace {
     theme: Theme,
     highlights: Vec<(Regex, u32)>,
     tabs: Vec<Tab>,
+    closed_tabs: VecDeque<ClosedTab>,
     active: usize,
     next_id: usize,
     input: Entity<EditableTextState>,
@@ -387,6 +511,7 @@ pub struct Workspace {
     _timer: Task<()>,
     _subscriptions: Vec<Subscription>,
     state_path: Option<PathBuf>,
+    ephemeral_only: bool,
     recent: Vec<PathBuf>,
     show_files: bool,
     header_click_armed: bool,
@@ -397,9 +522,24 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    #[cfg(test)]
     fn new(
         config: Config,
         paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_inputs(
+            config,
+            paths.into_iter().map(InputSource::File).collect(),
+            window,
+            cx,
+        )
+    }
+
+    fn new_with_inputs(
+        config: Config,
+        inputs: Vec<InputSource>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -451,11 +591,19 @@ impl Workspace {
         } else {
             Session::default()
         };
-        let restore = paths.is_empty() && config.files.restore_session;
-        let paths = if restore {
-            saved.tabs.iter().map(|tab| tab.path.clone()).collect()
+        let restore = inputs.is_empty() && config.files.restore_session;
+        let ephemeral_only = !inputs.is_empty()
+            && inputs
+                .iter()
+                .all(|input| matches!(input, InputSource::Stdin(_)));
+        let inputs = if restore {
+            saved
+                .tabs
+                .iter()
+                .map(|tab| InputSource::File(tab.path.clone()))
+                .collect()
         } else {
-            paths
+            inputs
         };
         let results_height = if config.files.restore_session {
             saved.results_height.unwrap_or(config.window.results_height)
@@ -530,6 +678,7 @@ impl Workspace {
             config,
             highlights,
             tabs: Vec::new(),
+            closed_tabs: VecDeque::new(),
             active: 0,
             next_id: 0,
             input: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
@@ -581,6 +730,7 @@ impl Workspace {
             } else {
                 None
             },
+            ephemeral_only,
             recent: saved.recent,
             show_files: false,
             header_click_armed: false,
@@ -589,18 +739,15 @@ impl Workspace {
             #[cfg(test)]
             quit_count: 0,
         };
-        for path in paths {
-            this.open(path, cx);
+        for input in inputs {
+            match input {
+                InputSource::File(path) => this.open(path, cx),
+                InputSource::Stdin(spool) => this.open_stdin(spool, cx),
+            }
         }
         if restore {
             for (tab, saved) in this.tabs.iter_mut().zip(saved.tabs) {
-                tab.query = saved.query;
-                tab.options = saved.options;
-                tab.sync_highlight_regex();
-                tab.bookmarks = saved.bookmarks;
-                tab.selected = saved.selected;
-                tab.main_selection = LineSelection::single(saved.selected);
-                tab.follow = saved.follow;
+                tab.apply_saved(saved);
             }
             this.active = saved.active.min(this.tabs.len().saturating_sub(1));
             let query = this
@@ -631,35 +778,38 @@ impl Workspace {
     }
 
     fn save_session(&self, cx: &App) {
-        if !self.config.files.save_session {
+        if !self.config.files.save_session || self.ephemeral_only {
             return;
         }
         let Some(path) = &self.state_path else {
             return;
         };
+        let mut persisted_tabs = Vec::new();
+        let mut persisted_active = 0;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if tab.is_stdin() {
+                continue;
+            }
+            if index == self.active {
+                persisted_active = persisted_tabs.len();
+            }
+            let query = if index == self.active {
+                self.input.read(cx).as_str().to_owned()
+            } else {
+                tab.query.clone()
+            };
+            persisted_tabs.push(tab.to_saved(query));
+        }
+        if !self.tabs.is_empty() && persisted_tabs.is_empty() {
+            return;
+        }
         let session = Session {
             version: 1,
-            active: self.active,
+            active: persisted_active,
             recent: self.recent.clone(),
             results_height: Some(self.target_results_height.round()),
             zoom_percent: (self.zoom_percent != DEFAULT_ZOOM_PERCENT).then_some(self.zoom_percent),
-            tabs: self
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(index, tab)| SavedTab {
-                    path: tab.path.clone(),
-                    query: if index == self.active {
-                        self.input.read(cx).as_str().to_owned()
-                    } else {
-                        tab.query.clone()
-                    },
-                    options: tab.options.clone(),
-                    bookmarks: tab.bookmarks.clone(),
-                    selected: tab.selected,
-                    follow: tab.follow,
-                })
-                .collect(),
+            tabs: persisted_tabs,
         };
         if let Err(error) = session.save(path) {
             eprintln!("Cannot save session {}: {error}", path.display());
@@ -668,50 +818,77 @@ impl Workspace {
 
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let path = path.canonicalize().unwrap_or(path);
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| !tab.is_stdin() && tab.path == path)
+        {
             self.switch(index, cx);
             return;
         }
+        self.ephemeral_only = false;
         self.recent.retain(|recent| recent != &path);
         self.recent.insert(0, path.clone());
         self.recent.truncate(self.config.files.recent_limit);
         self.show_files = false;
         self.next_id += 1;
-        self.tabs.push(Tab {
-            id: self.next_id,
+        self.tabs.push(Tab::new(
+            self.next_id,
             path,
-            log: None,
-            loading: false,
-            searching: false,
-            searching_since: None,
-            searching_visible: false,
-            load_cancel: Arc::new(AtomicBool::new(false)),
-            search_cancel: Arc::new(AtomicBool::new(false)),
-            revision: 0,
-            query: String::new(),
-            options: self.config.search.clone(),
-            highlight_regex: None,
-            results: SearchResults::default(),
-            bookmarks: BTreeSet::new(),
-            selected: 0,
-            main_selection: LineSelection::single(0),
-            result_selection: LineSelection::empty(),
-            main_text_selection: None,
-            result_text_selection: None,
-            follow: self.config.viewer.follow,
-            scroll: UniformListScrollHandle::new(),
-            result_scroll: UniformListScrollHandle::new(),
-            pending_main_reveal: None,
-            pending_results_reveal: None,
-            error: None,
-        });
+            self.config.search.clone(),
+            self.config.viewer.follow,
+        ));
+        self.switch(self.tabs.len() - 1, cx);
+        self.load(self.active);
+        cx.notify();
+    }
+
+    fn open_stdin(&mut self, spool: StdinSpool, cx: &mut Context<Self>) {
+        let path = spool.path().to_path_buf();
+        let stdin_finished = spool.is_finished();
+        self.show_files = false;
+        self.next_id += 1;
+        let mut tab = Tab::new(
+            self.next_id,
+            path,
+            self.config.search.clone(),
+            self.config.viewer.follow,
+        );
+        tab.stdin = Some(spool);
+        tab.stdin_finished = stdin_finished;
+        self.tabs.push(tab);
         self.switch(self.tabs.len() - 1, cx);
         self.load(self.active);
         cx.notify();
     }
 
     fn switch(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
+        self.activate_tab(index, true, cx);
+    }
+
+    fn move_active_tab(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        if self.tabs.len() <= 1 || self.active >= self.tabs.len() {
+            return false;
+        }
+        let target = if forward {
+            if self.active + 1 >= self.tabs.len() {
+                return false;
+            }
+            self.active + 1
+        } else {
+            if self.active == 0 {
+                return false;
+            }
+            self.active - 1
+        };
+        self.tabs.swap(self.active, target);
+        self.active = target;
+        cx.notify();
+        true
+    }
+
+    fn activate_tab(&mut self, index: usize, save_current_query: bool, cx: &mut Context<Self>) {
+        if save_current_query && let Some(tab) = self.tabs.get_mut(self.active) {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.active = index;
@@ -736,13 +913,64 @@ impl Workspace {
         cx.notify();
     }
 
+    fn record_closed_tab(&mut self, index: usize, tab: &Tab) {
+        if tab.is_stdin() {
+            return;
+        }
+        self.closed_tabs
+            .retain(|closed| closed.saved.path != tab.path);
+        if self.closed_tabs.len() >= MAX_CLOSED_TABS {
+            self.closed_tabs.pop_front();
+        }
+        self.closed_tabs.push_back(ClosedTab {
+            index,
+            saved: tab.to_saved(tab.query.clone()),
+        });
+    }
+
+    fn restore_closed_tab(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = loop {
+            let Some(entry) = self.closed_tabs.pop_back() else {
+                return false;
+            };
+            if !self
+                .tabs
+                .iter()
+                .any(|tab| !tab.is_stdin() && tab.path == entry.saved.path)
+            {
+                break entry;
+            }
+        };
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.query = self.input.read(cx).as_str().to_string();
+        }
+        let path = closed.saved.path.clone();
+        self.ephemeral_only = false;
+        self.recent.retain(|recent| recent != &path);
+        self.recent.insert(0, path.clone());
+        self.recent.truncate(self.config.files.recent_limit);
+        self.show_files = false;
+        self.show_goto = false;
+        self.next_id += 1;
+        let mut tab = Tab::new(
+            self.next_id,
+            path,
+            self.config.search.clone(),
+            self.config.viewer.follow,
+        );
+        tab.apply_saved(closed.saved);
+        let insert_index = closed.index.min(self.tabs.len());
+        self.tabs.insert(insert_index, tab);
+        self.activate_tab(insert_index, false, cx);
+        self.load(insert_index);
+        true
+    }
+
     fn close_tab_at(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
-        if index != self.active
-            && let Some(tab) = self.tabs.get_mut(self.active)
-        {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.query = self.input.read(cx).as_str().to_string();
         }
         self.header_click_armed = false;
@@ -756,7 +984,8 @@ impl Workspace {
         self.clear_row_layouts();
         self.dismiss_presets(cx);
         self.close_path_completions();
-        self.tabs.remove(index);
+        let removed = self.tabs.remove(index);
+        self.record_closed_tab(index, &removed);
         if self.tabs.is_empty() {
             self.active = 0;
             self.active_pane = Pane::Main;
@@ -785,6 +1014,7 @@ impl Workspace {
             return;
         }
         let path = path.canonicalize().unwrap_or(path);
+        self.ephemeral_only = false;
         self.recent.retain(|recent| recent != &path);
         self.recent.insert(0, path.clone());
         self.recent.truncate(self.config.files.recent_limit);
@@ -794,7 +1024,7 @@ impl Workspace {
         self.close_path_completions();
 
         let active = self.active;
-        if self.tabs[active].path == path {
+        if !self.tabs[active].is_stdin() && self.tabs[active].path == path {
             self.sync_path_input(cx);
             self.load(active);
             cx.notify();
@@ -820,10 +1050,10 @@ impl Workspace {
         tab.id = new_id;
         tab.path = path;
         tab.log = None;
+        tab.stdin = None;
+        tab.stdin_finished = false;
         tab.loading = false;
-        tab.searching = false;
-        tab.searching_since = None;
-        tab.searching_visible = false;
+        tab.clear_searching();
         tab.load_cancel = Arc::new(AtomicBool::new(false));
         tab.search_cancel = Arc::new(AtomicBool::new(false));
         tab.revision += 1;
@@ -855,9 +1085,7 @@ impl Workspace {
         tab.loading = true;
         tab.search_cancel.store(true, Ordering::Relaxed);
         tab.revision += 1;
-        tab.searching = false;
-        tab.searching_since = None;
-        tab.searching_visible = false;
+        tab.clear_searching();
         let (id, path, cancel, sender) = (
             tab.id,
             tab.path.clone(),
@@ -886,6 +1114,7 @@ impl Workspace {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
+        let previous_query = tab.query.clone();
         if index == self.active {
             tab.query = self.input.read(cx).as_str().to_string();
         }
@@ -896,16 +1125,17 @@ impl Workspace {
         let Some(log) = tab.log.clone() else {
             return;
         };
-        tab.error = None;
+        let previous_error = std::mem::replace(
+            &mut tab.error,
+            tab.stdin.as_ref().and_then(StdinSpool::error),
+        );
         let marks = if include_bookmarks {
             tab.bookmarks.clone()
         } else {
             BTreeSet::new()
         };
         if tab.query.is_empty() {
-            tab.searching = false;
-            tab.searching_since = None;
-            tab.searching_visible = false;
+            tab.clear_searching();
             let (visible, widest_row) =
                 search::visible_rows(&log, &[], tab.options.context_lines, &marks);
             let results = SearchResults {
@@ -936,6 +1166,8 @@ impl Workspace {
         tab.searching = true;
         tab.searching_since = Some(Instant::now());
         tab.searching_visible = false;
+        tab.refreshing_search =
+            preserve_selection && previous_query == tab.query && previous_error.is_none();
         let (id, revision, query, options, cancel) = (
             tab.id,
             tab.revision,
@@ -975,9 +1207,7 @@ impl Workspace {
         else {
             return;
         };
-        tab.searching = false;
-        tab.searching_since = None;
-        tab.searching_visible = false;
+        tab.clear_searching();
         match result {
             Ok(mut results) => {
                 tab.sync_highlight_regex();
@@ -1094,7 +1324,7 @@ impl Workspace {
                                 tab.bookmarks.retain(|&line| line < log.len());
                                 let non_empty = !log.is_empty();
                                 tab.log = Some(log);
-                                tab.error = None;
+                                tab.error = tab.stdin.as_ref().and_then(StdinSpool::error);
                                 if tab.follow {
                                     tab.pending_main_reveal = None;
                                     tab.scroll.scroll_to_bottom();
@@ -1123,14 +1353,44 @@ impl Workspace {
                 }
             }
         }
-        for tab in &mut self.tabs {
-            if tab.searching
-                && !tab.searching_visible
-                && tab
-                    .searching_since
-                    .is_some_and(|since| since.elapsed() >= SEARCH_INDICATOR_DELAY)
+        for index in 0..self.tabs.len() {
+            let mut reload_stdin_now = false;
             {
-                tab.searching_visible = true;
+                let tab = &mut self.tabs[index];
+                if tab.searching
+                    && !tab.searching_visible
+                    && tab
+                        .searching_since
+                        .is_some_and(|since| since.elapsed() >= SEARCH_INDICATOR_DELAY)
+                {
+                    tab.searching_visible = true;
+                    changed = true;
+                }
+                if let Some(spool) = &tab.stdin {
+                    let finished = spool.is_finished();
+                    if finished && !tab.stdin_finished {
+                        tab.stdin_finished = true;
+                        changed = true;
+                    }
+                    if let Some(error) = spool.error()
+                        && tab.error.is_none()
+                    {
+                        tab.error = Some(error);
+                        changed = true;
+                    }
+                    if !tab.loading
+                        && !tab.searching
+                        && let Some(log) = &tab.log
+                    {
+                        let written = spool.bytes_written();
+                        if written > log.stamp.len && (log.stamp.len == 0 || finished) {
+                            reload_stdin_now = true;
+                        }
+                    }
+                }
+            }
+            if reload_stdin_now {
+                self.load(index);
                 changed = true;
             }
         }
@@ -1142,16 +1402,23 @@ impl Workspace {
                     && !tab.searching
                     && let Some(log) = &tab.log
                 {
-                    match Stamp::read(&tab.path) {
-                        Ok(stamp) if stamp != log.stamp => {
+                    if let Some(spool) = &tab.stdin {
+                        if !spool.is_finished() && spool.bytes_written() > log.stamp.len {
                             self.load(index);
                             changed = true;
                         }
-                        Err(error) => {
-                            self.tabs[index].error = Some(format!("Watching file: {error}"));
-                            changed = true;
+                    } else {
+                        match Stamp::read(&tab.path) {
+                            Ok(stamp) if stamp != log.stamp => {
+                                self.load(index);
+                                changed = true;
+                            }
+                            Err(error) => {
+                                self.tabs[index].error = Some(format!("Watching file: {error}"));
+                                changed = true;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -1196,10 +1463,15 @@ impl Workspace {
             return;
         };
         let indices = tab.results.visible.clone();
-        let picker = cx.prompt_for_new_path(
-            log.path.parent().unwrap_or(Path::new(".")),
-            Some("nox-results.log"),
-        );
+        let default_dir = if tab.is_stdin() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            log.path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+        let picker = cx.prompt_for_new_path(&default_dir, Some("nox-results.log"));
         let sender = self.sender.clone();
         cx.spawn(async move |this, cx| match picker.await {
             Ok(Ok(Some(path))) => {
@@ -2201,6 +2473,10 @@ impl Workspace {
                 self.apply_selected_preset(window, cx);
                 return;
             }
+            Command::AppendPreset => {
+                self.append_selected_preset(window, cx);
+                return;
+            }
             Command::NextLine
             | Command::PreviousLine
             | Command::FirstLine
@@ -2539,6 +2815,9 @@ impl Workspace {
                     self.focus.focus(window, cx);
                 }
             }
+            Command::RestoreClosedTab => {
+                self.restore_closed_tab(cx);
+            }
             Command::NextTab => {
                 if !self.tabs.is_empty() {
                     self.switch((self.active + 1) % self.tabs.len(), cx);
@@ -2549,6 +2828,14 @@ impl Workspace {
                     let len = self.tabs.len();
                     self.switch((self.active + len - 1) % len, cx);
                 }
+            }
+            Command::MoveTabNext => {
+                self.move_active_tab(true, cx);
+                return;
+            }
+            Command::MoveTabPrevious => {
+                self.move_active_tab(false, cx);
+                return;
             }
             Command::ToggleFollow => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -2941,7 +3228,7 @@ impl Workspace {
         let path = self
             .tabs
             .get(self.active)
-            .map(|tab| tab.path.display().to_string())
+            .map(Tab::path_bar_text)
             .unwrap_or_default();
         self.set_path_input_silently(&path, cx);
     }
@@ -3207,11 +3494,20 @@ impl Workspace {
     }
 
     fn matching_preset_index(&self, current_input: &str, options: &SearchConfig) -> Option<usize> {
-        self.config.search.presets.iter().position(|preset| {
-            preset.pattern == current_input
-                && preset.mode == options.mode
-                && preset.highlight_match == options.highlight_matches
-        })
+        self.config
+            .search
+            .presets
+            .iter()
+            .enumerate()
+            .filter(|(_, preset)| {
+                preset.pattern == current_input
+                    && preset.mode == options.mode
+                    && preset.highlight_match == options.highlight_matches
+                    && preset.match_case.matches(options.case_sensitive)
+                    && preset.whole_word.matches(options.whole_word)
+            })
+            .max_by_key(|(idx, preset)| (preset.option_specificity(), std::cmp::Reverse(*idx)))
+            .map(|(idx, _)| idx)
     }
 
     fn active_preset_index(&self, cx: &App) -> Option<usize> {
@@ -3328,27 +3624,34 @@ impl Workspace {
         }
     }
 
-    fn apply_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(preset) = self.config.search.presets.get(index).cloned() else {
+    fn append_selected_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_presets {
             return;
-        };
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.options.mode = preset.mode;
-            tab.options.highlight_matches = preset.highlight_match;
         }
-        self.show_goto = false;
-        self.dismiss_presets(cx);
-        self.preset_index = index;
-        if preset.select_text.is_some() {
-            if let Some(range) = preset.select_text_range() {
+        if let Some(matched) = self.filtered_presets.get(self.preset_index) {
+            self.append_preset(matched.index, window, cx);
+        }
+    }
+
+    fn finish_preset_to_search(
+        &mut self,
+        pattern: String,
+        select_range: Option<std::ops::Range<usize>>,
+        has_select_text: bool,
+        select_warning: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if has_select_text {
+            if let Some(range) = select_range {
                 let version = self.input.update(cx, |input, cx| {
-                    input.emplace(&preset.pattern, cx);
+                    input.emplace(&pattern, cx);
                     input.move_to(range.start, cx);
                     input.select_to(range.end, cx);
                     input.version()
                 });
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
-                let expected_utf16 = utf16_range_for_utf8(&preset.pattern, range.clone());
+                let expected_utf16 = utf16_range_for_utf8(&pattern, range.clone());
                 cx.on_next_frame(window, move |this, window, cx| {
                     if !this.input.read(cx).focus_handle(cx).is_focused(window) {
                         return;
@@ -3370,11 +3673,11 @@ impl Workspace {
                 });
             } else {
                 self.input.update(cx, |input, cx| {
-                    input.emplace(&preset.pattern, cx);
-                    input.move_to(preset.pattern.len(), cx);
+                    input.emplace(&pattern, cx);
+                    input.move_to(pattern.len(), cx);
                 });
                 self.input.read(cx).focus_handle(cx).focus(window, cx);
-                if let Some(warning) = preset.select_text_warning() {
+                if let Some(warning) = select_warning {
                     self.status = Some(StatusMessage::warning(warning));
                 }
             }
@@ -3382,9 +3685,76 @@ impl Workspace {
             return;
         }
         self.input
-            .update(cx, |input, cx| input.emplace(&preset.pattern, cx));
+            .update(cx, |input, cx| input.emplace(&pattern, cx));
         self.start_search(self.active, cx);
         self.focus_visible_pane(self.active_pane, window, cx);
+    }
+
+    fn apply_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preset) = self.config.search.presets.get(index).cloned() else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.options.mode = preset.mode;
+            tab.options.highlight_matches = preset.highlight_match;
+            preset.match_case.apply_to(&mut tab.options.case_sensitive);
+            preset.whole_word.apply_to(&mut tab.options.whole_word);
+        }
+        self.show_goto = false;
+        self.dismiss_presets(cx);
+        self.preset_index = index;
+        let select_range = preset.select_text_range();
+        let has_select_text = preset.select_text.is_some();
+        let select_warning = preset.select_text_warning();
+        self.finish_preset_to_search(
+            preset.pattern,
+            select_range,
+            has_select_text,
+            select_warning,
+            window,
+            cx,
+        );
+    }
+
+    fn append_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.options.mode != SearchMode::Regex {
+            return;
+        }
+        let Some(preset) = self.config.search.presets.get(index).cloned() else {
+            return;
+        };
+        if preset.pattern.is_empty() {
+            self.status = Some(StatusMessage::warning(format!(
+                "Preset {:?} has an empty pattern",
+                preset.name
+            )));
+            self.dismiss_presets(cx);
+            cx.notify();
+            return;
+        }
+        let existing = self.input.read(cx).as_str().to_owned();
+        let appended = append_preset_to_regex(&existing, &tab.options, &preset);
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.options.case_sensitive = appended.case_sensitive;
+            tab.options.whole_word = appended.whole_word;
+            tab.options.highlight_matches = appended.highlight_matches;
+        }
+        self.show_goto = false;
+        self.dismiss_presets(cx);
+        self.preset_index = index;
+        let has_select_text = preset.select_text.is_some();
+        let select_warning = preset.select_text_warning();
+        self.finish_preset_to_search(
+            appended.pattern,
+            appended.select_range,
+            has_select_text,
+            select_warning,
+            window,
+            cx,
+        );
     }
 
     fn navigate_presets(&mut self, command: Command, cx: &mut Context<Self>) {
@@ -4433,8 +4803,8 @@ impl Workspace {
 
         for (index, tab) in self.tabs.iter().enumerate() {
             let active = index == self.active;
-            let filename = file_label(&tab.path);
-            let full_path = SharedString::from(tab.path.display().to_string());
+            let filename = tab.label();
+            let full_path = SharedString::from(tab.tooltip());
             let tip_theme = t.clone();
             let close_theme = t.clone();
             let close_shortcut = if active {
@@ -5086,6 +5456,10 @@ impl Workspace {
     ) -> Div {
         let t = &self.theme;
         let path_focused = self.path_input_focused(window, cx);
+        let path_placeholder = self
+            .tabs
+            .get(self.active)
+            .map_or("Enter file path…", Tab::path_bar_placeholder);
         let bar_bounds = self.path_bar_bounds.clone();
         let bounds_tracker = canvas(
             move |bounds, _window, _cx| {
@@ -5166,7 +5540,7 @@ impl Workspace {
                             .debug_selector(|| "file-path-input".into())
                             .key_context(format!("{DEFAULT_INPUT_CONTEXT} FilePath").as_str())
                             .state(self.path_input.downgrade())
-                            .placeholder("Enter file path…")
+                            .placeholder(path_placeholder)
                             .caret_color(t.accent)
                             .placeholder_color(t.muted)
                             .font(t.mono_font_spec())
@@ -5668,6 +6042,8 @@ impl Workspace {
             .child(trigger);
 
         if is_open {
+            let regex_mode = options.mode == SearchMode::Regex;
+            let append_shortcut = t.shortcut(Command::AppendPreset);
             let results_h = self.effective_results_height(window);
             let status_h = if self.config.window.show_status_bar {
                 26.0
@@ -5829,6 +6205,59 @@ impl Workspace {
                         };
                     let select_warning = preset.select_text_warning();
                     let warning_tip_theme = t.clone();
+                    let render_option_badge = |id_prefix: &'static str,
+                                               icon: Icon,
+                                               label: &'static str,
+                                               toggle: PresetToggle|
+                     -> Option<Stateful<Div>> {
+                        let (is_on, tip_text) = match toggle {
+                            PresetToggle::Leave => return None,
+                            PresetToggle::On => (true, format!("{label}: on")),
+                            PresetToggle::Off => (false, format!("{label}: off")),
+                        };
+                        let tip_theme = t.clone();
+                        let badge = div()
+                            .id((id_prefix, preset_index))
+                            .debug_selector(move || format!("{id_prefix}-{preset_index}"))
+                            .h(px(20.))
+                            .rounded_sm()
+                            .border_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .tooltip_show_delay(TOOLTIP_DELAY)
+                            .tooltip(move |_window, cx| {
+                                Tooltip::view(tip_text.clone(), None, tip_theme.clone(), cx)
+                            });
+                        let badge = if is_on {
+                            badge
+                                .w(px(20.))
+                                .bg(t.accent_subtle)
+                                .border_color(t.accent_border)
+                                .child(icon.element(px(12.), t.accent))
+                        } else {
+                            badge
+                                .px_1()
+                                .gap_0p5()
+                                .bg(t.background)
+                                .border_color(t.border)
+                                .child(icon.element(px(11.), t.muted))
+                                .child(Icon::Close.element(px(8.), t.muted))
+                        };
+                        Some(badge)
+                    };
+                    let match_case_badge = render_option_badge(
+                        "preset-match-case",
+                        Icon::CaseSensitive,
+                        "Match case",
+                        preset.match_case,
+                    );
+                    let whole_word_badge = render_option_badge(
+                        "preset-whole-word",
+                        Icon::WholeWord,
+                        "Whole words",
+                        preset.whole_word,
+                    );
 
                     list = list.child(
                         div()
@@ -5862,8 +6291,12 @@ impl Workspace {
                                     cx.notify();
                                 }
                             }))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.apply_preset(preset_index, window, cx);
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                if regex_mode && event.modifiers().secondary() {
+                                    this.append_preset(preset_index, window, cx);
+                                } else {
+                                    this.apply_preset(preset_index, window, cx);
+                                }
                             }))
                             .child(
                                 div()
@@ -5916,6 +6349,12 @@ impl Workspace {
                                                         }),
                                                 )
                                             })
+                                            .when_some(match_case_badge, |el, badge| {
+                                                el.child(badge)
+                                            })
+                                            .when_some(whole_word_badge, |el, badge| {
+                                                el.child(badge)
+                                            })
                                             .child(
                                                 div()
                                                     .px_1p5()
@@ -5928,7 +6367,73 @@ impl Workspace {
                                                     .text_size(px(10.))
                                                     .text_color(t.muted)
                                                     .child(mode_label),
-                                            ),
+                                            )
+                                            .when(regex_mode, |el| {
+                                                let append_tip_theme = t.clone();
+                                                let append_tip_shortcut = append_shortcut.clone();
+                                                let append_hover_bg = t.accent_subtle;
+                                                let append_hover_border = t.accent_border;
+                                                let append_hover_fg = t.accent;
+                                                let append_group = SharedString::from(format!(
+                                                    "preset-append-{preset_index}"
+                                                ));
+                                                el.child(
+                                                    div()
+                                                        .id(("preset-append", preset_index))
+                                                        .group(append_group.clone())
+                                                        .debug_selector(move || {
+                                                            format!("preset-append-{preset_index}")
+                                                        })
+                                                        .size(px(20.))
+                                                        .rounded_sm()
+                                                        .border_1()
+                                                        .border_color(t.border)
+                                                        .bg(t.background)
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .cursor_pointer()
+                                                        .hover(move |s| {
+                                                            s.bg(append_hover_bg)
+                                                                .border_color(append_hover_border)
+                                                        })
+                                                        .child(
+                                                            Icon::Plus
+                                                                .element(px(11.), t.muted)
+                                                                .group_hover(
+                                                                    append_group,
+                                                                    move |s| {
+                                                                        s.text_color(
+                                                                            append_hover_fg,
+                                                                        )
+                                                                    },
+                                                                ),
+                                                        )
+                                                        .tooltip_show_delay(TOOLTIP_DELAY)
+                                                        .tooltip(move |_window, cx| {
+                                                            Tooltip::view(
+                                                                "Append to search (|)",
+                                                                append_tip_shortcut.clone(),
+                                                                append_tip_theme.clone(),
+                                                                cx,
+                                                            )
+                                                        })
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            |_, _, cx| cx.stop_propagation(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                cx.stop_propagation();
+                                                                this.append_preset(
+                                                                    preset_index,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                            }),
                                     ),
                             )
                             .child(
@@ -6007,10 +6512,19 @@ impl Workspace {
                         )
                         .child(
                             div()
+                                .debug_selector(|| "presets-header-hint".into())
                                 .font(t.mono_font_spec())
                                 .text_size(px(10.))
                                 .text_color(t.muted)
-                                .child("↑↓ ↵"),
+                                .child(if regex_mode {
+                                    if let Some(shortcut) = &append_shortcut {
+                                        SharedString::from(format!("↑↓ ↵ · {shortcut} +"))
+                                    } else {
+                                        SharedString::from("↑↓ ↵ · +")
+                                    }
+                                } else {
+                                    SharedString::from("↑↓ ↵")
+                                }),
                         ),
                 )
                 .child(search_field)
@@ -6240,6 +6754,15 @@ impl Workspace {
         let bookmarks = tab.map_or(0, |tab| tab.bookmarks.len());
         let bytes = tab.and_then(|tab| tab.log.as_ref()).map(|l| l.stamp.len);
         let follow = tab.is_some_and(|tab| tab.follow);
+        let stdin_suffix = tab
+            .and_then(|tab| {
+                tab.is_stdin().then_some(if tab.is_streaming_stdin() {
+                    " · Streaming"
+                } else {
+                    " · stdin"
+                })
+            })
+            .unwrap_or("");
 
         div()
             .h(px(26.))
@@ -6352,11 +6875,10 @@ impl Workspace {
                                     } else {
                                         t.muted.opacity(0.6)
                                     }))
-                                    .child(
-                                        div()
-                                            .font(t.mono_font_spec())
-                                            .child(format!("{} · UTF-8", format_bytes(len))),
-                                    ),
+                                    .child(div().font(t.mono_font_spec()).child(format!(
+                                        "{} · UTF-8{stdin_suffix}",
+                                        format_bytes(len)
+                                    ))),
                             )
                         })
                     })
@@ -6407,6 +6929,26 @@ impl Workspace {
                 )
             })
     }
+    fn empty_results_message(&self, tab: Option<&Tab>) -> &'static str {
+        let Some(tab) = tab else {
+            return "";
+        };
+        if tab.show_searching_indicator() {
+            "Searching…"
+        } else if tab.error.is_some() {
+            "Results unavailable"
+        } else if tab.query.is_empty() {
+            if self.config.viewer.include_bookmarks {
+                "Search above or click the gutter to bookmark lines"
+            } else {
+                "Enter a query above to filter lines"
+            }
+        } else if (tab.searching && !tab.refreshing_search) || (tab.loading && tab.log.is_none()) {
+            ""
+        } else {
+            "No matches"
+        }
+    }
 }
 
 impl Render for Workspace {
@@ -6431,8 +6973,7 @@ impl Render for Workspace {
         let result_count = tab.map_or(0, |tab| tab.results.visible.len());
         let results_limited = tab.is_some_and(|tab| tab.results.limited);
         let loading = tab.is_some_and(|tab| tab.loading);
-        let searching = tab.is_some_and(|tab| tab.searching);
-        let show_searching = tab.is_some_and(|tab| tab.searching_visible);
+        let show_searching = tab.is_some_and(Tab::show_searching_indicator);
         let tab_error = tab.and_then(|tab| tab.error.clone());
         let options = tab
             .map(|tab| tab.options.clone())
@@ -6474,21 +7015,7 @@ impl Render for Workspace {
         let main_area = if self.tabs.is_empty() {
             self.render_welcome(cx)
         } else {
-            let empty_results = if show_searching || loading {
-                "Searching…"
-            } else if searching {
-                ""
-            } else if tab_error.is_some() {
-                "Results unavailable"
-            } else if tab.is_some_and(|tab| tab.query.is_empty()) {
-                if self.config.viewer.include_bookmarks {
-                    "Search above or click the gutter to bookmark lines"
-                } else {
-                    "Enter a query above to filter lines"
-                }
-            } else {
-                "No matches"
-            };
+            let empty_results = self.empty_results_message(tab);
 
             let source_log_area = div().key_context("Log").flex().flex_1().min_h_0().child(
                 div()
@@ -6977,7 +7504,7 @@ fn parent_label(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-pub fn run(config: Config, paths: Vec<PathBuf>) -> anyhow::Result<()> {
+pub fn run(config: Config, inputs: Vec<InputSource>) -> anyhow::Result<()> {
     let bindings = keybindings(&config)?;
     gpui_platform::application()
         .with_quit_mode(QuitMode::LastWindowClosed)
@@ -7025,7 +7552,7 @@ pub fn run(config: Config, paths: Vec<PathBuf>) -> anyhow::Result<()> {
                         ..Default::default()
                     };
                     if let Err(error) = cx.open_window(options, |window, cx| {
-                        cx.new(|cx| Workspace::new(config, paths, window, cx))
+                        cx.new(|cx| Workspace::new_with_inputs(config, inputs, window, cx))
                     }) {
                         eprintln!("Cannot open window: {error}");
                         cx.quit();
@@ -7917,6 +8444,8 @@ mod tests {
                 pattern: "error|fatal|panic".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -7924,6 +8453,8 @@ mod tests {
                 pattern: "warn".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -7931,6 +8462,8 @@ mod tests {
                 pattern: "GET|POST|PUT|DELETE".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -7938,6 +8471,8 @@ mod tests {
                 pattern: "HTTP 5\\d\\d".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -7945,6 +8480,8 @@ mod tests {
                 pattern: "401|403|unauthorized".into(),
                 mode: SearchMode::Regex,
                 highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
         ];
@@ -8167,6 +8704,8 @@ mod tests {
                 pattern: "ERROR".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: None,
             },
             config::Preset {
@@ -8174,6 +8713,8 @@ mod tests {
                 pattern: "GET .* port PORT_NUMBER".into(),
                 mode: SearchMode::Regex,
                 highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("PORT_NUMBER".into()),
             },
             config::Preset {
@@ -8181,6 +8722,8 @@ mod tests {
                 pattern: "user=שלום_NAME!".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("שלום_NAME".into()),
             },
         ];
@@ -8315,6 +8858,8 @@ mod tests {
                 pattern: "GET .* port 8080".into(),
                 mode: SearchMode::Regex,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some("PORT_NUMBER".into()),
             },
             config::Preset {
@@ -8322,6 +8867,8 @@ mod tests {
                 pattern: "warn".into(),
                 mode: SearchMode::Literal,
                 highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
                 select_text: Some(String::new()),
             },
         ];
@@ -11386,6 +11933,49 @@ mod tests {
 
         // Ctrl+Tab cycles forward back to tab 0.
         cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // Ctrl+PageDown cycles forward (0 -> 1 -> 2 -> 0) and Ctrl+PageUp cycles backward (0 -> 2 -> 1 -> 0).
+        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.input.read(cx).as_str(), "q1");
+        });
+
+        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(view.input.read(cx).as_str(), "q2");
+        });
+
+        cx.simulate_keystrokes("ctrl-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        cx.simulate_keystrokes("ctrl-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(view.input.read(cx).as_str(), "q2");
+        });
+
+        cx.simulate_keystrokes("ctrl-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.input.read(cx).as_str(), "q1");
+        });
+
+        cx.simulate_keystrokes("ctrl-pageup");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             assert_eq!(view.active, 0);
@@ -14615,6 +15205,8 @@ mod tests {
             pattern: "HTTP 5\\d\\d".into(),
             mode: SearchMode::Regex,
             highlight_match: true,
+            match_case: PresetToggle::Leave,
+            whole_word: PresetToggle::Leave,
             select_text: None,
         });
         config.search.presets.push(config::Preset {
@@ -14622,6 +15214,8 @@ mod tests {
             pattern: "401|403".into(),
             mode: SearchMode::Regex,
             highlight_match: true,
+            match_case: PresetToggle::Leave,
+            whole_word: PresetToggle::Leave,
             select_text: None,
         });
         cx.update(|cx| {
@@ -15503,6 +16097,1741 @@ mod tests {
                     < 0.5,
                 "cmd-left in Search input must not reset log horizontal scroll"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn restore_closed_tab_reopens_closed_tabs_in_lifo_order_with_state_and_position(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let restore_key = if cfg!(target_os = "macos") {
+            "cmd-shift-t"
+        } else {
+            "ctrl-shift-t"
+        };
+        let close_key = if cfg!(target_os = "macos") {
+            "cmd-w"
+        } else {
+            "ctrl-w"
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        let third = directory.path().join("third.log");
+        std::fs::write(&first, "alpha\nERROR one\nomega\n").unwrap();
+        std::fs::write(&second, "beta\nWARN two\nWARN three\n").unwrap();
+        std::fs::write(&third, "gamma\nINFO four\n").unwrap();
+        let first_canon = first.canonicalize().unwrap();
+        let second_canon = second.canonicalize().unwrap();
+        let third_canon = third.canonicalize().unwrap();
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(
+                config,
+                vec![first.clone(), second.clone(), third.clone()],
+                window,
+                cx,
+            )
+        });
+        for index in 0..3 {
+            wait_for_tab_loaded(&view, index, cx);
+        }
+
+        // Default shortcut label is populated for RestoreClosedTab.
+        view.read_with(cx, |view, _| {
+            let expected = if cfg!(target_os = "macos") {
+                "⌘⇧T"
+            } else {
+                "Ctrl+Shift+T"
+            };
+            assert_eq!(
+                view.theme.shortcut(Command::RestoreClosedTab).as_deref(),
+                Some(expected)
+            );
+        });
+
+        // No-op when no tab has been closed yet.
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 3);
+            assert_eq!(view.active, 2);
+        });
+
+        // Customize state on all three tabs and make tab 1 (second.log) active.
+        view.update(cx, |view, cx| {
+            view.tabs[0].query = "ERROR".into();
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.tabs[0].options.case_sensitive = true;
+            view.tabs[0].bookmarks = BTreeSet::from([0, 2]);
+            view.tabs[0].selected = 1;
+            view.tabs[0].follow = false;
+
+            view.tabs[1].query = "WARN".into();
+            view.tabs[1].options.mode = SearchMode::Regex;
+            view.tabs[1].options.whole_word = true;
+            view.tabs[1].options.invert = false;
+            view.tabs[1].options.highlight_matches = false;
+            view.tabs[1].bookmarks = BTreeSet::from([2]);
+            view.tabs[1].selected = 2;
+            view.tabs[1].follow = true;
+
+            view.tabs[2].query = "INFO".into();
+            view.tabs[2].selected = 1;
+
+            view.switch(1, cx);
+            // Edit the active tab's search input without committing a search yet to ensure
+            // closing captures the live input value.
+            view.input.update(cx, |input, cx| input.emplace("WARN", cx));
+        });
+        cx.run_until_parked();
+
+        // Close middle tab (index 1, second.log) with secondary-w.
+        cx.simulate_keystrokes(close_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, third_canon);
+        });
+
+        // Switch to first.log (index 0), type an updated query in search input, and close it.
+        view.update(cx, |view, cx| {
+            view.switch(0, cx);
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(close_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].path, third_canon);
+        });
+
+        // First secondary-shift-t restores first.log (LIFO) at its original index 0 with state.
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, third_canon);
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.input.read(cx).as_str(), "ERROR");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                first_canon.display().to_string()
+            );
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.case_sensitive);
+            assert_eq!(view.tabs[0].bookmarks, BTreeSet::from([0, 2]));
+            assert_eq!(view.tabs[0].selected, 1);
+            assert!(!view.tabs[0].follow);
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+        });
+
+        // Works while search input is focused (Workspace context): second secondary-shift-t
+        // restores second.log at its original index 1 between first.log and third.log.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 1, cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 3);
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, second_canon);
+            assert_eq!(view.tabs[2].path, third_canon);
+            assert_eq!(view.tabs[1].query, "WARN");
+            assert_eq!(view.input.read(cx).as_str(), "WARN");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                second_canon.display().to_string()
+            );
+            assert_eq!(view.tabs[1].options.mode, SearchMode::Regex);
+            assert!(view.tabs[1].options.whole_word);
+            assert!(!view.tabs[1].options.highlight_matches);
+            assert_eq!(view.tabs[1].bookmarks, BTreeSet::from([2]));
+            assert_eq!(view.tabs[1].selected, 2);
+            assert!(view.tabs[1].follow);
+            assert_eq!(view.tabs[1].results.matches, vec![1, 2]);
+            // Previously active tab's query (first.log) was preserved when switching.
+            assert_eq!(view.tabs[0].query, "ERROR");
+        });
+
+        // Close all remaining tabs down to the empty workspace, then restore from empty state.
+        view.update_in(cx, |view, window, cx| {
+            view.focus_pane(Pane::Main, window, cx);
+        });
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.simulate_keystrokes(close_key);
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs.is_empty());
+            assert_eq!(view.input.read(cx).as_str(), "");
+        });
+
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        wait_for_tab_loaded(&view, 0, cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.input.read(cx).as_str(), "ERROR");
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+        });
+
+        // If a closed tab was manually reopened in the meantime, RestoreClosedTab skips it and
+        // restores the next still-closed tab without duplicating the already-open file.
+        // Remaining closed stack has [second.log, third.log] (third.log on top).
+        view.update(cx, |view, cx| {
+            view.open(third.clone(), cx);
+        });
+        wait_for_tab_loaded(&view, 1, cx);
+        cx.simulate_keystrokes(restore_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 3);
+            let paths: Vec<_> = view.tabs.iter().map(|tab| tab.path.clone()).collect();
+            assert!(paths.contains(&first_canon));
+            assert!(paths.contains(&second_canon));
+            assert!(paths.contains(&third_canon));
+            assert_eq!(view.tabs[view.active].path, second_canon);
+        });
+    }
+
+    #[gpui::test]
+    fn stdin_tab_streams_live_input_preserves_bookmarks_and_cleans_up_on_replace(
+        cx: &mut TestAppContext,
+    ) {
+        use std::io::Write as _;
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.poll_interval_ms = 10;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let spool = StdinSpool::spawn_reader(reader).unwrap();
+        let spool_path = spool.path().to_path_buf();
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_inputs(config.clone(), vec![InputSource::Stdin(spool)], window, cx)
+        });
+        vcx.run_until_parked();
+
+        // Wait for initial load of the empty stream to complete.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while view.read_with(vcx, |view, _| view.tabs[0].log.is_none()) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for initial stdin load"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            view.update(vcx, |view, cx| view.tick(cx));
+            vcx.run_until_parked();
+        }
+
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            let tab = &view.tabs[0];
+            assert!(tab.is_stdin());
+            assert!(tab.is_streaming_stdin());
+            assert_eq!(tab.label(), "stdin");
+            assert_eq!(tab.path_bar_placeholder(), "Standard input (streaming…)");
+            assert_eq!(view.path_input.read(cx).as_str(), "");
+            assert!(view.recent.is_empty());
+            assert_eq!(tab.log.as_ref().unwrap().len(), 0);
+        });
+
+        // Write first chunk while keeping the pipe open.
+        writer.write_all(b"INFO boot\nERROR timeout\n").unwrap();
+        writer.flush().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while view.read_with(vcx, |view, _| {
+            view.tabs[0].log.as_ref().map_or(0, |log| log.len()) < 2
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for first streamed lines"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            view.update(vcx, |view, cx| view.tick(cx));
+            vcx.run_until_parked();
+        }
+
+        // Bookmark line 0 and search for ERROR.
+        view.update(vcx, |view, cx| {
+            view.tabs[0].bookmarks.insert(0);
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            view.start_search(0, cx);
+        });
+        vcx.run_until_parked();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while view.read_with(vcx, |view, _| view.tabs[0].searching) {
+            assert!(Instant::now() < deadline, "timed out waiting for search");
+            std::thread::sleep(Duration::from_millis(5));
+            vcx.run_until_parked();
+        }
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.tabs[0].results.matches, vec![1]);
+        });
+
+        // Write second chunk and close the pipe (EOF).
+        writer.write_all(b"ERROR retry\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while view.read_with(vcx, |view, _| {
+            view.tabs[0].log.as_ref().map_or(0, |log| log.len()) < 3
+                || view.tabs[0].is_streaming_stdin()
+                || view.tabs[0].searching
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for EOF stdin reload"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            view.update(vcx, |view, cx| view.tick(cx));
+            vcx.run_until_parked();
+        }
+
+        view.read_with(vcx, |view, _| {
+            let tab = &view.tabs[0];
+            let log = tab.log.as_ref().unwrap();
+            assert_eq!(log.len(), 3);
+            assert_eq!(log.line(2, 100).unwrap(), "ERROR retry");
+            assert!(tab.bookmarks.contains(&0), "bookmark must survive append");
+            assert_eq!(tab.results.matches, vec![1, 2]);
+            assert!(!tab.is_streaming_stdin());
+            assert_eq!(tab.path_bar_placeholder(), "Standard input");
+        });
+
+        // Replacing the stdin tab with a regular file cleans up the temp spool file.
+        let dir = tempfile::tempdir().unwrap();
+        let real_path = dir.path().join("real.log");
+        std::fs::write(&real_path, "regular line\n").unwrap();
+        let canonical = real_path.canonicalize().unwrap_or(real_path.clone());
+
+        view.update(vcx, |view, cx| {
+            view.replace_active_tab(real_path, cx);
+        });
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, cx| {
+            let tab = &view.tabs[0];
+            assert!(!tab.is_stdin());
+            assert_eq!(tab.path, canonical);
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                canonical.display().to_string()
+            );
+            assert_eq!(view.recent, vec![canonical.clone()]);
+        });
+        assert!(
+            !spool_path.exists(),
+            "stdin temp file should be removed once replaced by a regular file"
+        );
+    }
+
+    #[gpui::test]
+    fn stdin_tabs_preserve_existing_session_and_are_excluded_from_saved_sessions(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("session.json");
+        let existing_path = dir.path().join("existing.log");
+        let real_path = dir.path().join("real.log");
+        std::fs::write(&existing_path, "old line\n").unwrap();
+        std::fs::write(&real_path, "real line\n").unwrap();
+
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = true;
+        config.files.restore_session = true;
+        config.files.state_file = Some(state_file.display().to_string());
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        // Seed an existing session with `existing.log`.
+        let initial_session = Session {
+            version: 1,
+            active: 0,
+            tabs: vec![SavedTab {
+                path: existing_path.clone(),
+                query: "old".into(),
+                options: config.search.clone(),
+                bookmarks: BTreeSet::new(),
+                selected: 0,
+                follow: false,
+            }],
+            recent: vec![existing_path.clone()],
+            results_height: None,
+            zoom_percent: None,
+        };
+        initial_session.save(&state_file).unwrap();
+
+        // Opening only piped stdin takes priority over restore_session and does not clobber session.json.
+        let spool = StdinSpool::spawn_reader(std::io::Cursor::new(b"piped\n".to_vec())).unwrap();
+        let (stdin_only_view, vcx1) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_inputs(config.clone(), vec![InputSource::Stdin(spool)], window, cx)
+        });
+        vcx1.run_until_parked();
+        stdin_only_view.read_with(vcx1, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert!(view.tabs[0].is_stdin());
+            view.save_session(cx);
+        });
+        let after_stdin_only = Session::load(&state_file, &config).unwrap();
+        assert_eq!(after_stdin_only.tabs.len(), 1);
+        assert_eq!(after_stdin_only.tabs[0].path, existing_path);
+
+        // Opening stdin + a real file excludes stdin from session.json and adjusts `active`.
+        let spool2 = StdinSpool::spawn_reader(std::io::Cursor::new(b"piped2\n".to_vec())).unwrap();
+        let spool2_path = spool2.path().to_path_buf();
+        let (mixed_view, vcx2) = cx.add_window_view(|window, cx| {
+            Workspace::new_with_inputs(
+                config.clone(),
+                vec![
+                    InputSource::Stdin(spool2),
+                    InputSource::File(real_path.clone()),
+                ],
+                window,
+                cx,
+            )
+        });
+        vcx2.run_until_parked();
+        mixed_view.read_with(vcx2, |view, cx| {
+            assert_eq!(view.tabs.len(), 2);
+            assert!(view.tabs[0].is_stdin());
+            assert!(!view.tabs[1].is_stdin());
+            assert_eq!(view.active, 1);
+            view.save_session(cx);
+        });
+        let saved_mixed = Session::load(&state_file, &config).unwrap();
+        let canonical_real = real_path.canonicalize().unwrap_or(real_path);
+        assert_eq!(saved_mixed.tabs.len(), 1);
+        assert_eq!(saved_mixed.tabs[0].path, canonical_real);
+        assert_eq!(saved_mixed.active, 0);
+        assert!(!saved_mixed.recent.contains(&spool2_path));
+        assert_eq!(saved_mixed.recent.first(), Some(&canonical_real));
+    }
+
+    #[test]
+    fn append_regex_alternative_handles_empty_plain_and_escaped_trailing_pipes() {
+        assert_eq!(
+            search::append_regex_alternative_with_offset("", "foo"),
+            ("foo".into(), 0)
+        );
+        assert_eq!(
+            search::append_regex_alternative_with_offset("alpha", "beta"),
+            ("alpha|beta".into(), 6)
+        );
+        // Unescaped trailing pipe does not produce `||`.
+        assert_eq!(
+            search::append_regex_alternative_with_offset("alpha|", "beta"),
+            ("alpha|beta".into(), 6)
+        );
+        // Escaped literal trailing pipe (`\|`) MUST still get an alternation separator.
+        assert_eq!(
+            search::append_regex_alternative_with_offset(r"alpha\|", "beta"),
+            (r"alpha\||beta".into(), 8)
+        );
+        // Escaped backslash followed by real pipe (`\\|`) does not produce `||`.
+        assert_eq!(
+            search::append_regex_alternative_with_offset(r"alpha\\|", "beta"),
+            (r"alpha\\|beta".into(), 8)
+        );
+        // Three backslashes + pipe (`\\\|`) is an escaped pipe, so separator is added.
+        assert_eq!(
+            search::append_regex_alternative_with_offset(r"alpha\\\|", "beta"),
+            (r"alpha\\\||beta".into(), 10)
+        );
+    }
+
+    #[gpui::test]
+    fn appending_presets_in_regex_mode_escapes_literals_runs_search_and_respects_mode_and_ui(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        let literal_special = "[WARN] req(1.2)+$a|b";
+        config.search.presets = vec![
+            config::Preset {
+                name: "Errors".into(),
+                pattern: "ERROR|FATAL".into(),
+                mode: SearchMode::Regex,
+                highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: None,
+            },
+            config::Preset {
+                name: "SpecialWarn".into(),
+                pattern: literal_special.into(),
+                mode: SearchMode::Literal,
+                highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: None,
+            },
+            config::Preset {
+                name: "DebugTag".into(),
+                pattern: "DEBUG".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: None,
+            },
+            config::Preset {
+                name: "Empty".into(),
+                pattern: String::new(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: None,
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("append-presets.log");
+        std::fs::write(
+            &path,
+            format!("INFO boot\nERROR fail\n{literal_special}\nDEBUG trace\nINFO a|b literal\n"),
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.tabs[0].options.highlight_matches = true;
+            view.tabs[0].main_selection = LineSelection::single(0);
+            view.input.update(cx, |input, cx| input.emplace("INFO", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let (presets_key, append_key) = if cfg!(target_os = "macos") {
+            ("cmd-p", "cmd-enter")
+        } else {
+            ("ctrl-p", "ctrl-enter")
+        };
+
+        // 1. In Literal mode: inline `+` buttons are absent, secondary-enter is a no-op,
+        //    and secondary-click falls back to normal apply.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("preset-append-0").is_none());
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), "INFO");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+        });
+
+        // 2. Switch to Regex mode with active search "INFO" and highlight_matches = true.
+        //    Inline `+` buttons are now rendered, and secondary-enter appends "ERROR|FATAL",
+        //    runs the search immediately, closes dropdown, focuses log, and keeps highlight_matches = true.
+        view.update_in(cx, |view, window, cx| {
+            view.close_presets(window, cx);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.tabs[0].options.highlight_matches = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("preset-append-0").is_some());
+        assert!(cx.debug_bounds("presets-header-hint").is_some());
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), "INFO|ERROR|FATAL");
+            assert_eq!(view.tabs[0].query, "INFO|ERROR|FATAL");
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 4]);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(
+                view.tabs[0].options.highlight_matches,
+                "appending to non-empty search must preserve existing highlight_matches"
+            );
+            assert!(view.focus.is_focused(window));
+        });
+
+        // 3. Clicking the inline `+` button on a Literal preset escapes regex metacharacters
+        //    and appends it without triggering apply_preset.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        let plus_pos = cx
+            .debug_bounds("preset-append-1")
+            .expect("inline append button for literal preset")
+            .center();
+        cx.simulate_click(plus_pos, Modifiers::none());
+        cx.run_until_parked();
+        let escaped_special = regex::escape(literal_special);
+        let expected_after_plus = format!("INFO|ERROR|FATAL|{escaped_special}");
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), expected_after_plus);
+            assert_eq!(view.tabs[0].query, expected_after_plus);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2, 4]);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+
+        // 4. Secondary+Click on a preset row appends it cleanly.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        let item2_bounds = cx.debug_bounds("preset-item-2").expect("preset item 2");
+        // Click near the left side of the row (away from the inline `+` button).
+        let row_click = point(item2_bounds.origin.x + px(24.), item2_bounds.center().y);
+        cx.simulate_click(row_click, Modifiers::secondary_key());
+        cx.run_until_parked();
+        let expected_after_sec_click = format!("{expected_after_plus}|DEBUG");
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), expected_after_sec_click);
+            assert_eq!(view.tabs[0].query, expected_after_sec_click);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2, 3, 4]);
+        });
+
+        // 5. Appending into an empty search box inserts without leading `|`, still escapes
+        //    literal presets, keeps Regex mode, and adopts the preset's highlight_match.
+        view.update(cx, |view, cx| {
+            view.input.update(cx, |input, cx| input.emplace("", cx));
+            view.tabs[0].options.highlight_matches = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.show_presets);
+            assert_eq!(view.input.read(cx).as_str(), escaped_special);
+            assert_eq!(view.tabs[0].query, escaped_special);
+            assert_eq!(view.tabs[0].results.matches, vec![2]);
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(
+                !view.tabs[0].options.highlight_matches,
+                "appending into empty search should adopt preset highlight_match"
+            );
+        });
+
+        // 6. Escaped trailing pipe (`a\|`) gets a separator (`a\||DEBUG`), whereas unescaped
+        //    trailing pipe (`ERROR|`) does not produce `||`.
+        view.update(cx, |view, cx| {
+            view.input.update(cx, |input, cx| input.emplace(r"a\|", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(2, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), r"a\||DEBUG");
+            assert_eq!(view.tabs[0].results.matches, vec![2, 3, 4]);
+        });
+
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR|", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(2, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "ERROR|DEBUG");
+            assert_eq!(view.tabs[0].results.matches, vec![1, 3]);
+        });
+
+        // 7. Empty preset pattern is ignored safely with a warning and does not add trailing `|`.
+        view.update_in(cx, |view, window, cx| view.append_preset(3, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "ERROR|DEBUG");
+            assert!(
+                view.status
+                    .as_ref()
+                    .is_some_and(|s| s.tone == StatusTone::Warning)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn appending_selectable_preset_shifts_and_escapes_selection_and_defers_search(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "Port".into(),
+                pattern: "port=PORT_NUM".into(),
+                mode: SearchMode::Regex,
+                highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: Some("PORT_NUM".into()),
+            },
+            config::Preset {
+                name: "LiteralHost".into(),
+                pattern: "[שלום] host=<HOST.NAME>".into(),
+                mode: SearchMode::Literal,
+                highlight_match: false,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: Some("<HOST.NAME>".into()),
+            },
+            config::Preset {
+                name: "BadSelect".into(),
+                pattern: "WARN".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: Some("MISSING".into()),
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("append-selectable-presets.log");
+        std::fs::write(
+            &path,
+            "ERROR init\nGET / port=8080\n[שלום] host=api.prod\nWARN disk\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.tabs[0].options.highlight_matches = true;
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+
+        let selected_range = |input: &Entity<EditableTextState>,
+                              window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+
+        let (presets_key, append_key) = if cfg!(target_os = "macos") {
+            ("cmd-p", "cmd-enter")
+        } else {
+            ("ctrl-p", "ctrl-enter")
+        };
+
+        // 1. Append regex preset with `select_text`: shifts selection past "ERROR|",
+        //    focuses search box, keeps highlight_matches, and defers running search.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            let expected = "ERROR|port=PORT_NUM";
+            assert_eq!(view.input.read(cx).as_str(), expected);
+            assert_eq!(
+                selected_range(&view.input, window, cx),
+                utf16_range_for_utf8(expected, 11..19)
+            );
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert!(view.tabs[0].options.highlight_matches);
+        });
+
+        // Typing replaces only the selected placeholder, and Enter runs the combined search.
+        cx.simulate_input("8080");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "ERROR|port=8080");
+            assert_eq!(view.tabs[0].query, "ERROR|port=8080");
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1]);
+        });
+
+        // 2. Append literal preset with Unicode + metacharacters before & inside `select_text`:
+        //    escapes literal pattern and selects the exact escaped placeholder range.
+        cx.simulate_keystrokes(presets_key);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(append_key);
+        cx.run_until_parked();
+        let expected_combined = r"ERROR|port=8080|\[שלום\] host=<HOST\.NAME>";
+        let start = expected_combined.find(r"<HOST\.NAME>").unwrap();
+        let end = start + r"<HOST\.NAME>".len();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.show_presets);
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), expected_combined);
+            assert_eq!(
+                selected_range(&view.input, window, cx),
+                utf16_range_for_utf8(expected_combined, start..end)
+            );
+            assert_eq!(view.tabs[0].query, "ERROR|port=8080");
+        });
+
+        // Replacing the selected escaped placeholder and pressing Enter matches the Unicode line.
+        cx.simulate_input(r"api\.prod");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].query,
+                r"ERROR|port=8080|\[שלום\] host=api\.prod"
+            );
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2]);
+        });
+
+        // 3. Selectable preset with missing `select_text` appends, places caret at end, warns, and defers search.
+        view.update_in(cx, |view, window, cx| view.append_preset(2, window, cx));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let expected = r"ERROR|port=8080|\[שלום\] host=api\.prod|WARN";
+            assert_eq!(view.input.read(cx).as_str(), expected);
+            let end_utf16 = expected.encode_utf16().count();
+            assert_eq!(
+                selected_range(&view.input, window, cx),
+                end_utf16..end_utf16
+            );
+            assert!(
+                view.status
+                    .as_ref()
+                    .is_some_and(|s| s.tone == StatusTone::Warning)
+            );
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2]);
+        });
+    }
+
+    #[gpui::test]
+    fn presets_regex_mode_context_precedence_is_independent_of_binding_order(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        // Intentionally register `Presets && RegexMode` BEFORE `Presets` for the same key.
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-enter".into(),
+            context: config::KeyContext::PresetsRegexMode,
+            action: Command::AppendPreset,
+        });
+        config.keyboard.bindings.push(config::Binding {
+            keys: "alt-enter".into(),
+            context: config::KeyContext::Presets,
+            action: Command::ApplyPreset,
+        });
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("presets-precedence.log");
+        std::fs::write(&path, "INFO boot\nERROR fail\nWARN disk\n").unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.input.update(cx, |input, cx| input.emplace("INFO", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // In Regex mode, `Presets && RegexMode` (AppendPreset) wins over `Presets` (ApplyPreset).
+        view.update_in(cx, |view, window, cx| view.toggle_presets(window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "INFO|error|fatal|panic");
+        });
+
+        // In Literal mode, `Presets` (ApplyPreset) wins.
+        view.update_in(cx, |view, window, cx| {
+            view.tabs[0].options.mode = SearchMode::Literal;
+            view.input.update(cx, |input, cx| input.emplace("INFO", cx));
+            view.toggle_presets(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "error|fatal|panic");
+        });
+    }
+
+    #[gpui::test]
+    fn empty_query_never_shows_searching_while_loading_or_reloading(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.viewer.include_bookmarks = true;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.log");
+        std::fs::write(&path, "line 1\nline 2\n").unwrap();
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path.clone()], window, cx));
+
+        // Initial load with empty query must not display "Searching…".
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.loading);
+            assert!(tab.query.is_empty());
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(
+                view.empty_results_message(Some(tab)),
+                "Search above or click the gutter to bookmark lines"
+            );
+        });
+
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // Background reload (e.g., live file growth / poll) with empty query must not flicker "Searching…".
+        std::fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.load(0);
+            cx.notify();
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.loading);
+            assert!(tab.log.is_some());
+            assert!(tab.query.is_empty());
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(
+                view.empty_results_message(Some(tab)),
+                "Search above or click the gutter to bookmark lines"
+            );
+        });
+
+        // With include_bookmarks disabled, the empty-query prompt still shows cleanly during reload.
+        view.update(cx, |view, _| {
+            view.config.viewer.include_bookmarks = false;
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert_eq!(
+                view.empty_results_message(Some(tab)),
+                "Enter a query above to filter lines"
+            );
+        });
+
+        wait_for_tab_loaded(&view, 0, cx);
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(!tab.loading);
+            assert!(!tab.searching);
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(
+                view.empty_results_message(Some(tab)),
+                "Enter a query above to filter lines"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn non_empty_query_results_empty_message_avoids_flicker_across_reload(cx: &mut TestAppContext) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live_query.log");
+        std::fs::write(&path, "info startup\ninfo ready\n").unwrap();
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path.clone()], window, cx));
+
+        // Initial load with a non-empty query stays blank instead of flashing "Searching…" or "No matches".
+        view.update(cx, |view, _| {
+            view.tabs[0].query = "FATAL".into();
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.loading);
+            assert!(tab.log.is_none());
+            assert_eq!(view.empty_results_message(Some(tab)), "");
+        });
+
+        wait_for_tab_loaded(&view, 0, cx);
+
+        // Submit a non-empty query with no matches.
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.emplace("FATAL", cx));
+            view.start_search(0, cx);
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.searching);
+            assert!(!tab.refreshing_search);
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "");
+        });
+
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(!tab.searching);
+            assert_eq!(view.empty_results_message(Some(tab)), "No matches");
+        });
+
+        // Reloading the live file keeps "No matches" steady instead of flickering "Searching…" or blank.
+        std::fs::write(&path, "info startup\ninfo ready\ninfo tick\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.load(0);
+            cx.notify();
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.loading);
+            assert!(tab.log.is_some());
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "No matches");
+        });
+
+        // A background refresh search (< SEARCH_INDICATOR_DELAY) also keeps "No matches" steady.
+        wait_for_tab_loaded(&view, 0, cx);
+        view.update(cx, |view, cx| {
+            view.start_search_preserving(0, true, cx);
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.searching);
+            assert!(tab.refreshing_search);
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "No matches");
+        });
+
+        // Once a search actually exceeds SEARCH_INDICATOR_DELAY, both header and body show "Searching…".
+        view.update(cx, |view, _| {
+            view.tabs[0].searching_visible = true;
+        });
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "Searching…");
+        });
+
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let tab = &view.tabs[0];
+            assert!(!tab.searching);
+            assert!(!tab.show_searching_indicator());
+            assert_eq!(view.empty_results_message(Some(tab)), "No matches");
+        });
+    }
+
+    #[gpui::test]
+    fn move_tab_shortcuts_relocate_active_tab_without_wrapping_and_preserve_state(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let state_file = directory.path().join("session.json");
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = true;
+        config.files.restore_session = false;
+        config.files.state_file = Some(state_file.display().to_string());
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        let third = directory.path().join("third.log");
+        std::fs::write(&first, "one\ntwo\n").unwrap();
+        std::fs::write(&second, "alpha\nbeta\n").unwrap();
+        std::fs::write(&third, "red\nblue\n").unwrap();
+        let first_canon = first.canonicalize().unwrap_or_else(|_| first.clone());
+        let second_canon = second.canonicalize().unwrap_or_else(|_| second.clone());
+        let third_canon = third.canonicalize().unwrap_or_else(|_| third.clone());
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(config, vec![first, second, third], window, cx)
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.switch(0, cx);
+            view.tabs[0].bookmarks.insert(1);
+            view.tabs[1].query = "q1".into();
+            view.tabs[2].query = "q2".into();
+            view.input.update(cx, |input, cx| input.emplace("q0", cx));
+        });
+        cx.run_until_parked();
+
+        // Default shortcut labels are populated for MoveTabNext and MoveTabPrevious.
+        view.read_with(cx, |view, _| {
+            let expected_next = if cfg!(target_os = "macos") {
+                "⌃⇧PgDn"
+            } else {
+                "Ctrl+Shift+PgDn"
+            };
+            let expected_prev = if cfg!(target_os = "macos") {
+                "⌃⇧PgUp"
+            } else {
+                "Ctrl+Shift+PgUp"
+            };
+            assert_eq!(
+                view.theme.shortcut(Command::MoveTabNext).as_deref(),
+                Some(expected_next)
+            );
+            assert_eq!(
+                view.theme.shortcut(Command::MoveTabPrevious).as_deref(),
+                Some(expected_prev)
+            );
+        });
+
+        let tab_paths = |view: &Workspace| -> Vec<PathBuf> {
+            view.tabs.iter().map(|tab| tab.path.clone()).collect()
+        };
+
+        // At index 0, Ctrl+Shift+PageUp is a non-cyclic no-op.
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    first_canon.clone(),
+                    second_canon.clone(),
+                    third_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // Ctrl+Shift+PageDown moves tab 0 -> 1, preserving active input, path, and bookmarks.
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    second_canon.clone(),
+                    first_canon.clone(),
+                    third_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+            assert_eq!(
+                view.path_input.read(cx).as_str(),
+                first_canon.display().to_string()
+            );
+            assert!(view.tabs[1].bookmarks.contains(&1));
+            assert_eq!(view.tabs[0].query, "q1");
+            assert_eq!(view.tabs[2].query, "q2");
+        });
+
+        // Ctrl+Shift+PageDown moves tab 1 -> 2.
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    second_canon.clone(),
+                    third_canon.clone(),
+                    first_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // At the last tab, Ctrl+Shift+PageDown is a non-cyclic no-op (must NOT wrap to index 0).
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 2);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    second_canon.clone(),
+                    third_canon.clone(),
+                    first_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // Works while search input has focus (Workspace context), moving backward 2 -> 1 -> 0.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::FocusSearch, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    second_canon.clone(),
+                    first_canon.clone(),
+                    third_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 0);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    first_canon.clone(),
+                    second_canon.clone(),
+                    third_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q0");
+        });
+
+        // Relocating another tab and saving session persists the new tab order and active index.
+        view.update(cx, |view, cx| view.switch(2, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        let saved = view.read_with(cx, |view, cx| {
+            assert_eq!(view.active, 1);
+            assert_eq!(
+                tab_paths(view),
+                vec![
+                    first_canon.clone(),
+                    third_canon.clone(),
+                    second_canon.clone()
+                ]
+            );
+            assert_eq!(view.input.read(cx).as_str(), "q2");
+            view.save_session(cx);
+            Session::load(&state_file, &view.config).unwrap()
+        });
+        assert_eq!(saved.active, 1);
+        let saved_paths: Vec<PathBuf> = saved.tabs.into_iter().map(|t| t.path).collect();
+        assert_eq!(saved_paths, vec![first_canon, third_canon, second_canon]);
+
+        // With a single tab, both move shortcuts are safe no-ops.
+        view.update(cx, |view, cx| {
+            view.close_tab_at(2, cx);
+            view.close_tab_at(0, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.active, 0);
+        });
+
+        // With no tabs open, both move shortcuts are safe no-ops.
+        view.update(cx, |view, cx| {
+            view.close_tab_at(0, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.simulate_keystrokes("ctrl-shift-pageup");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tabs.is_empty());
+            assert_eq!(view.active, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn move_tab_shortcuts_respect_custom_keyboard_bindings(cx: &mut TestAppContext) {
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_dir.path().join("keyboard.json"),
+            r#"{
+  "bindings": [
+    { "keys": "alt-right", "context": "Workspace", "action": "move_tab_next" },
+    { "keys": "alt-left", "context": "Workspace", "action": "move_tab_previous" }
+  ]
+}"#,
+        )
+        .unwrap();
+        let mut config = Config::load(Some(config_dir.path())).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        std::fs::write(&first, "one\n").unwrap();
+        std::fs::write(&second, "two\n").unwrap();
+        let first_canon = first.canonicalize().unwrap_or_else(|_| first.clone());
+        let second_canon = second.canonicalize().unwrap_or_else(|_| second.clone());
+
+        let (view, cx) = cx
+            .add_window_view(|window, cx| Workspace::new(config, vec![first, second], window, cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| view.switch(0, cx));
+        cx.run_until_parked();
+
+        // Replaced default shortcuts no longer trigger tab relocation.
+        cx.simulate_keystrokes("ctrl-shift-pagedown");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, second_canon);
+        });
+
+        // Custom bindings relocate tabs forward and backward without wrapping.
+        cx.simulate_keystrokes("alt-right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[0].path, second_canon);
+            assert_eq!(view.tabs[1].path, first_canon);
+        });
+
+        cx.simulate_keystrokes("alt-right");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 1);
+            assert_eq!(view.tabs[1].path, first_canon);
+        });
+
+        cx.simulate_keystrokes("alt-left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+            assert_eq!(view.tabs[1].path, second_canon);
+        });
+
+        cx.simulate_keystrokes("alt-left");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active, 0);
+            assert_eq!(view.tabs[0].path, first_canon);
+        });
+    }
+
+    #[gpui::test]
+    fn applying_presets_respects_match_case_whole_word_specificity_and_dropdown_badges(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "AnyError".into(),
+                pattern: "err".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::Leave,
+                select_text: None,
+            },
+            config::Preset {
+                name: "ExactErrWord".into(),
+                pattern: "err".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::On,
+                whole_word: PresetToggle::On,
+                select_text: None,
+            },
+            config::Preset {
+                name: "RegexRelaxed".into(),
+                pattern: "err|warn".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+                match_case: PresetToggle::Off,
+                whole_word: PresetToggle::Off,
+                select_text: None,
+            },
+            config::Preset {
+                name: "KeepCaseForceWord".into(),
+                pattern: "warn".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::Leave,
+                whole_word: PresetToggle::On,
+                select_text: None,
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preset-options.log");
+        std::fs::write(
+            &path,
+            "err exact\nERR upper\nerror sub\nwarn exact\nWARN upper\nwarning sub\n",
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].main_selection = LineSelection::single(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Opening the Patterns dropdown renders option badges only for non-`leave` toggles.
+        view.update_in(cx, |view, window, cx| view.toggle_presets(window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("preset-match-case-0").is_none());
+        assert!(cx.debug_bounds("preset-whole-word-0").is_none());
+        assert!(cx.debug_bounds("preset-match-case-1").is_some());
+        assert!(cx.debug_bounds("preset-whole-word-1").is_some());
+        assert!(cx.debug_bounds("preset-match-case-2").is_some());
+        assert!(cx.debug_bounds("preset-whole-word-2").is_some());
+        assert!(cx.debug_bounds("preset-match-case-3").is_none());
+        assert!(cx.debug_bounds("preset-whole-word-3").is_some());
+
+        // 1. Apply Literal case-sensitive + whole-word preset: sets both toggles, matches only line 0,
+        //    and beats the less-specific `AnyError` preset with the same pattern/mode.
+        view.update_in(cx, |view, window, cx| view.apply_preset(1, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![0]);
+            assert_eq!(view.active_preset_index(cx), Some(1));
+        });
+
+        // Turning off whole_word detaches `ExactErrWord` (On) and falls back to `AnyError` (Leave).
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleWholeWord, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 2]);
+            assert_eq!(view.active_preset_index(cx), Some(0));
+        });
+
+        // 2. Apply Regex case-insensitive + non-whole-word preset (from Literal case-sensitive):
+        //    clears both toggles and matches all 6 lines.
+        view.update_in(cx, |view, window, cx| view.apply_preset(2, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(!view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2, 3, 4, 5]);
+            assert_eq!(view.active_preset_index(cx), Some(2));
+        });
+
+        // Manually toggling case_sensitive ON detaches `RegexRelaxed` (match_case: Off).
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleCaseSensitive, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.tabs[0].options.case_sensitive);
+            assert_eq!(view.active_preset_index(cx), None);
+        });
+
+        // 3. Apply `KeepCaseForceWord` (match_case: Leave, whole_word: On): preserves case_sensitive=true,
+        //    enables whole_word=true, and matches only lowercase whole-word "warn" (line 3).
+        view.update_in(cx, |view, window, cx| view.apply_preset(3, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Literal);
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![3]);
+            assert_eq!(view.active_preset_index(cx), Some(3));
+        });
+
+        // Toggling case_sensitive OFF keeps `KeepCaseForceWord` active since match_case is Leave.
+        view.update_in(cx, |view, window, cx| {
+            view.command(Command::ToggleCaseSensitive, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(!view.tabs[0].options.case_sensitive);
+            assert!(view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![3, 4]);
+            assert_eq!(view.active_preset_index(cx), Some(3));
+        });
+    }
+
+    #[gpui::test]
+    fn appending_presets_preserves_match_case_whole_word_and_select_text_across_combinations(
+        cx: &mut TestAppContext,
+    ) {
+        let mut config = Config::load(None).unwrap();
+        config.files.save_session = false;
+        config.files.restore_session = false;
+        config.search.presets = vec![
+            config::Preset {
+                name: "LitExact".into(),
+                pattern: "ERROR".into(),
+                mode: SearchMode::Literal,
+                highlight_match: false,
+                match_case: PresetToggle::On,
+                whole_word: PresetToggle::On,
+                select_text: None,
+            },
+            config::Preset {
+                name: "LitRelaxed".into(),
+                pattern: "warn".into(),
+                mode: SearchMode::Literal,
+                highlight_match: true,
+                match_case: PresetToggle::Off,
+                whole_word: PresetToggle::Off,
+                select_text: None,
+            },
+            config::Preset {
+                name: "RegexWordCase".into(),
+                pattern: "GET|POST".into(),
+                mode: SearchMode::Regex,
+                highlight_match: true,
+                match_case: PresetToggle::On,
+                whole_word: PresetToggle::On,
+                select_text: None,
+            },
+            config::Preset {
+                name: "SelectLiteral".into(),
+                pattern: "[שלום] host=<HOST.NAME>".into(),
+                mode: SearchMode::Literal,
+                highlight_match: false,
+                match_case: PresetToggle::On,
+                whole_word: PresetToggle::Off,
+                select_text: Some("<HOST.NAME>".into()),
+            },
+        ];
+        cx.update(|cx| {
+            cx.bind_keys(text_input_default_bindings());
+            cx.bind_keys(keybindings(&config).unwrap());
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("append-preset-options.log");
+        std::fs::write(
+            &path,
+            concat!(
+                "INFO boot\n",               // 0
+                "info ready\n",              // 1
+                "ERROR fail\n",              // 2
+                "error lower\n",             // 3
+                "ERRORS plural\n",           // 4
+                "WARNING disk\n",            // 5
+                "GET /health\n",             // 6
+                "get /health\n",             // 7
+                "TARGET /health\n",          // 8
+                "[שלום] host=api.prod ok\n", // 9
+                "[שלום] HOST=api.prod ok\n", // 10
+            ),
+        )
+        .unwrap();
+        let log = Arc::new(LogFile::open(&path, &AtomicBool::new(false)).unwrap());
+        let (view, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(config, vec![path], window, cx));
+        view.update(cx, |view, cx| {
+            view.tabs[0].log = Some(log);
+            view.tabs[0].options.mode = SearchMode::Regex;
+            view.tabs[0].options.case_sensitive = false;
+            view.tabs[0].options.whole_word = false;
+            view.tabs[0].options.highlight_matches = true;
+            view.input.update(cx, |input, cx| input.emplace("info", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+
+        // 1. Active Regex case-insensitive non-whole-word ("info") + append Literal case-sensitive whole-word ("ERROR"):
+        //    wraps preset as `\b(?-i:ERROR)\b`, keeps global toggles off, matches lines 0, 1, 2 (NOT 3 or 4).
+        view.update_in(cx, |view, window, cx| view.append_preset(0, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), r"info|\b(?-i:ERROR)\b");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(!view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert!(view.tabs[0].options.highlight_matches);
+            assert_eq!(view.tabs[0].results.matches, vec![0, 1, 2]);
+        });
+
+        // 2. Active Regex case-sensitive + whole-word ("ERROR") + append Literal case-insensitive non-whole-word ("warn"):
+        //    lifts existing to `\b(?:ERROR)\b`, turns global whole_word off, wraps preset as `(?i:warn)`,
+        //    matches lines 2 (exact whole word ERROR) and 5 (case-insensitive substring WARNING), NOT 3 or 4.
+        view.update(cx, |view, cx| {
+            view.tabs[0].options.case_sensitive = true;
+            view.tabs[0].options.whole_word = true;
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(1, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), r"\b(?:ERROR)\b|(?i:warn)");
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![2, 5]);
+        });
+
+        // 3. Chain-append Regex `match_case=On, whole_word=On` ("GET|POST") when global `case_sensitive=true`:
+        //    adds `\b(?:GET|POST)\b` without redundant `-i`, matching line 6 (NOT 7 or 8).
+        view.update_in(cx, |view, window, cx| view.append_preset(2, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.input.read(cx).as_str(),
+                r"\b(?:ERROR)\b|(?i:warn)|\b(?:GET|POST)\b"
+            );
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].results.matches, vec![2, 5, 6]);
+        });
+
+        // 4. Empty search in Regex mode + append Literal preset (`match_case=On, whole_word=On, highlight_match=false`):
+        //    adopts toggles directly with no inline wrappers and keeps Regex mode.
+        view.update(cx, |view, cx| {
+            view.input.update(cx, |input, cx| input.emplace("", cx));
+            view.tabs[0].options.case_sensitive = false;
+            view.tabs[0].options.whole_word = false;
+            view.tabs[0].options.highlight_matches = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(0, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).as_str(), "ERROR");
+            assert_eq!(view.tabs[0].options.mode, SearchMode::Regex);
+            assert!(view.tabs[0].options.case_sensitive);
+            assert!(view.tabs[0].options.whole_word);
+            assert!(!view.tabs[0].options.highlight_matches);
+            assert_eq!(view.tabs[0].results.matches, vec![2]);
+        });
+
+        // 5. Selectable literal preset with `match_case=On, whole_word=Off` appended onto case-insensitive
+        //    whole-word search: lifts existing, wraps preset in `(?-i:...)`, selects exact escaped placeholder,
+        //    defers search, and after typing replacement + Enter matches case-sensitively (line 9, NOT line 10).
+        let selected_range = |input: &Entity<EditableTextState>,
+                              window: &mut Window,
+                              cx: &mut Context<Workspace>| {
+            input
+                .update(cx, |state, cx| state.selected_text_range(false, window, cx))
+                .expect("selection range")
+                .range
+        };
+        view.update(cx, |view, cx| {
+            view.tabs[0].options.case_sensitive = false;
+            view.tabs[0].options.whole_word = true;
+            view.input
+                .update(cx, |input, cx| input.emplace("ERROR", cx));
+            view.start_search(0, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.append_preset(3, window, cx));
+        cx.run_until_parked();
+        let expected_before_edit = r"\b(?:ERROR)\b|(?-i:\[שלום\] host=<HOST\.NAME>)";
+        let start = expected_before_edit.find(r"<HOST\.NAME>").unwrap();
+        let end = start + r"<HOST\.NAME>".len();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.input.read(cx).focus_handle(cx).is_focused(window));
+            assert_eq!(view.input.read(cx).as_str(), expected_before_edit);
+            assert_eq!(
+                selected_range(&view.input, window, cx),
+                utf16_range_for_utf8(expected_before_edit, start..end)
+            );
+            assert!(!view.tabs[0].options.case_sensitive);
+            assert!(!view.tabs[0].options.whole_word);
+            assert_eq!(view.tabs[0].query, "ERROR");
+            assert_eq!(view.tabs[0].results.matches, vec![2, 3]);
+        });
+        cx.simulate_input(r"api\.prod");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tabs[0].query,
+                r"\b(?:ERROR)\b|(?-i:\[שלום\] host=api\.prod)"
+            );
+            assert_eq!(view.tabs[0].results.matches, vec![2, 3, 9]);
         });
     }
 }

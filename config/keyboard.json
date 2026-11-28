@@ -17,13 +17,38 @@
       "context": "Workspace"
     },
     {
+      "keys": "secondary-shift-t",
+      "action": "restore_closed_tab",
+      "context": "Workspace"
+    },
+    {
       "keys": "ctrl-tab",
+      "action": "next_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-pagedown",
       "action": "next_tab",
       "context": "Workspace"
     },
     {
       "keys": "ctrl-shift-tab",
       "action": "previous_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-pageup",
+      "action": "previous_tab",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-shift-pagedown",
+      "action": "move_tab_next",
+      "context": "Workspace"
+    },
+    {
+      "keys": "ctrl-shift-pageup",
+      "action": "move_tab_previous",
       "context": "Workspace"
     },
     {
@@ -325,6 +350,11 @@
       "keys": "enter",
       "action": "apply_preset",
       "context": "Presets"
+    },
+    {
+      "keys": "secondary-enter",
+      "action": "append_preset",
+      "context": "Presets && RegexMode"
     },
     {
       "keys": "escape",

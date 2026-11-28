@@ -49,7 +49,8 @@
         "Search",
         "FilePath",
         "GoTo",
-        "Presets"
+        "Presets",
+        "Presets && RegexMode"
       ]
     },
     "Command": {
@@ -57,8 +58,11 @@
       "enum": [
         "open",
         "close_tab",
+        "restore_closed_tab",
         "next_tab",
         "previous_tab",
+        "move_tab_next",
+        "move_tab_previous",
         "search",
         "toggle_regex",
         "toggle_case_sensitive",
@@ -109,6 +113,7 @@
         "swap_selection_anchor",
         "toggle_presets",
         "apply_preset",
+        "append_preset",
         "increase_filter_height",
         "decrease_filter_height",
         "zoom_in",

@@ -134,6 +134,44 @@ pub enum SearchMode {
     Literal,
     Regex,
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PresetToggle {
+    #[default]
+    Leave,
+    Off,
+    On,
+}
+
+impl PresetToggle {
+    /// Applies this tri-state setting to a search option boolean.
+    pub fn apply_to(self, target: &mut bool) {
+        match self {
+            Self::Leave => {}
+            Self::Off => *target = false,
+            Self::On => *target = true,
+        }
+    }
+
+    /// Returns the forced boolean value for `On`/`Off`, or `None` for `Leave`.
+    pub fn forced_value(self) -> Option<bool> {
+        match self {
+            Self::Leave => None,
+            Self::Off => Some(false),
+            Self::On => Some(true),
+        }
+    }
+
+    /// Returns `true` when `current` satisfies this preset setting.
+    pub fn matches(self, current: bool) -> bool {
+        match self {
+            Self::Leave => true,
+            Self::Off => !current,
+            Self::On => current,
+        }
+    }
+}
+
 fn default_highlight_matches() -> bool {
     true
 }
@@ -146,11 +184,21 @@ pub struct Preset {
     pub mode: SearchMode,
     #[serde(default = "default_highlight_matches")]
     pub highlight_match: bool,
+    #[serde(default)]
+    pub match_case: PresetToggle,
+    #[serde(default)]
+    pub whole_word: PresetToggle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub select_text: Option<String>,
 }
 
 impl Preset {
+    /// Returns the number of explicit (`on` / `off`) search toggle constraints on this preset.
+    pub fn option_specificity(&self) -> u8 {
+        u8::from(self.match_case != PresetToggle::Leave)
+            + u8::from(self.whole_word != PresetToggle::Leave)
+    }
+
     /// Returns the UTF-8 byte range of the first occurrence of `select_text` within `pattern`
     /// when `select_text` is configured, non-empty, and contained in `pattern`.
     pub fn select_text_range(&self) -> Option<std::ops::Range<usize>> {
@@ -175,6 +223,25 @@ impl Preset {
             ))
         } else {
             None
+        }
+    }
+
+    /// Returns the pattern text ready to be embedded in a regex search (escaping regex
+    /// metacharacters when `self.mode == SearchMode::Literal`) along with the mapped UTF-8
+    /// byte range of `select_text` within that returned string.
+    pub fn regex_pattern_and_select_range(&self) -> (String, Option<std::ops::Range<usize>>) {
+        if self.mode == SearchMode::Regex {
+            return (self.pattern.clone(), self.select_text_range());
+        }
+        if let Some(raw_range) = self.select_text_range() {
+            let before = regex::escape(&self.pattern[..raw_range.start]);
+            let selected = regex::escape(&self.pattern[raw_range.start..raw_range.end]);
+            let after = regex::escape(&self.pattern[raw_range.end..]);
+            let start = before.len();
+            let end = start + selected.len();
+            (format!("{before}{selected}{after}"), Some(start..end))
+        } else {
+            (regex::escape(&self.pattern), None)
         }
     }
 }
@@ -225,8 +292,11 @@ pub struct FilesConfig {
 pub enum Command {
     Open,
     CloseTab,
+    RestoreClosedTab,
     NextTab,
     PreviousTab,
+    MoveTabNext,
+    MoveTabPrevious,
     Search,
     ToggleRegex,
     ToggleCaseSensitive,
@@ -277,6 +347,7 @@ pub enum Command {
     SwapSelectionAnchor,
     TogglePresets,
     ApplyPreset,
+    AppendPreset,
     IncreaseFilterHeight,
     DecreaseFilterHeight,
     ZoomIn,
@@ -304,6 +375,8 @@ pub enum KeyContext {
     FilePath,
     GoTo,
     Presets,
+    #[serde(rename = "Presets && RegexMode")]
+    PresetsRegexMode,
 }
 impl KeyContext {
     pub fn as_str(self) -> &'static str {
@@ -320,12 +393,14 @@ impl KeyContext {
             Self::FilePath => "FilePath",
             Self::GoTo => "GoTo",
             Self::Presets => "Presets",
+            Self::PresetsRegexMode => "Presets && RegexMode",
         }
     }
 
     pub fn predicate(self) -> &'static str {
         match self {
             Self::TextSelectedRegexMode => "RegexMode > TextSelected",
+            Self::PresetsRegexMode => "RegexMode > Presets",
             Self::TextInput => "EditableText",
             other => other.as_str(),
         }
@@ -339,7 +414,7 @@ impl KeyContext {
             Self::FilterLog => 1,
             Self::Search | Self::FilePath | Self::GoTo | Self::Presets => 1,
             Self::Selection | Self::TextSelected => 1,
-            Self::TextSelectedRegexMode => 2,
+            Self::TextSelectedRegexMode | Self::PresetsRegexMode => 2,
         }
     }
 }
@@ -517,7 +592,14 @@ impl Config {
         }
         for preset in &s.presets {
             if preset.mode == SearchMode::Regex {
-                regex::Regex::new(&preset.pattern)
+                let pattern = if preset.whole_word == PresetToggle::On {
+                    format!(r"\b(?:{})\b", preset.pattern)
+                } else {
+                    preset.pattern.clone()
+                };
+                regex::RegexBuilder::new(&pattern)
+                    .case_insensitive(preset.match_case == PresetToggle::Off)
+                    .build()
                     .with_context(|| format!("Invalid preset: {}", preset.name))?;
             }
         }

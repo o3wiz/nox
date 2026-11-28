@@ -5,4 +5,5 @@ pub mod path_complete;
 pub mod search;
 pub mod selection;
 pub mod session;
+pub mod stdin;
 pub mod zoom;

@@ -23,6 +23,14 @@
           "type": "boolean",
           "default": true
         },
+        "match_case": {
+          "$ref": "#/$defs/PresetToggle",
+          "default": "leave"
+        },
+        "whole_word": {
+          "$ref": "#/$defs/PresetToggle",
+          "default": "leave"
+        },
         "select_text": {
           "type": [
             "string",
@@ -35,6 +43,14 @@
         "name",
         "pattern",
         "mode"
+      ]
+    },
+    "PresetToggle": {
+      "type": "string",
+      "enum": [
+        "leave",
+        "off",
+        "on"
       ]
     },
     "SearchConfig": {

@@ -19,6 +19,7 @@ pub enum Icon {
     Copy,
     CopyMatches,
     Close,
+    Plus,
     Search,
     Regex,
     CaseSensitive,
@@ -57,6 +58,7 @@ impl Icon {
         Icon::Copy,
         Icon::CopyMatches,
         Icon::Close,
+        Icon::Plus,
         Icon::Search,
         Icon::Regex,
         Icon::CaseSensitive,
@@ -107,6 +109,8 @@ impl Icon {
             Icon::CopyMatches => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2" fill="#ffffff"/><path d="M5.5 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v.5"/></svg>"##,
 
             Icon::Close => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="6.5" x2="17.5" y2="17.5"/><line x1="17.5" y1="6.5" x2="6.5" y2="17.5"/></svg>"##,
+
+            Icon::Plus => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5.5" x2="12" y2="18.5"/><line x1="5.5" y1="12" x2="18.5" y2="12"/></svg>"##,
 
             Icon::Search => br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.75" cy="10.75" r="6.75"/><line x1="15.8" y1="15.8" x2="20.5" y2="20.5"/></svg>"##,
 

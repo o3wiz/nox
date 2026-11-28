@@ -12,19 +12,25 @@
       "name": "Errors",
       "pattern": "error|fatal|panic",
       "mode": "regex",
-      "highlight_match": true
+      "highlight_match": true,
+      "match_case": "leave",
+      "whole_word": "leave"
     },
     {
       "name": "Warnings",
       "pattern": "warn",
       "mode": "literal",
-      "highlight_match": true
+      "highlight_match": true,
+      "match_case": "leave",
+      "whole_word": "leave"
     },
     {
       "name": "Requests",
       "pattern": "GET|POST|PUT|DELETE",
       "mode": "regex",
-      "highlight_match": true
+      "highlight_match": true,
+      "match_case": "leave",
+      "whole_word": "leave"
     }
   ]
 }
